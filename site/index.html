@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8" />
   <title>NKN Client — LLM Chat</title>
@@ -26,83 +27,445 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/go.min.js"></script>
 
   <style>
-    :root{
-      --bg:#000; --panel:#0a0a0a; --line:#141414; --fg:#fff; --muted:#bfbfbf; --accent:#fff;
-      --pad:12px; --radius:14px; --shadow:0 12px 30px rgba(0,0,0,.45);
+    :root {
+      --bg: #000;
+      --panel: #0a0a0a;
+      --line: #141414;
+      --fg: #fff;
+      --muted: #bfbfbf;
+      --accent: #fff;
+      --pad: 12px;
+      --radius: 14px;
+      --shadow: 0 12px 30px rgba(0, 0, 0, .45);
     }
-    *{box-sizing:border-box}
-    html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial}
-    .app{display:grid;grid-template-rows:auto 1fr;grid-template-columns:260px 1fr;grid-template-areas:"top top" "left main";height:100%}
-    header{grid-area:top;display:flex;align-items:center;gap:10px;padding:10px var(--pad);border-bottom:1px solid --line;background:#000;position:sticky;top:0;z-index:20;border-bottom:1px solid var(--line)}
-    .brand{font-weight:700;letter-spacing:.3px}
-    .spacer{flex:1}
-    .topbar-select{appearance:none;background:#000;border:1px solid #2a2a2a;color:var(--fg);padding:8px 10px;border-radius:10px;min-width:220px}
-    .chip{padding:6px 10px;border:1px solid #2a2a2a;border-radius:999px;color:#eaeaea;background:#0a0a0a}
-    .gear{cursor:pointer;border:1px solid #2a2a2a;border-radius:10px;padding:8px 10px;background:#0a0a0a}
-    .gear:active{transform:translateY(1px)}
-    .col-left{grid-area:left;border-right:1px solid #141414;background:#050505;display:flex;flex-direction:column;min-width:0}
-    .left-head{padding:10px var(--pad);border-bottom:1px solid #141414;display:flex;align-items:center;gap:8px}
-    .sessions{flex:1;overflow:auto;padding:8px}
-    .session{position:relative;padding:10px;border:1px solid #1a1a1a;border-radius:12px;margin-bottom:8px;background:#0a0a0a;cursor:pointer}
-    .session.active{border-color:#fff}
-    .session .title{font-weight:600;padding-right:28px}
-    .session small{color:#cfcfcf;opacity:.8}
-    .session .del{
-      position:absolute;top:6px;right:6px;width:24px;height:24px;display:flex;align-items:center;justify-content:center;
-      border:1px solid #2a2a2a;border-radius:999px;background:#060606;color:#cfcfcf;font-size:14px;line-height:1;cursor:pointer
+
+    * {
+      box-sizing: border-box;
+      transition: all 0.2s ease;
     }
-    .session .del:hover{background:#111}
-    .col-main{grid-area:main;display:flex;flex-direction:column;min-width:0}
-    .sysedit{padding:12px;border-bottom:1px solid #141414;background:#050505}
-    .sysedit label{display:block;font-size:12px;color:#cfcfcf;margin-bottom:6px}
-    .sysinput{width:100%;min-height:64px;resize:vertical;background:#000;border:1px solid #2a2a2a;color:#fff;border-radius:12px;padding:10px}
-    .chat{flex:1;overflow:auto;padding:16px;max-height:calc(100vh - 18.5rem);scroll-behavior:smooth}
-    .msg{max-width:900px;margin:0 auto 14px auto;padding:12px 14px;border-radius:14px;border:1px solid #1a1a1a}
-    .user{background:#0a0a0a}
-    .assistant{background:#0a0a0a;border-color:#2a2a2a}
-    .meta{display:flex;gap:10px;align-items:center;color:#bfbfbf;font-size:12px;margin-bottom:6px}
-    .content{word-wrap:break-word}
-    .content p{margin:.5em 0}
-    .content img{max-width:100%;border-radius:8px}
-    .content code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:13px;background:#0b0b0b;border:1px solid #2a2a2a;border-radius:6px;padding:.2em .35em}
-    .content pre{background:#0b0b0b;border:1px solid #2a2a2a;border-radius:12px;padding:12px;overflow:auto}
-    .content pre code{background:transparent;border:none;padding:0}
-    .content blockquote{border-left:3px solid #2a2a2a;margin:8px 0;padding:6px 10px;color:#cfd8dc;background:#071018;border-radius:8px}
-    .content ul,.content ol{padding-left:1.4em}
-    .composer{display:flex;gap:10px;padding:12px;border-top:1px solid #141414;background:#050505}
-    .input{flex:1;resize:none;height:56px;background:#000;border:1px solid #2a2a2a;color:var(--fg);border-radius:12px;padding:12px}
-    .btn{background:#000;border:1px solid #fff;color:#fff;padding:12px 14px;border-radius:12px;cursor:pointer}
-    .btn:active{transform:translateY(1px)}
-    .row{display:flex;gap:8px;align-items:center}
-    .muted{color:#cfcfcf;opacity:.8}
-    .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50}
-    .modal{width:min(560px,92vw);background:#0a0a0a;border:1px solid #2a2a2a;border-radius:16px;box-shadow:var(--shadow);padding:14px}
-    .modal h3{margin:.2rem 0 .8rem 0}
-    .field{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}
-    .text{background:#000;border:1px solid #2a2a2a;color:#fff;padding:10px;border-radius:10px}
-    .num{background:#000;border:1px solid #2a2a2a;color:#fff;padding:10px;border-radius:10px;width:120px}
-    .chkrow{display:flex;gap:8px;align-items:center;margin-top:6px}
-    .modal .row{justify-content:flex-end;margin-top:10px}
+
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, "Helvetica Neue", Arial
+    }
+
+    .app {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      grid-template-columns: 260px 1fr;
+      grid-template-areas: "top top" "left main";
+      height: 100%
+    }
+
+    header {
+      max-height: 400px;
+      grid-area: top;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-flow: wrap;
+      gap: 10px;
+      padding: 10px var(--pad);
+      background: #000;
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      border-bottom: 1px solid var(--line)
+    }
+
+    .brand {
+      font-weight: 700;
+      letter-spacing: .3px
+    }
+
+    .spacer {
+      flex: 1
+    }
+
+    .topbar-select {
+      appearance: none;
+      background: #000;
+      border: 1px solid #2a2a2a;
+      color: var(--fg);
+      padding: 8px 10px;
+      border-radius: 10px;
+      min-width: 220px
+    }
+
+    .chip {
+      padding: 6px 10px;
+      border: 1px solid #2a2a2a;
+      border-radius: 999px;
+      color: #eaeaea;
+      background: #0a0a0a
+    }
+
+    .chiprow {
+      display: flex;
+      flex-flow: row;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .gear {
+      cursor: pointer;
+      border: 1px solid #2a2a2a;
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: #0a0a0a;
+      color:white;
+    }
+
+    .gear:active {
+      transform: translateY(1px)
+    }
+
+    .col-left {
+      grid-area: left;
+      border-right: 1px solid #141414;
+      background: #050505;
+      display: flex;
+      flex-direction: column;
+      min-width: 0
+    }
+
+    .left-head {
+      padding: 10px var(--pad);
+      border-bottom: 1px solid #141414;
+      display: flex;
+      align-items: center;
+      gap: 8px
+    }
+
+    .sessions {
+      flex: 1;
+      overflow: auto;
+      padding: 8px
+    }
+
+    .session {
+      position: relative;
+      padding: 10px;
+      border: 1px solid #1a1a1a;
+      border-radius: 12px;
+      margin-bottom: 8px;
+      background: #0a0a0a;
+      cursor: pointer
+    }
+
+    .session.active {
+      border-color: #fff
+    }
+
+    .session .title {
+      font-weight: 600;
+      padding-right: 28px
+    }
+
+    .session small {
+      color: #cfcfcf;
+      opacity: .8
+    }
+
+    .session .del {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid #2a2a2a;
+      border-radius: 999px;
+      background: #060606;
+      color: #cfcfcf;
+      font-size: 14px;
+      line-height: 1;
+      cursor: pointer
+    }
+
+    .session .del:hover {
+      background: #111
+    }
+
+    .col-main {
+      position: relative;
+      box-sizing: border-box;
+      grid-area: main;
+      display: flex;
+      flex-direction: column;
+      min-width: 0
+    }
+
+    .sysedit {
+      padding: 12px;
+      border-bottom: 1px solid #141414;
+      background: #050505;
+      box-sizing: border-box;
+      height: 80px;
+    }
+
+    .sysedit label {
+      display: block;
+      font-size: 12px;
+      color: #cfcfcf;
+      margin-bottom: 6px
+    }
+
+    .sysinput {
+      width: 100%;
+      min-height: 64px;
+      resize: vertical;
+      background: #000;
+      border: 1px solid #2a2a2a;
+      color: #fff5;
+      border-radius: 12px;
+      padding: 10px
+    }
+    .sysinput:focus {
+      outline: none;
+      border-color: #fff;
+      color: #fff
+    }
+
+    .chat {
+      position: relative;
+      display: block;
+      height: 100%;
+      flex: 1;
+      overflow: auto;
+      padding: 16px;
+      max-height: calc(100vh - 221px);
+      scroll-behavior: smooth
+    }
+
+    .msg {
+      max-width: 900px;
+      margin: 0 auto 14px auto;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid #1a1a1a
+    }
+
+    .user {
+      background: #0a0a0a
+    }
+
+    .assistant {
+      background: #0a0a0a;
+      border-color: #2a2a2a
+    }
+
+    .meta {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      color: #bfbfbf;
+      font-size: 12px;
+      margin-bottom: 6px
+    }
+
+    .content {
+      word-wrap: break-word
+    }
+
+    .content p {
+      margin: .5em 0
+    }
+
+    .content img {
+      max-width: 100%;
+      border-radius: 8px
+    }
+
+    .content code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 13px;
+      background: #0b0b0b;
+      border: 1px solid #2a2a2a;
+      border-radius: 6px;
+      padding: .2em .35em
+    }
+
+    .content pre {
+      background: #0b0b0b;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      padding: 12px;
+      overflow: auto
+    }
+
+    .content pre code {
+      background: transparent;
+      border: none;
+      padding: 0
+    }
+
+    .content blockquote {
+      border-left: 3px solid #2a2a2a;
+      margin: 8px 0;
+      padding: 6px 10px;
+      color: #cfd8dc;
+      background: #071018;
+      border-radius: 8px
+    }
+
+    .content ul,
+    .content ol {
+      padding-left: 1.4em
+    }
+
+    .composer {
+      display: flex;
+      gap: 10px;
+      padding: 12px;
+      border-top: 1px solid #141414;
+      background: #050505
+    }
+
+    .input {
+      flex: 1;
+      resize: none;
+      height: 56px;
+      background: #000;
+      border: 1px solid #2a2a2a;
+      color: var(--fg);
+      border-radius: 12px;
+      padding: 12px
+    }
+
+    .btn {
+      background: #000;
+      border: 1px solid #fff;
+      color: #fff;
+      padding: 12px 14px;
+      border-radius: 12px;
+      cursor: pointer
+    }
+
+    .btn:active {
+      transform: translateY(1px)
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center
+    }
+
+    .muted {
+      color: #cfcfcf;
+      opacity: .8
+    }
+
+    .overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, .6);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 50
+    }
+
+    .modal {
+      width: min(560px, 92vw);
+      background: #0a0a0a;
+      border: 1px solid #2a2a2a;
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      padding: 14px
+    }
+
+    .modal h3 {
+      margin: .2rem 0 .8rem 0
+    }
+    
+    .modal > .row{
+      display: flex;
+      justify-content: flex-start;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 10px
+    }
+
+    .text {
+      background: #000;
+      border: 1px solid #2a2a2a;
+      color: #fff;
+      padding: 10px;
+      border-radius: 10px
+    }
+
+    .num {
+      background: #000;
+      border: 1px solid #2a2a2a;
+      color: #fff;
+      padding: 10px;
+      border-radius: 10px;
+      width: 120px
+    }
+
+    .chkrow {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 6px
+    }
+
+    .modal .row {
+      justify-content: flex-end;
+      margin-top: 10px
+    }
+
+      #toggleSidebar{
+        display:none;
+      }
+      
     @media (max-width: 900px) {
-      .app{grid-template-columns:1fr;grid-template-areas:"top" "main"}
-      .col-left{display:none}
+
+      #toggleSidebar{
+        display:flex;
+      }
+
+      .app {
+        grid-template-columns: 1fr;
+        grid-template-areas: "top" "main"
+      }
+
+      .col-left {
+        display: flex;
+        position: absolute;
+        width: 50%;
+        z-index: 10;
+        left: -50%;
+        top: 54px;
+        bottom: 0px;
+      }
     }
   </style>
 </head>
+
 <body>
   <div class="app">
     <header>
-      <div class="brand">NKN Client Chat</div>
+      <button class="gear" id="toggleSidebar" onclick="toggleSidebar()">►</button>
       <select id="modelSelect" class="topbar-select" title="Available models" disabled>
         <option>— loading models —</option>
       </select>
-      <div class="spacer"></div>
-      <div class="chip" id="hubChip">hub: —</div>
-      <div class="chip" id="meChip">me: —</div>
-      <button id="settingsBtn" class="gear" aria-label="Settings">☰</button>
+      <button id="settingsBtn" class="gear" aria-label="Settings">⚙</button>
     </header>
 
-    <aside class="col-left">
+    <aside id="sidebar" class="col-left">
       <div class="left-head row">
         <div style="font-weight:600">Sessions</div>
         <div class="spacer"></div>
@@ -113,8 +476,8 @@
 
     <main class="col-main">
       <div class="sysedit">
-        <label for="systemMsg">System Prompt (saved per session)</label>
-        <textarea id="systemMsg" class="sysinput" placeholder="(Optional) e.g. 'You are a concise assistant. Answer with short bullets.'"></textarea>
+        <textarea id="systemMsg" class="sysinput"
+          placeholder="(Optional) e.g. 'You are a concise assistant. Answer with short bullets.'"></textarea>
       </div>
 
       <div id="chat" class="chat"></div>
@@ -129,16 +492,23 @@
   <!-- Settings Modal -->
   <div id="overlay" class="overlay">
     <div class="modal">
+      <div class="chiprow">
+        <div class="chip" id="hubChip">hub: —</div>
+        <div class="chip" id="meChip">me: —</div>
+      </div>
       <h3>Settings</h3>
       <div class="field">
         <label>Hub address (signaling server) <span class="muted">(identifier.publicKeyHex64)</span></label>
         <input id="hubInput" class="text" placeholder="e.g. hub.0123abcd…64hex" spellcheck="false" />
       </div>
-      <div class="row" style="gap:20px;flex-wrap:wrap">
-        <div class="field"><label>Temperature</label><input id="optTemperature" class="num" type="number" step="0.01" min="0" max="2" /></div>
-        <div class="field"><label>Top-p</label><input id="optTopP" class="num" type="number" step="0.01" min="0" max="1" /></div>
+      <div class="row" style="gap:20px;flex-wrap:wrap;justify-content: flex-start;">
+        <div class="field"><label>Temperature</label><input id="optTemperature" class="num" type="number" step="0.01"
+            min="0" max="2" /></div>
+        <div class="field"><label>Top-p</label><input id="optTopP" class="num" type="number" step="0.01" min="0"
+            max="1" /></div>
         <div class="field"><label>Seed</label><input id="optSeed" class="num" type="number" step="1" /></div>
-        <div class="field"><label>Context (num_ctx)</label><input id="optNumCtx" class="num" type="number" step="1" min="128" /></div>
+        <div class="field"><label>Context (num_ctx)</label><input id="optNumCtx" class="num" type="number" step="1"
+            min="128" /></div>
       </div>
       <div class="field">
         <div class="chkrow">
@@ -157,10 +527,9 @@
 
   <!-- Copy-to-clipboard helper for code blocks -->
   <script>
-(() => {
-  // --- Styles for the copy button (dark-friendly) ---
-  const style = document.createElement('style');
-  style.textContent = `
+    (() => {
+      const style = document.createElement('style');
+      style.textContent = `
     pre { position: relative; }
     .code-copy-btn {
       position: absolute; top: 8px; right: 8px;
@@ -180,535 +549,546 @@
       color: #b2fab4;
     }
   `;
-  document.head.appendChild(style);
+      document.head.appendChild(style);
 
-  // --- Helper utils ---
-  const hasSelection = () => {
-    const sel = window.getSelection && window.getSelection();
-    return sel && String(sel).length > 0;
-  };
-
-  const flash = (btn, msg = 'Copied!') => {
-    const orig = btn.textContent;
-    btn.textContent = msg;
-    btn.classList.add('ok');
-    setTimeout(() => {
-      btn.textContent = orig;
-      btn.classList.remove('ok');
-    }, 1200);
-  };
-
-  const fallbackCopy = (text, btn) => {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.top = '-1000px';
-    document.body.appendChild(ta);
-    ta.focus(); ta.select();
-    try {
-      const ok = document.execCommand('copy');
-      flash(btn, ok ? 'Copied!' : 'Failed');
-    } catch {
-      flash(btn, 'Failed');
-    } finally {
-      document.body.removeChild(ta);
-    }
-  };
-
-  const doCopy = (codeEl, btn) => {
-    const text = codeEl.textContent || '';
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(
-        () => flash(btn, 'Copied!'),
-        () => fallbackCopy(text, btn)
-      );
-    } else {
-      fallbackCopy(text, btn);
-    }
-  };
-
-  // Attach a copy button to one code block
-  const attachButton = (codeEl) => {
-    if (!codeEl || codeEl.dataset.copyAttached === '1') return;
-    const pre = codeEl.closest('pre');
-    if (!pre) return;
-
-    // Avoid duplicates
-    if (pre.querySelector('.code-copy-btn')) {
-      codeEl.dataset.copyAttached = '1';
-      return;
-    }
-
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'code-copy-btn';
-    btn.textContent = 'Copy';
-    pre.appendChild(btn);
-
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      doCopy(codeEl, btn);
-    });
-
-    // Also allow clicking the code block to copy (if no selection)
-    pre.addEventListener('click', () => {
-      if (hasSelection()) return;
-      doCopy(codeEl, btn);
-    });
-
-    codeEl.dataset.copyAttached = '1';
-  };
-
-  // Scan current DOM
-  const scan = (root = document) => {
-    root.querySelectorAll('pre > code').forEach(attachButton);
-  };
-
-  // Observe future additions
-  const mo = new MutationObserver((muts) => {
-    for (const m of muts) {
-      m.addedNodes && m.addedNodes.forEach((n) => {
-        if (n.nodeType !== 1) return;
-        if (n.matches && n.matches('pre > code')) attachButton(n);
-        else scan(n);
+      const hasSelection = () => {
+        const sel = window.getSelection && window.getSelection();
+        return sel && String(sel).length > 0;
+      };
+      const flash = (btn, msg = 'Copied!') => {
+        const orig = btn.textContent;
+        btn.textContent = msg;
+        btn.classList.add('ok');
+        setTimeout(() => {
+          btn.textContent = orig;
+          btn.classList.remove('ok');
+        }, 1200);
+      };
+      const fallbackCopy = (text, btn) => {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.top = '-1000px';
+        document.body.appendChild(ta);
+        ta.focus(); ta.select();
+        try { flash(btn, document.execCommand('copy') ? 'Copied!' : 'Failed'); }
+        catch { flash(btn, 'Failed'); }
+        finally { document.body.removeChild(ta); }
+      };
+      const doCopy = (codeEl, btn) => {
+        const text = codeEl.textContent || '';
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(
+            () => flash(btn, 'Copied!'),
+            () => fallbackCopy(text, btn)
+          );
+        } else fallbackCopy(text, btn);
+      };
+      const attachButton = (codeEl) => {
+        if (!codeEl || codeEl.dataset.copyAttached === '1') return;
+        const pre = codeEl.closest('pre'); if (!pre) return;
+        if (pre.querySelector('.code-copy-btn')) { codeEl.dataset.copyAttached = '1'; return; }
+        const btn = document.createElement('button');
+        btn.type = 'button'; btn.className = 'code-copy-btn'; btn.textContent = 'Copy';
+        pre.appendChild(btn);
+        btn.addEventListener('click', (e) => { e.stopPropagation(); doCopy(codeEl, btn); });
+        pre.addEventListener('click', () => { if (!hasSelection()) doCopy(codeEl, btn); });
+        codeEl.dataset.copyAttached = '1';
+      };
+      const scan = (root = document) => { root.querySelectorAll('pre > code').forEach(attachButton); };
+      const mo = new MutationObserver((muts) => {
+        for (const m of muts) m.addedNodes && m.addedNodes.forEach((n) => {
+          if (n.nodeType !== 1) return;
+          if (n.matches && n.matches('pre > code')) attachButton(n); else scan(n);
+        });
       });
-    }
-  });
-  mo.observe(document.documentElement, { childList: true, subtree: true });
-
-  // Initial pass
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => scan());
-  } else {
-    scan();
-  }
-})();
+      mo.observe(document.documentElement, { childList: true, subtree: true });
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => scan()); else scan();
+    })();
   </script>
 
   <script>
-  // ─────────── Utils & storage
-  const $ = s => document.querySelector(s);
-  const el = id => document.getElementById(id);
-  const short = s => s ? (s.slice(0,7)+'…'+s.slice(-6)) : '—';
-  const isNknAddr = s => /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/.test((s||'').trim());
-  const debounce = (fn, ms=300) => { let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
+    // ─────────── Utils & storage
+    const $ = s => document.querySelector(s);
+    const el = id => document.getElementById(id);
+    const short = s => s ? (s.slice(0, 7) + '…' + s.slice(-6)) : '—';
+    const isNknAddr = s => /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/.test((s || '').trim());
+    const debounce = (fn, ms = 300) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
-  // Markdown + code highlighting setup
-  marked.setOptions({ gfm: true, breaks: true, headerIds: false, mangle: false });
-  function mdToHtml(s){ try{ return marked.parse(String(s||'')); }catch{ return String(s||''); } }
-  function highlightIn(node){
-    try{
-      node.querySelectorAll('pre code').forEach(block => { try{ hljs.highlightElement(block); }catch{} });
-    }catch{}
-  }
-
-  const STORAGE = {
-    SESS: 'CLIENT_SESSIONS_V1',
-    SETTINGS: 'CLIENT_SETTINGS_V1',
-    SEED: 'CLIENT_SEED_HEX',
-    HUB:  'CLIENT_HUB_ADDR',
-    LEGACY_SEED: 'PEERBALLS_SEED_HEX',
-    LEGACY_HUB:  'PEERBALLS_HUB_ADDR',
-    LAST_MODEL: 'CLIENT_LAST_SELECTED_MODEL'
-  };
-
-  function loadJSON(key, fallback){
-    try{ return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); }catch{ return fallback; }
-  }
-  function saveJSON(key, val){ localStorage.setItem(key, JSON.stringify(val)); }
-
-  const toHex = buf => Array.from(buf).map(b=>b.toString(16).padStart(2,'0')).join('');
-  function getOrCreateSeed(){
-    let hex = localStorage.getItem(STORAGE.SEED) || localStorage.getItem(STORAGE.LEGACY_SEED);
-    if(/^[0-9a-f]{64}$/.test(hex||'')) return hex;
-    const r = new Uint8Array(32); crypto.getRandomValues(r); hex = toHex(r);
-    localStorage.setItem(STORAGE.SEED, hex); return hex;
-  }
-
-  // Settings
-  const settings = (() => {
-    const defaultHub = localStorage.getItem(STORAGE.HUB) || localStorage.getItem(STORAGE.LEGACY_HUB) || '';
-    return loadJSON(STORAGE.SETTINGS, {
-      hub: defaultHub, temperature: 0.2, top_p: 0.9, seed: 0, num_ctx: 4096, stream: true
-    });
-  })();
-
-  function updateSettingsUI(){
-    el('hubInput').value = settings.hub || '';
-    el('optTemperature').value = settings.temperature;
-    el('optTopP').value = settings.top_p;
-    el('optSeed').value = settings.seed;
-    el('optNumCtx').value = settings.num_ctx;
-    el('optStream').checked = !!settings.stream;
-  }
-  function saveSettingsFromUI(){
-    const prevHub = settings.hub;
-    const hub = el('hubInput').value.trim();
-    if(!isNknAddr(hub)){ alert('Invalid hub address'); return false; }
-    settings.hub = hub;
-    settings.temperature = parseFloat(el('optTemperature').value || '0') || 0;
-    settings.top_p = parseFloat(el('optTopP').value || '1') || 1;
-    settings.seed = parseInt(el('optSeed').value || '0', 10) || 0;
-    settings.num_ctx = parseInt(el('optNumCtx').value || '4096', 10) || 4096;
-    settings.stream = !!el('optStream').checked;
-    saveJSON(STORAGE.SETTINGS, settings);
-    localStorage.setItem(STORAGE.HUB, settings.hub);
-    if (prevHub !== settings.hub) { location.reload(); return false; }
-    const s = getSession(); if (s) sendSessionOpen(s, /*seed*/false);
-    return true;
-  }
-
-  // Sessions
-  let sessions = loadJSON(STORAGE.SESS, []);
-  let activeSessionId = (sessions[0]?.id) || null;
-
-  const getSavedModel = () => localStorage.getItem(STORAGE.LAST_MODEL) || (sessions[0]?.model || '');
-  const setSavedModel = (m) => { if (m) localStorage.setItem(STORAGE.LAST_MODEL, m); };
-
-  function newId(prefix='id'){ return prefix + '-' + Math.random().toString(16).slice(2) + Date.now().toString(36); }
-  function createSessionForModel(model){
-    const id = newId('sess');
-    const s = { id, title: model, model, system: '', createdAt: Date.now(), messages: [] };
-    sessions.unshift(s); activeSessionId = id; saveJSON(STORAGE.SESS, sessions);
-    setSavedModel(model);
-    renderSessions(); renderSystemEditor(); renderChat();
-    sendSessionOpen(s, /*seed*/true); // seed (ensures model/system/options on server)
-  }
-  function getSession(id=activeSessionId){ return sessions.find(x=>x.id===id) || null; }
-  function setActiveSession(id){
-    activeSessionId = id;
-    const s = getSession();
-    if (s && s.model) {
-      setSavedModel(s.model);
-      // If models already loaded, reflect in dropdown
-      const sel = el('modelSelect');
-      if (sel && Array.from(sel.options).some(o=>o.value===s.model)) sel.value = s.model;
+    // Markdown + code highlighting setup
+    marked.setOptions({ gfm: true, breaks: true, headerIds: false, mangle: false });
+    function mdToHtml(s) { try { return marked.parse(String(s || '')); } catch { return String(s || ''); } }
+    function highlightIn(node) {
+      try { node.querySelectorAll('pre code').forEach(block => { try { hljs.highlightElement(block); } catch { } }); } catch { }
     }
-    renderSessions(); renderSystemEditor(); renderChat();
-    if (s) sendSessionOpen(s, /*seed*/true); // seed full history on selection
-  }
-  function appendMessage(sessId, role, content){
-    const s=getSession(sessId); if(!s) return; s.messages.push({role, content, ts:Date.now()}); saveJSON(STORAGE.SESS, sessions);
-  }
-  function updateLastAssistantContent(sessId, content){
-    const s=getSession(sessId); if(!s) return;
-    for(let i=s.messages.length-1;i>=0;i--){
-      if(s.messages[i].role==='assistant'){ s.messages[i].content=content; break; }
+
+    const STORAGE = {
+      SESS: 'CLIENT_SESSIONS_V1',
+      SETTINGS: 'CLIENT_SETTINGS_V1',
+      SEED: 'CLIENT_SEED_HEX',
+      HUB: 'CLIENT_HUB_ADDR',
+      LEGACY_SEED: 'PEERBALLS_SEED_HEX',
+      LEGACY_HUB: 'PEERBALLS_HUB_ADDR',
+      LAST_MODEL: 'CLIENT_LAST_SELECTED_MODEL'
+    };
+
+    function loadJSON(key, fallback) {
+      try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch { return fallback; }
     }
-    saveJSON(STORAGE.SESS, sessions);
-  }
-  function deleteSession(id){
-    const idx = sessions.findIndex(x=>x.id===id);
-    if (idx === -1) return;
-    const sid = sessions[idx].id;
-    // Notify hub (reset server-side cache)
-    sendSessionReset(sid);
-    sessions.splice(idx,1);
-    saveJSON(STORAGE.SESS, sessions);
-    // Reselect active
-    if (activeSessionId === id) {
-      activeSessionId = sessions[0]?.id || null;
+    function saveJSON(key, val) { localStorage.setItem(key, JSON.stringify(val)); }
+
+    const toHex = buf => Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
+    function getOrCreateSeed() {
+      let hex = localStorage.getItem(STORAGE.SEED) || localStorage.getItem(STORAGE.LEGACY_SEED);
+      if (/^[0-9a-f]{64}$/.test(hex || '')) return hex;
+      const r = new Uint8Array(32); crypto.getRandomValues(r); hex = toHex(r);
+      localStorage.setItem(STORAGE.SEED, hex); return hex;
     }
-    // Update saved model to new head if any
-    if (sessions[0]?.model) setSavedModel(sessions[0].model);
-    renderSessions(); renderSystemEditor(); renderChat();
-    // If new active exists, open it
-    if (activeSessionId) {
+
+    // Settings
+    const settings = (() => {
+      const defaultHub = localStorage.getItem(STORAGE.HUB) || localStorage.getItem(STORAGE.LEGACY_HUB) || '';
+      return loadJSON(STORAGE.SETTINGS, {
+        hub: defaultHub, temperature: 0.2, top_p: 0.9, seed: 0, num_ctx: 4096, stream: true
+      });
+    })();
+
+    // --- URL param → hub (supports ?hub=… or #hub=… and aliases) ---
+    function getUrlHubParam() {
+      const tryRead = (sp) => sp.get('hub') || sp.get('nkn') || sp.get('signaling') || sp.get('signal');
+      let v = '';
+      try { v = tryRead(new URLSearchParams(location.search)) || ''; } catch { }
+      if (!v && location.hash && location.hash.includes('=')) {
+        try { v = tryRead(new URLSearchParams(location.hash.slice(1))) || ''; } catch { }
+      }
+      return (v || '').trim();
+    }
+    function applyHubFromUrl() {
+      const h = getUrlHubParam();
+      if (h && isNknAddr(h)) {
+        settings.hub = h;
+        saveJSON(STORAGE.SETTINGS, settings);
+        localStorage.setItem(STORAGE.HUB, h);
+        // Clean the URL so the param isn't kept around
+        try {
+          const url = new URL(location.href);
+          ['hub', 'nkn', 'signaling', 'signal'].forEach(k => url.searchParams.delete(k));
+          history.replaceState(null, '', url.toString());
+        } catch { }
+      }
+    }
+
+    function updateSettingsUI() {
+      el('hubInput').value = settings.hub || '';
+      el('optTemperature').value = settings.temperature;
+      el('optTopP').value = settings.top_p;
+      el('optSeed').value = settings.seed;
+      el('optNumCtx').value = settings.num_ctx;
+      el('optStream').checked = !!settings.stream;
+    }
+    function saveSettingsFromUI() {
+      const prevHub = settings.hub;
+      const hub = el('hubInput').value.trim();
+      if (!isNknAddr(hub)) { alert('Invalid hub address'); return false; }
+      settings.hub = hub;
+      settings.temperature = parseFloat(el('optTemperature').value || '0') || 0;
+      settings.top_p = parseFloat(el('optTopP').value || '1') || 1;
+      settings.seed = parseInt(el('optSeed').value || '0', 10) || 0;
+      settings.num_ctx = parseInt(el('optNumCtx').value || '4096', 10) || 4096;
+      settings.stream = !!el('optStream').checked;
+      saveJSON(STORAGE.SETTINGS, settings);
+      localStorage.setItem(STORAGE.HUB, settings.hub);
+      if (prevHub !== settings.hub) { location.reload(); return false; }
+      const s = getSession(); if (s) sendSessionOpen(s, /*seed*/false);
+      return true;
+    }
+
+    // Sessions
+    let sessions = loadJSON(STORAGE.SESS, []);
+    let activeSessionId = (sessions[0]?.id) || null;
+
+    const getSavedModel = () => localStorage.getItem(STORAGE.LAST_MODEL) || (sessions[0]?.model || '');
+    const setSavedModel = (m) => { if (m) localStorage.setItem(STORAGE.LAST_MODEL, m); };
+
+    function newId(prefix = 'id') { return prefix + '-' + Math.random().toString(16).slice(2) + Date.now().toString(36); }
+    function createSessionForModel(model) {
+      const id = newId('sess');
+      const s = { id, title: model, model, system: '', createdAt: Date.now(), messages: [] };
+      sessions.unshift(s); activeSessionId = id; saveJSON(STORAGE.SESS, sessions);
+      setSavedModel(model);
+      renderSessions(); renderSystemEditor(); renderChat();
+      sendSessionOpen(s, /*seed*/true); // seed (ensures model/system/options on server)
+    }
+    function getSession(id = activeSessionId) { return sessions.find(x => x.id === id) || null; }
+    function setActiveSession(id) {
+      activeSessionId = id;
       const s = getSession();
-      if (s) sendSessionOpen(s, /*seed*/true);
+      if (s && s.model) {
+        setSavedModel(s.model);
+        const sel = el('modelSelect');
+        if (sel && Array.from(sel.options).some(o => o.value === s.model)) sel.value = s.model;
+      }
+      renderSessions(); renderSystemEditor(); renderChat();
+      if (s) sendSessionOpen(s, /*seed*/true); // seed full history on selection
     }
-  }
+    function appendMessage(sessId, role, content) {
+      const s = getSession(sessId); if (!s) return; s.messages.push({ role, content, ts: Date.now() }); saveJSON(STORAGE.SESS, sessions);
+    }
+    function updateLastAssistantContent(sessId, content) {
+      const s = getSession(sessId); if (!s) return;
+      for (let i = s.messages.length - 1; i >= 0; i--) {
+        if (s.messages[i].role === 'assistant') { s.messages[i].content = content; break; }
+      }
+      saveJSON(STORAGE.SESS, sessions);
+    }
+    function deleteSession(id) {
+      const idx = sessions.findIndex(x => x.id === id);
+      if (idx === -1) return;
+      const sid = sessions[idx].id;
+      sendSessionReset(sid);
+      sessions.splice(idx, 1);
+      saveJSON(STORAGE.SESS, sessions);
+      if (activeSessionId === id) activeSessionId = sessions[0]?.id || null;
+      if (sessions[0]?.model) setSavedModel(sessions[0].model);
+      renderSessions(); renderSystemEditor(); renderChat();
+      if (activeSessionId) { const s = getSession(); if (s) sendSessionOpen(s, /*seed*/true); }
+    }
 
-  function renderSessions(){
-    const box = el('sessions'); box.innerHTML='';
-    sessions.forEach(s=>{
-      const div = document.createElement('div'); div.className='session'+(s.id===activeSessionId?' active':'');
-      div.onclick=()=>setActiveSession(s.id);
-      div.innerHTML=`
-        <div class="title">${s.title||s.model||'Session'}</div>
-        <small>${s.model||''} • ${new Date(s.createdAt).toLocaleString()}</small>
+    function renderSessions() {
+      const box = el('sessions'); box.innerHTML = '';
+      sessions.forEach(s => {
+        const div = document.createElement('div'); div.className = 'session' + (s.id === activeSessionId ? ' active' : '');
+        div.onclick = () => setActiveSession(s.id);
+        div.innerHTML = `
+        <div class="title">${s.title || s.model || 'Session'}</div>
+        <small>${s.model || ''} • ${new Date(s.createdAt).toLocaleString()}</small>
         <button class="del" title="Delete session" aria-label="Delete">×</button>
       `;
-      const del = div.querySelector('.del');
-      del.addEventListener('click', (e)=>{
-        e.stopPropagation();
-        if (confirm('Delete this session?')) deleteSession(s.id);
+        const del = div.querySelector('.del');
+        del.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (confirm('Delete this session?')) deleteSession(s.id);
+        });
+        box.appendChild(div);
       });
-      box.appendChild(div);
-    });
-  }
-
-  // Markdown renderer for message body
-  function messageHtml(role, content){
-    // Render all messages as Markdown for consistency
-    return mdToHtml(content || '');
-  }
-
-  function renderSystemEditor(){
-    const s = getSession();
-    const ta = el('systemMsg');
-    if(!s){
-      ta.value = '';
-      ta.placeholder = '(Select or create a session to set a system prompt)';
-      ta.disabled = true;
-      return;
     }
-    ta.disabled = false;
-    ta.value = s.system || '';
-    ta.placeholder = "(Optional) e.g. 'You are a concise assistant. Answer with short bullets.'";
-  }
 
-  function renderChat(){
-    const s=getSession(); const box=el('chat'); box.innerHTML='';
-    if(!s){ box.innerHTML=`<div class="muted" style="text-align:center;margin-top:30px">Choose a model above to create a session.</div>`; return; }
-    s.messages.forEach(m=>{
-      const w=document.createElement('div'); w.className='msg '+(m.role==='user'?'user':'assistant');
-      const contentHtml = messageHtml(m.role, m.content);
-      w.innerHTML=`<div class="meta">${m.role} • ${new Date(m.ts).toLocaleTimeString()}</div><div class="content">${contentHtml}</div>`;
-      box.appendChild(w);
-      // highlight code inside this message
-      highlightIn(w);
-    });
-    box.scrollTop=box.scrollHeight;
-  }
+    // Markdown renderer for message body
+    function messageHtml(role, content) { return mdToHtml(content || ''); }
 
-  function addStreamingAssistantBubble(){
-    const s=getSession(); if(!s) return;
-    const w=document.createElement('div'); w.className='msg assistant'; w.dataset.stream='1';
-    w.innerHTML=`<div class="meta">assistant • streaming…</div><div class="content" id="streamContent"></div>`;
-    el('chat').appendChild(w); el('chat').scrollTop=el('chat').scrollHeight;
-  }
-  function setStreamingContent(text){
-    const c=el('streamContent');
-    if(c){
-      c.innerHTML = mdToHtml(text || '');
-      highlightIn(c);
-      el('chat').scrollTop=el('chat').scrollHeight;
-    }
-  }
-  function finishStreamingBubble(){
-    const c=el('streamContent'); if(c){ c.removeAttribute('id'); }
-    const m=document.querySelector('.msg.assistant[data-stream="1"] .meta'); if(m) m.textContent='assistant • done';
-    const w=document.querySelector('.msg.assistant[data-stream="1"]'); if(w) w.dataset.stream='0';
-  }
-
-  // NKN
-  let client=null,myAddr=null; let HUB_ADDR=settings.hub||'';
-  function updateChips(){ el('hubChip').textContent='hub: '+(HUB_ADDR?short(HUB_ADDR):'—'); el('meChip').textContent='me: '+(myAddr?short(myAddr):'—'); }
-  function trySend(addr,obj){ if(!client||!addr) return; try{ client.send(addr, JSON.stringify(obj)); }catch{} }
-
-  // Streaming (ordered)
-  const streams=new Map();
-  function startStream(id,onChunk){ streams.set(id,{next:1,lastAck:0,buffer:new Map(),onChunk}); }
-  function handleChunk(id,seq,data){
-    const st=streams.get(id); if(!st) return; st.buffer.set(seq,data);
-    while(st.buffer.has(st.next)){ const part=st.buffer.get(st.next); st.buffer.delete(st.next); st.onChunk(part); st.next++; }
-    sendAck(id, st.next-1);
-  }
-  function sendAck(id,upto){ const st=streams.get(id); if(!st||upto<=st.lastAck) return; st.lastAck=upto; trySend(HUB_ADDR,{event:'llm.ack',id,upto}); }
-  function endStream(id){ streams.delete(id); }
-
-  // Models
-  let modelsLoaded = false;
-  function requestModelsList(){ trySend(HUB_ADDR, {event:'llm.request', api:'list', stream:false}); }
-  function ensureModels(){
-    const backoff = [0, 500, 1500, 3000, 5000, 8000];
-    backoff.forEach((ms, i)=> setTimeout(()=>{ if(!modelsLoaded){ requestModelsList(); } }, ms));
-  }
-  function populateModels(models){
-    const sel=el('modelSelect'); sel.innerHTML='';
-    (models||[]).forEach(m=>{
-      const name = m.model || m.name || '';
-      if(!name) return;
-      const opt=document.createElement('option'); opt.value=name; opt.textContent=name; sel.appendChild(opt);
-    });
-    modelsLoaded = (sel.options.length>0);
-    sel.disabled = !modelsLoaded;
-    if(!modelsLoaded){ const opt=document.createElement('option'); opt.textContent='— no models —'; sel.appendChild(opt); }
-    // Restore last selection (last session's model wins)
-    const remembered = getSavedModel();
-    if (remembered && Array.from(sel.options).some(o => o.value === remembered)) {
-      sel.value = remembered;
-    }
-    sel.onchange = ()=>{
-      const model=sel.value;
-      if(model && modelsLoaded){
-        setSavedModel(model);
-        createSessionForModel(model);
-      }
-    };
-  }
-
-  // Build history for seeding (exclude 'system'; it's sent separately)
-  function buildHistoryForSession(sess){
-    return (sess?.messages || []).map(m => ({ role: m.role, content: m.content }));
-  }
-
-  // Session control → hub
-  function currentOptions(){ return { temperature: settings.temperature, top_p: settings.top_p, seed: settings.seed, num_ctx: settings.num_ctx }; }
-  function sendSessionOpen(s, seed){
-    if(!s || !HUB_ADDR) return;
-    const payload = {
-      event: 'session.open',
-      sid: s.id,
-      model: s.model || undefined,
-      system: (s.system||''),
-      options: currentOptions()
-    };
-    if (seed) {
-      payload.history = buildHistoryForSession(s);
-      payload.replace = true; // authoritative seed
-    }
-    trySend(HUB_ADDR, payload);
-  }
-  function sendSessionReset(sid){ if(!sid || !HUB_ADDR) return; trySend(HUB_ADDR, { event: 'session.reset', sid }); }
-
-  function connectNKN(){
-    if(!isNknAddr(HUB_ADDR)){ openSettings(); return; }
-    updateChips();
-    client = new nkn.MultiClient({ seed: getOrCreateSeed(), identifier: 'client' });
-    client.onConnect(()=>{
-      myAddr = client.addr; updateChips();
-      trySend(HUB_ADDR, {event:'announce'}); // auto models push
-      const sel=el('modelSelect'); sel.innerHTML='<option>— loading models —</option>'; sel.disabled=true;
-      modelsLoaded = false; ensureModels();
-
-      // Reselect dropdown to last session's model ASAP (once models arrive populateModels will set it)
+    function renderSystemEditor() {
       const s = getSession();
-      if (s) {
-        setSavedModel(s.model || getSavedModel());
-        sendSessionOpen(s, /*seed*/true);
+      const ta = el('systemMsg');
+      if (!s) {
+        ta.value = '';
+        ta.placeholder = '(Select or create a session to set a system prompt)';
+        ta.disabled = true;
+        return;
       }
-    });
-    client.on('message', onInbound);
-    window.addEventListener('beforeunload', ()=>{ try{ client && client.close(); }catch{} });
-  }
+      ta.disabled = false;
+      ta.value = s.system || '';
+      ta.placeholder = "(Optional) e.g. 'You are a concise assistant. Answer with short bullets.'";
+    }
 
-  // Inbound
-  function onInbound(a,b){
-    let src, payload;
-    if(a && typeof a==='object' && (a.payload!==undefined || a.data!==undefined || a.src!==undefined)){
-      src = a.src || a.from || ''; payload = a.payload ?? a.data;
-    } else { src=a; payload=b; }
-    let body=null;
-    try{
-      if(payload instanceof Uint8Array) body = JSON.parse(new TextDecoder().decode(payload));
-      else if(typeof payload==='string') body = JSON.parse(payload);
-      else body = payload;
-    }catch{ return; }
-    if(!body || src!==HUB_ADDR) return;
+    function renderChat() {
+      const s = getSession(); const box = el('chat'); box.innerHTML = '';
+      if (!s) { box.innerHTML = `<div class="muted" style="text-align:center;margin-top:30px">Choose a model above to create a session.</div>`; return; }
+      s.messages.forEach(m => {
+        const w = document.createElement('div'); w.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+        const contentHtml = messageHtml(m.role, m.content);
+        w.innerHTML = `<div class="meta">${m.role} • ${new Date(m.ts).toLocaleTimeString()}</div><div class="content">${contentHtml}</div>`;
+        box.appendChild(w);
+        highlightIn(w);
+      });
+      box.scrollTop = box.scrollHeight;
+    }
 
-    const ev = body.event;
+    function addStreamingAssistantBubble() {
+      const s = getSession(); if (!s) return;
+      const w = document.createElement('div'); w.className = 'msg assistant'; w.dataset.stream = '1';
+      w.innerHTML = `<div class="meta">assistant • streaming…</div><div class="content" id="streamContent"></div>`;
+      el('chat').appendChild(w); el('chat').scrollTop = el('chat').scrollHeight;
+    }
+    function setStreamingContent(text) {
+      const c = el('streamContent');
+      if (c) {
+        c.innerHTML = mdToHtml(text || '');
+        highlightIn(c);
+        el('chat').scrollTop = el('chat').scrollHeight;
+      }
+    }
+    function finishStreamingBubble() {
+      const c = el('streamContent'); if (c) { c.removeAttribute('id'); }
+      const m = document.querySelector('.msg.assistant[data-stream="1"] .meta'); if (m) m.textContent = 'assistant • done';
+      const w = document.querySelector('.msg.assistant[data-stream="1"]'); if (w) w.dataset.stream = '0';
+    }
 
-    // Session/control logs
-    if(ev==='session.ready' || ev==='session.info' || ev==='ctrl.info'){ /* dev log */ return; }
-    if(ev==='ctrl.error'){ console.warn('[ctrl.error]', body); return; }
+    // NKN
+    let client = null, myAddr = null; let HUB_ADDR = settings.hub || '';
+    function updateChips() { el('hubChip').textContent = 'hub: ' + (HUB_ADDR ? short(HUB_ADDR) : '—'); el('meChip').textContent = 'me: ' + (myAddr ? short(myAddr) : '—'); }
+    function trySend(addr, obj) { if (!client || !addr) return; try { client.send(addr, JSON.stringify(obj)); } catch { } }
+
+    // Streaming (ordered)
+    const streams = new Map();
+
+    // NEW: track current/pending stream ids and cancellations for Stop button
+    let currentStreamId = null;           // the stream we can cancel now
+    let pendingStreamId = null;           // id announced by llm.start before first chunk
+    let isStreaming = false;              // UI mode flag
+    const cancelledStreams = new Set();   // ids we asked to cancel; ignore their chunks
+
+    function startStream(id, onChunk) { streams.set(id, { next: 1, lastAck: 0, buffer: new Map(), onChunk }); }
+    function handleChunk(id, seq, data) {
+      if (cancelledStreams.has(id)) return; // ignore chunks after user stopped
+      const st = streams.get(id); if (!st) return; st.buffer.set(seq, data);
+      // On first observed token for pending stream, flip to Stop
+      if (!isStreaming && currentStreamId === null && pendingStreamId === id) {
+        setStopMode(id);
+      }
+      while (st.buffer.has(st.next)) { const part = st.buffer.get(st.next); st.buffer.delete(st.next); st.onChunk(part); st.next++; }
+      sendAck(id, st.next - 1);
+    }
+    function sendAck(id, upto) { const st = streams.get(id); if (!st || upto <= st.lastAck) return; st.lastAck = upto; trySend(HUB_ADDR, { event: 'llm.ack', id, upto }); }
+    function endStream(id) { streams.delete(id); cancelledStreams.delete(id); if (currentStreamId === id) currentStreamId = null; if (pendingStreamId === id) pendingStreamId = null; }
 
     // Models
-    if(ev==='llm.models' && body.data && body.data.models){ populateModels(body.data.models); return; }
-    if(ev==='llm.result' && body.data && body.data.models){ populateModels(body.data.models); return; }
-
-    // LLM streaming / results
-    if(ev==='llm.start'){
-      const { id, stream } = body;
-      if(stream){
-        addStreamingAssistantBubble();
-        const sess=getSession(); if(!sess) return;
-        sess.messages.push({role:'assistant', content:'', ts: Date.now()}); saveJSON(STORAGE.SESS,sessions);
-        let acc='';
-        startStream(id,(part)=>{
-          const text=extractDelta(part);
-          if(text){
-            acc+=text;
-            setStreamingContent(acc);
-            updateLastAssistantContent(sess.id, acc);
-          }
-        });
+    let modelsLoaded = false;
+    function requestModelsList() { trySend(HUB_ADDR, { event: 'llm.request', api: 'list', stream: false }); }
+    function ensureModels() {
+      const backoff = [0, 500, 1500, 3000, 5000, 8000];
+      backoff.forEach((ms) => setTimeout(() => { if (!modelsLoaded) { requestModelsList(); } }, ms));
+    }
+    function populateModels(models) {
+      const sel = el('modelSelect'); sel.innerHTML = '';
+      (models || []).forEach(m => {
+        const name = m.model || m.name || '';
+        if (!name) return;
+        const opt = document.createElement('option'); opt.value = name; opt.textContent = name; sel.appendChild(opt);
+      });
+      modelsLoaded = (sel.options.length > 0);
+      sel.disabled = !modelsLoaded;
+      if (!modelsLoaded) { const opt = document.createElement('option'); opt.textContent = '— no models —'; sel.appendChild(opt); }
+      // Restore last selection (last session's model wins)
+      const remembered = getSavedModel();
+      if (remembered && Array.from(sel.options).some(o => o.value === remembered)) {
+        sel.value = remembered;
       }
-      return;
+      sel.onchange = () => {
+        const model = sel.value;
+        if (model && modelsLoaded) {
+          setSavedModel(model);
+          createSessionForModel(model);
+        }
+      };
     }
-    if(ev==='llm.chunk'){ handleChunk(body.id, body.seq, body.data); return; }
-    if(ev==='llm.done'){ finishStreamingBubble(); sendAck(body.id, body.last_seq); endStream(body.id); return; }
-    if(ev==='llm.result'){
-      const sess=getSession(); if(!sess) return;
-      const text=extractFull(body.data);
-      appendMessage(sess.id,'assistant',text);
-      renderChat();
-      return;
+
+    // Build history for seeding (exclude 'system'; it's sent separately)
+    function buildHistoryForSession(sess) {
+      return (sess?.messages || []).map(m => ({ role: m.role, content: m.content }));
     }
-    if(ev==='llm.error'){
-      const sess=getSession(); if(!sess) return;
-      appendMessage(sess.id,'assistant','[error] '+body.message);
-      renderChat();
-      return;
+
+    // Session control → hub
+    function currentOptions() { return { temperature: settings.temperature, top_p: settings.top_p, seed: settings.seed, num_ctx: settings.num_ctx }; }
+    function sendSessionOpen(s, seed) {
+      if (!s || !HUB_ADDR) return;
+      const payload = {
+        event: 'session.open',
+        sid: s.id,
+        model: s.model || undefined,
+        system: (s.system || ''),
+        options: currentOptions()
+      };
+      if (seed) {
+        payload.history = buildHistoryForSession(s);
+        payload.replace = true; // authoritative seed
+      }
+      trySend(HUB_ADDR, payload);
     }
-  }
+    function sendSessionReset(sid) { if (!sid || !HUB_ADDR) return; trySend(HUB_ADDR, { event: 'session.reset', sid }); }
 
-  function extractDelta(part){
-    if(part?.message?.content) return part.message.content;
-    if(typeof part?.response === 'string') return part.response;
-    return '';
-  }
-  function extractFull(obj){
-    if(obj?.message?.content) return obj.message.content;
-    if(typeof obj?.response === 'string') return obj.response;
-    try{ return JSON.stringify(obj); }catch{ return String(obj); }
-  }
+    function connectNKN() {
+      if (!isNknAddr(HUB_ADDR)) { openSettings(); return; }
+      updateChips();
+      client = new nkn.MultiClient({ seed: getOrCreateSeed(), identifier: 'client' });
+      client.onConnect(() => {
+        myAddr = client.addr; updateChips();
+        trySend(HUB_ADDR, { event: 'announce' }); // auto models push
+        const sel = el('modelSelect'); sel.innerHTML = '<option>— loading models —</option>'; sel.disabled = true;
+        modelsLoaded = false; ensureModels();
 
-  // Compose & send (DELTA MODE)
-  function sendPrompt(){
-    const s=getSession(); if(!s){ alert('Choose a model first.'); return; }
-    const text=el('prompt').value; if(!text.trim()) return;
+        const s = getSession();
+        if (s) {
+          setSavedModel(s.model || getSavedModel());
+          sendSessionOpen(s, /*seed*/true);
+        }
+      });
+      client.on('message', onInbound);
+      window.addEventListener('beforeunload', () => { try { client && client.close(); } catch { } });
+    }
 
-    appendMessage(s.id,'user',text.trim()); renderChat(); el('prompt').value='';
+    // Inbound
+    function onInbound(a, b) {
+      let src, payload;
+      if (a && typeof a === 'object' && (a.payload !== undefined || a.data !== undefined || a.src !== undefined)) {
+        src = a.src || a.from || ''; payload = a.payload ?? a.data;
+      } else { src = a; payload = b; }
+      let body = null;
+      try {
+        if (payload instanceof Uint8Array) body = JSON.parse(new TextDecoder().decode(payload));
+        else if (typeof payload === 'string') body = JSON.parse(payload);
+        else body = payload;
+      } catch { return; }
+      if (!body || src !== HUB_ADDR) return;
 
-    const reqId=newId('req');
-    const doStream = !!settings.stream;
+      const ev = body.event;
 
-    trySend(HUB_ADDR,{
-      event:'llm.request',
-      id:reqId,
-      api:'chat',
-      sid:s.id,
-      delta:text.trim(),
-      stream:doStream,
-      kwargs:{ options: currentOptions() }
-    });
-  }
+      if (ev === 'session.ready' || ev === 'session.info' || ev === 'ctrl.info') { return; }
+      if (ev === 'ctrl.error') { console.warn('[ctrl.error]', body); return; }
 
-  // System editor → persist locally and push to hub
-  el('systemMsg').addEventListener('input', debounce(()=>{
-    const s = getSession(); if(!s) return;
-    s.system = el('systemMsg').value;
-    saveJSON(STORAGE.SESS, sessions);
-    sendSessionOpen(s, /*seed*/false);
-  }, 250));
+      if (ev === 'llm.models' && body.data && body.data.models) { populateModels(body.data.models); return; }
+      if (ev === 'llm.result' && body.data && body.data.models) { populateModels(body.data.models); return; }
 
-  // Settings modal
-  function openSettings(){ updateSettingsUI(); el('overlay').style.display='flex'; }
-  function closeSettings(){ el('overlay').style.display='none'; }
+      if (ev === 'llm.start') {
+        const { id, stream } = body;
+        if (stream) {
+          pendingStreamId = id;             // wait for first token to flip UI to Stop
+          addStreamingAssistantBubble();
+          const sess = getSession(); if (!sess) return;
+          sess.messages.push({ role: 'assistant', content: '', ts: Date.now() }); saveJSON(STORAGE.SESS, sessions);
+          let acc = '';
+          startStream(id, (part) => {
+            const text = extractDelta(part);
+            if (text) { acc += text; setStreamingContent(acc); updateLastAssistantContent(sess.id, acc); }
+          });
+        }
+        return;
+      }
+      if (ev === 'llm.chunk') { handleChunk(body.id, body.seq, body.data); return; }
+      if (ev === 'llm.done') {
+        finishStreamingBubble(); sendAck(body.id, body.last_seq); endStream(body.id);
+        setSendMode(); // back to send
+        return;
+      }
+      if (ev === 'llm.result') {
+        const sess = getSession(); if (!sess) return;
+        const text = extractFull(body.data);
+        appendMessage(sess.id, 'assistant', text);
+        renderChat();
+        return;
+      }
+      if (ev === 'llm.error') {
+        const sess = getSession(); if (!sess) return;
+        appendMessage(sess.id, 'assistant', '[error] ' + body.message);
+        renderChat();
+        // ensure button resets even if an error interrupts a stream
+        setSendMode();
+        return;
+      }
+    }
 
-  // Boot
-  function boot(){
-    // Make sure dropdown remembers last model immediately
-    const sel = el('modelSelect');
-    const remembered = getSavedModel();
-    if (remembered) { sel.dataset.remembered = remembered; }
+    function extractDelta(part) {
+      if (part?.message?.content) return part.message.content;
+      if (typeof part?.response === 'string') return part.response;
+      return '';
+    }
+    function extractFull(obj) {
+      if (obj?.message?.content) return obj.message.content;
+      if (typeof obj?.response === 'string') return obj.response;
+      try { return JSON.stringify(obj); } catch { return String(obj); }
+    }
 
-    renderSessions(); renderSystemEditor(); renderChat(); updateSettingsUI(); updateChips();
-    el('sendBtn').onclick=sendPrompt;
-    el('prompt').addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendPrompt(); }});
-    el('settingsBtn').onclick=openSettings; el('closeModal').onclick=closeSettings;
-    el('saveSettings').onclick=()=>{ if(saveSettingsFromUI()){ closeSettings(); } };
-    el('newSessionBtn').onclick=()=>{
-      const sel=el('modelSelect'); const model=sel.value || sel.options[0]?.value;
-      if(!model || sel.disabled){ alert('No models yet. Set hub and ensure it’s running.'); return; }
-      createSessionForModel(model);
-    };
-    if (activeSessionId) setActiveSession(activeSessionId);
-    connectNKN();
-  }
-  boot();
+    // Compose & send (DELTA MODE)
+    function sendPrompt() {
+      const s = getSession(); if (!s) { alert('Choose a model first.'); return; }
+      const text = el('prompt').value; if (!text.trim()) return;
+
+      appendMessage(s.id, 'user', text.trim()); renderChat(); el('prompt').value = '';
+
+      const reqId = newId('req');
+      const doStream = !!settings.stream;
+
+      trySend(HUB_ADDR, {
+        event: 'llm.request',
+        id: reqId,
+        api: 'chat',
+        sid: s.id,
+        delta: text.trim(),
+        stream: doStream,
+        kwargs: { options: currentOptions() }
+      });
+    }
+
+    // NEW: Stop button behavior
+    function setStopMode(id) {
+      const btn = el('sendBtn');
+      currentStreamId = id;
+      isStreaming = true;
+      btn.textContent = 'Stop';
+      btn.onclick = stopGeneration;
+    }
+    function setSendMode() {
+      const btn = el('sendBtn');
+      isStreaming = false;
+      pendingStreamId = null;
+      currentStreamId = null;
+      btn.textContent = 'Send';
+      btn.onclick = sendPrompt;
+    }
+    function stopGeneration() {
+      if (!currentStreamId || !HUB_ADDR) { setSendMode(); return; }
+      cancelledStreams.add(currentStreamId);
+      trySend(HUB_ADDR, { event: 'llm.cancel', id: currentStreamId });
+      // Immediately return the UI to Send mode; incoming llm.done will be handled gracefully.
+      setSendMode();
+    }
+
+    // System editor → persist locally and push to hub
+    el('systemMsg').addEventListener('input', debounce(() => {
+      const s = getSession(); if (!s) return;
+      s.system = el('systemMsg').value;
+      saveJSON(STORAGE.SESS, sessions);
+      sendSessionOpen(s, /*seed*/false);
+    }, 250));
+
+    // Settings modal
+    function openSettings() { updateSettingsUI(); el('overlay').style.display = 'flex'; }
+    function closeSettings() { el('overlay').style.display = 'none'; }
+
+    // Sidebar Toggle Mobile
+    function toggleSidebar() {
+      const el = document.getElementById('sidebar');
+      if (!el) return; // quietly no-op if missing
+
+      // Read current computed left; treat 0px/0% as "open"
+      const curLeft = getComputedStyle(el).left.trim();
+      el.style.left = (curLeft === '0px' || curLeft === '0%') ? '-50%' : '0%';
+    }
+
+    // Boot
+    function boot() {
+      // Apply hub from URL before anything else that depends on it
+      applyHubFromUrl();
+
+      renderSessions(); renderSystemEditor(); renderChat(); updateSettingsUI();
+
+      // Ensure HUB_ADDR reflects (possibly updated) settings.hub
+      HUB_ADDR = settings.hub || '';
+      updateChips();
+
+      el('sendBtn').onclick = sendPrompt;
+      el('prompt').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); } });
+      el('settingsBtn').onclick = openSettings; el('closeModal').onclick = closeSettings;
+      el('saveSettings').onclick = () => { if (saveSettingsFromUI()) { closeSettings(); } };
+      el('newSessionBtn').onclick = () => {
+        const sel = el('modelSelect'); const model = sel.value || sel.options[0]?.value;
+        if (!model || sel.disabled) { alert('No models yet. Set hub and ensure it’s running.'); return; }
+        createSessionForModel(model);
+      };
+      if (activeSessionId) setActiveSession(activeSessionId);
+      connectNKN();
+    }
+    boot();
   </script>
 </body>
+
 </html>
