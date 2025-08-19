@@ -4,7 +4,8 @@
 <head>
   <meta charset="utf-8" />
   <title>NKN Client — LLM Chat</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+
   <meta name="theme-color" content="#000" />
   <!-- NKN SDK -->
   <script src="https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js"></script>
@@ -27,6 +28,8 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/go.min.js"></script>
 
   <style>
+    @import url('https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400..700;1,400..700&display=swap');
+
     :root {
       --bg: #000;
       --panel: #0a0a0a;
@@ -50,7 +53,14 @@
       margin: 0;
       background: var(--bg);
       color: var(--fg);
-      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, "Helvetica Neue", Arial
+      font-family: "Instrument Sans", sans-serif;
+      touch-action: manipulation;
+      -ms-touch-action: manipulation;
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      -moz-user-select: none;
+      -ms-user-select: none;
+      user-select: none;
     }
 
     .app {
@@ -112,12 +122,19 @@
     }
 
     .gear {
+      display: flex;
+      flex-flow: row;
+      justify-content: center;
+      min-width:34px;
+      min-height:34px;
       cursor: pointer;
       border: 1px solid #2a2a2a;
       border-radius: 10px;
-      padding: 8px 10px;
+      padding: 10px 10px;
+      font-size:14px;
+      line-height: 1;
       background: #0a0a0a;
-      color:white;
+      color: white;
     }
 
     .gear:active {
@@ -227,6 +244,7 @@
       border-radius: 12px;
       padding: 10px
     }
+
     .sysinput:focus {
       outline: none;
       border-color: #fff;
@@ -343,7 +361,7 @@
       background: #000;
       border: 1px solid #fff;
       color: #fff;
-      padding: 12px 14px;
+      padding: 12px 23px;
       border-radius: 12px;
       cursor: pointer
     }
@@ -370,7 +388,8 @@
       display: none;
       align-items: center;
       justify-content: center;
-      z-index: 50
+      z-index: 50;
+      backdrop-filter: blur(10px);
     }
 
     .modal {
@@ -385,8 +404,8 @@
     .modal h3 {
       margin: .2rem 0 .8rem 0
     }
-    
-    .modal > .row{
+
+    .modal>.row {
       display: flex;
       justify-content: flex-start;
     }
@@ -427,14 +446,14 @@
       margin-top: 10px
     }
 
-      #toggleSidebar{
-        display:none;
-      }
-      
+    #toggleSidebar {
+      display: none;
+    }
+
     @media (max-width: 900px) {
 
-      #toggleSidebar{
-        display:flex;
+      #toggleSidebar {
+        display: flex;
       }
 
       .app {
@@ -458,11 +477,11 @@
 <body>
   <div class="app">
     <header>
-      <button class="gear" id="toggleSidebar" onclick="toggleSidebar()">►</button>
+      <button class="gear" id="toggleSidebar" onclick="toggleSidebar()">☰</button>
       <select id="modelSelect" class="topbar-select" title="Available models" disabled>
         <option>— loading models —</option>
       </select>
-      <button id="settingsBtn" class="gear" aria-label="Settings">⚙</button>
+      <button id="settingsBtn" class="gear" aria-label="Settings">☷</button>
     </header>
 
     <aside id="sidebar" class="col-left">
@@ -484,7 +503,7 @@
 
       <div class="composer">
         <textarea id="prompt" class="input" placeholder="Type a message… (Shift+Enter = newline)"></textarea>
-        <button id="sendBtn" class="btn">Send</button>
+        <button id="sendBtn" class="btn">⮞</button>
       </div>
     </main>
   </div>
@@ -1023,7 +1042,7 @@
       const btn = el('sendBtn');
       currentStreamId = id;
       isStreaming = true;
-      btn.textContent = 'Stop';
+      btn.textContent = '⏹';
       btn.onclick = stopGeneration;
     }
     function setSendMode() {
@@ -1031,7 +1050,7 @@
       isStreaming = false;
       pendingStreamId = null;
       currentStreamId = null;
-      btn.textContent = 'Send';
+      btn.textContent = '⮞';
       btn.onclick = sendPrompt;
     }
     function stopGeneration() {
