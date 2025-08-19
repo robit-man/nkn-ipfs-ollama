@@ -3,13 +3,10 @@
 client_signaling_server.py — NKN hub + Ollama bridge
 (Session-backed chat context, ordered streaming with ACKs, control channel)
 
-Features
-- Session cache per (src_addr, sid); stores system, model, default options, and interlaced messages.
-- session.open to create/update session; session.reset to clear; session.info to inspect.
-- llm.request supports "delta" mode (frontend sends only latest user message + sid).
-- Backward compatible with kwargs.messages (frontend-provided full history).
-- Ordered streaming (llm.start → llm.chunk(seq) → llm.done) with cumulative ACKs + resend.
-- Robust Ollama response normalization for list/result streaming.
+Fixes / Guarantees in this build:
+- No Popen monkey-patch recursion. We record child start_time on spawn.
+- Bridge watchdog: restart on crash, no-ready timeout, or stalled heartbeats.
+- Streaming reliability: run final resend sweeps BEFORE llm.done is sent.
 """
 
 # ──────────────────────────────────────────────────────────────────────
@@ -111,8 +108,13 @@ SESSION_TTL_SECS   = 60 * 45      # prune sessions idle > 45m
 SESSION_MAX_TURNS  = 20           # keep last 20 user/assistant turns (40 msgs) + system
 SESSION_LOCK = threading.RLock()
 
+# Watchdog config (bridge)
+READY_GRACE_SECS   = 20.0
+HB_INTERVAL_SECS   = 5.0
+HB_STALL_SECS      = 20.0
+
 # ──────────────────────────────────────────────────────────────────────
-# IV. Node NKN bridge (DM-first; hardened sends)
+# IV. Node NKN bridge (DM-first; hardened sends) + watchdog
 # ──────────────────────────────────────────────────────────────────────
 NODE_DIR = BASE_DIR / "bridge-node"
 NODE_BIN = shutil.which("node")
@@ -161,7 +163,7 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
 
   client.on('connect', () => {
     READY = true;
-    sendToPy({ type: 'ready', address: client.addr, topicPrefix: TOPIC_NS });
+    sendToPy({ type: 'ready', address: client.addr, topicPrefix: TOPIC_NS, ts: Date.now() });
     log('ready at', client.addr);
   });
 
@@ -209,6 +211,11 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
   }
   setInterval(drain, 300);
 
+  // Heartbeat to Python watchdog
+  setInterval(() => {
+    try { sendToPy({ type: 'hb', ts: Date.now(), ready: READY }); } catch {}
+  }, 5000);
+
   const rl = readline.createInterface({ input: process.stdin });
   rl.on('line', async line => {
     if (!line) return;
@@ -230,15 +237,31 @@ bridge_env = os.environ.copy()
 bridge_env["NKN_SEED_HEX"]     = NKN_SEED_HEX
 bridge_env["NKN_TOPIC_PREFIX"] = TOPIC_PREFIX
 
-bridge = Popen([str(shutil.which("node")), str(BRIDGE_JS)], cwd=NODE_DIR, env=bridge_env,
-               stdin=PIPE, stdout=PIPE, stderr=PIPE, text=True, bufsize=1)
-
+# Bridge process + watchdog state
+bridge = None
 state: Dict[str, Any] = {"nkn_address": None, "topic_prefix": TOPIC_PREFIX}
+_last_hb = 0.0
+_ready_at = 0.0
+_bridge_starts = 0
+_bridge_lock = threading.Lock()
+
+def _spawn_bridge() -> Popen:
+    global _last_hb, _ready_at, _bridge_starts
+    _last_hb = time.time()
+    _ready_at = 0.0
+    _bridge_starts += 1
+    proc = Popen([str(shutil.which("node")), str(BRIDGE_JS)],
+                 cwd=NODE_DIR, env=bridge_env,
+                 stdin=PIPE, stdout=PIPE, stderr=PIPE,
+                 text=True, bufsize=1)
+    setattr(proc, "start_time", time.time())
+    return proc
 
 def _bridge_send(obj: dict):
     try:
-        bridge.stdin.write(json.dumps(obj) + "\n")
-        bridge.stdin.flush()
+        if bridge and bridge.stdin:
+            bridge.stdin.write(json.dumps(obj) + "\n")
+            bridge.stdin.flush()
     except Exception:
         pass
 
@@ -246,30 +269,93 @@ def _dm(to: str, data: dict):
     _bridge_send({"type": "dm", "to": to, "data": data})
 
 def _bridge_reader_stdout():
-    for line in bridge.stdout:
-        line = (line or "").strip()
-        if not line: continue
+    global _last_hb, _ready_at
+    while True:
         try:
-            msg = json.loads(line)
+            if not bridge or not bridge.stdout:
+                time.sleep(0.2); continue
+            line = bridge.stdout.readline()
+            if line == '' and bridge.poll() is not None:
+                time.sleep(0.2); continue
+            line = (line or "").strip()
+            if not line: continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+
+            if msg.get("type") == "ready":
+                state["nkn_address"]  = msg.get("address")
+                state["topic_prefix"] = msg.get("topicPrefix") or TOPIC_PREFIX
+                _ready_at = time.time()
+                print(f"→ NKN ready: {state['nkn_address']}  (topics prefix: {state['topic_prefix']})")
+
+            elif msg.get("type") == "hb":
+                _last_hb = time.time()
+
+            elif msg.get("type") == "nkn-dm":
+                src = msg.get("src") or ""
+                body = msg.get("msg") or {}
+                _handle_dm(src, body)
         except Exception:
-            continue
-
-        if msg.get("type") == "ready":
-            state["nkn_address"]  = msg.get("address")
-            state["topic_prefix"] = msg.get("topicPrefix") or TOPIC_PREFIX
-            print(f"→ NKN ready: {state['nkn_address']}  (topics prefix: {state['topic_prefix']})")
-
-        elif msg.get("type") == "nkn-dm":
-            src = msg.get("src") or ""
-            body = msg.get("msg") or {}
-            _handle_dm(src, body)
+            time.sleep(0.2)
 
 def _bridge_reader_stderr():
-    for line in bridge.stderr:
-        sys.stderr.write(line)
+    while True:
+        try:
+            if bridge and bridge.stderr:
+                line = bridge.stderr.readline()
+                if line: sys.stderr.write(line)
+                else:
+                    time.sleep(0.1)
+            else:
+                time.sleep(0.2)
+        except Exception:
+            time.sleep(0.2)
 
+def _restart_bridge_locked():
+    global bridge
+    try:
+        if bridge:
+            try: bridge.terminate()
+            except Exception: pass
+    finally:
+        bridge = _spawn_bridge()
+
+def _watchdog_loop():
+    global bridge, _last_hb, _ready_at
+    while True:
+        try:
+            with _bridge_lock:
+                need_restart = False
+                now = time.time()
+
+                # Crash or dead pipe
+                if not bridge or bridge.poll() is not None:
+                    need_restart = True
+
+                # Not ready within grace
+                elif getattr(bridge, "start_time", 0) and _ready_at == 0.0:
+                    if now - getattr(bridge, "start_time", 0) > READY_GRACE_SECS:
+                        need_restart = True
+
+                # Stalled heartbeat (after we've seen 'ready')
+                elif _ready_at > 0.0 and (now - _last_hb) > HB_STALL_SECS:
+                    need_restart = True
+
+                if need_restart:
+                    print("↻ restarting NKN bridge …")
+                    _restart_bridge_locked()
+            time.sleep(1.0)
+        except Exception:
+            time.sleep(1.0)
+
+# Initial spawn and threads
+with _bridge_lock:
+    bridge = _spawn_bridge()
 threading.Thread(target=_bridge_reader_stdout, daemon=True).start()
 threading.Thread(target=_bridge_reader_stderr, daemon=True).start()
+threading.Thread(target=_watchdog_loop, daemon=True).start()
 
 def _shutdown(*_):
     try: bridge.terminate()
@@ -292,7 +378,6 @@ def _log(evt: str, msg: str):
     print(f"[{_stamp()}] {evt}  {msg}")
 
 def _to_jsonable(x):
-    """Safely convert Ollama typed responses to JSON-able structures."""
     try:
         json.dumps(x)
         return x
@@ -374,7 +459,6 @@ SESSIONS: Dict[tuple, Session] = {}  # (src_addr, sid) -> Session
 
 def _sess_key(src_addr: str, sid: str): return (src_addr, sid or "")
 
-# ── NEW: sanitizers for seeding
 _VALID_ROLES = {"system", "user", "assistant"}
 def _sanitize_msg(m: dict) -> Dict[str, str]:
     role = str(m.get("role","")).strip().lower()
@@ -408,18 +492,15 @@ def _open_session(src_addr:str, sid:str, model:str=None, system:str=None, option
             if system is not None: s.system = system
             if options: s.default_options.update(options)
 
-        # Handle seeding if provided
         if history is not None:
             hist = _sanitize_history(history)
 
-            # Pull a system message from history if system not explicitly provided
             if (system is None) and not s.system:
                 for m in hist:
                     if m["role"] == "system":
                         s.system = m["content"]
                         break
 
-            # Keep only user & assistant turns in the conversation log
             turns = [{"role": m["role"], "content": m["content"], "ts": _now_ms()}
                      for m in hist if m["role"] in ("user","assistant")]
 
@@ -428,7 +509,6 @@ def _open_session(src_addr:str, sid:str, model:str=None, system:str=None, option
             else:
                 s.messages.extend(turns)
 
-            # Prune after seeding if needed
             _prune_session(s)
 
         s.touch()
@@ -586,6 +666,8 @@ def _extract_full_text(api: str, data: Any) -> str:
 class _LLMStream:
     RESEND_INTERVAL = 0.6
     WINDOW_LIMIT    = 512
+    FINAL_SWEEPS    = 3
+    FINAL_GAP_SECS  = 0.12
 
     def __init__(self, src_addr: str, req: dict,
                  on_start=None, on_delta=None, on_done=None):
@@ -662,6 +744,18 @@ class _LLMStream:
         except Exception as e:
             _log("llm.on_delta.err", str(e))
 
+    def _sweep_resend_unacked(self):
+        """One quick pass of re-sending any not-yet-acked chunks up to current seq."""
+        with self._lock:
+            start = self.last_acked + 1
+            end   = self.seq
+            if end < start:
+                return
+            for s in range(start, end + 1):
+                pkt = self.window.get(s)
+                if pkt is not None:
+                    self._dm(pkt)
+
     def _send_done(self, meta: dict):
         with self._lock:
             self.done_sent = True
@@ -697,6 +791,7 @@ class _LLMStream:
                     pkt = self.window.get(s)
                     if pkt is not None:
                         self._dm(pkt)
+                # Stop only after client has ACKed through last_seq (post-done)
                 if self.done_sent and self.last_acked >= self.done_seq:
                     return
 
@@ -716,6 +811,7 @@ class _LLMStream:
             if not self.stream:
                 data = self._invoke_once(self.api)
                 self._send_result(data)
+                # Non-stream: no chunks; still call done after result
                 self._send_done({"mode":"non-stream","api":self.api})
                 return
 
@@ -723,6 +819,17 @@ class _LLMStream:
             for part in gen:
                 if self.cancelled: break
                 self._send_chunk(part)
+
+            # >>> Critical reliability change: do quick final sweeps BEFORE done.
+            for _ in range(self.FINAL_SWEEPS):
+                if self.cancelled: break
+                self._sweep_resend_unacked()
+                # If client already caught up, we can break early
+                with self._lock:
+                    if self.last_acked >= self.seq:
+                        break
+                time.sleep(self.FINAL_GAP_SECS)
+
             self._send_done(meta or {"mode":"stream","api":self.api})
 
         except OllamaResponseError as e:
@@ -799,7 +906,7 @@ def _handle_dm(src_addr: str, body: dict):
         _log("dm", f"from {src_addr}  event=<missing>  body={body}")
         return
 
-    # ——— Control channel ————————————————————————————————
+    # Control
     if ev == "ctrl.request":
         op = (body.get("op") or "").strip().lower()
         if op == "models":
@@ -812,7 +919,7 @@ def _handle_dm(src_addr: str, body: dict):
             _dm(src_addr, {"event":"ctrl.error","ts":_now_ms(),"op":op,"message":"unknown op"})
         return
 
-    # ——— Sessions ————————————————————————————————————————
+    # Sessions
     if ev == "session.open":
         sid    = body.get("sid")
         model  = body.get("model")
@@ -829,7 +936,6 @@ def _handle_dm(src_addr: str, body: dict):
             _dm(src_addr, {"event":"ctrl.error","message":str(e),"ts":_now_ms()})
         return
 
-    # (Alias) Seed explicitly with replace=True
     if ev == "session.seed":
         sid    = body.get("sid")
         model  = body.get("model")
@@ -863,22 +969,20 @@ def _handle_dm(src_addr: str, body: dict):
                        "messages":len(s.messages),"ts":_now_ms()})
         return
 
-    # ——— LLM channel ——————————————————————————————————————
+    # LLM
     if ev == "llm.request":
         api    = (body.get("api") or "chat").strip().lower()
         stream = bool(body.get("stream", False))
-        sid    = body.get("sid")  # session id for server-side history
-        delta  = body.get("delta")  # newest user message
+        sid    = body.get("sid")
+        delta  = body.get("delta")
         kwargs = body.get("kwargs") or {}
         model  = (body.get("model") or "").strip() or None
 
-        # Short path: models
         if api == "list" and not stream:
             _send_models_list(src_addr)
             _log("llm.list", f"{src_addr} → models sent")
             return
 
-        # Build kwargs/context
         if sid and delta is not None:
             s = _get_session(src_addr, sid)
             if not s:
@@ -891,7 +995,7 @@ def _handle_dm(src_addr: str, body: dict):
                                "message":"session has no model; call session.open with model","kind":"bad_request","ts":_now_ms()})
                 return
             _append_user(src_addr, sid, delta)
-            req_messages = _build_chat_messages(s, new_user=None)  # already appended
+            req_messages = _build_chat_messages(s, new_user=None)
             opts = _merge_options(s, (kwargs.get("options") or {}))
             call_kwargs = dict(kwargs)
             call_kwargs["messages"] = req_messages
@@ -928,7 +1032,6 @@ def _handle_dm(src_addr: str, body: dict):
             return
 
         else:
-            # Compatibility mode: direct kwargs.messages or prompts
             rid = _start_llm(src_addr, body)
             _log("llm.start", f"{src_addr} id={rid} api={api} model={model} stream={stream} (compat)")
             return
@@ -942,7 +1045,7 @@ def _handle_dm(src_addr: str, body: dict):
         _log("llm.cancel", f"{src_addr} id={body.get('id')}")
         return
 
-    # ——— Globe protocol (legacy demo) ————————————————
+    # Legacy demo globe
     if ev == "ping":
         _dm(src_addr, {"event":"pong","ts":_now_ms()})
         _log("ping", f"{src_addr}")
@@ -973,7 +1076,7 @@ def _handle_dm(src_addr: str, body: dict):
         clients.add(src_addr)
         _log("announce", f"{src_addr}")
         _send_world_snapshot([src_addr])
-        _send_models_list(src_addr)   # auto-deliver model list
+        _send_models_list(src_addr)
         return
 
     if ev in ("frame-color", "frame-depth"):
@@ -1003,6 +1106,9 @@ def root():
         llmActive=len(_llm_streams),
         ollamaHost=OLLAMA_HOST,
         sessions=len(SESSIONS),
+        bridgeStarts=_bridge_starts,
+        readyAt=_ready_at,
+        lastHeartbeat=_last_hb,
     )
 
 @app.route("/models")
