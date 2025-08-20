@@ -111,7 +111,7 @@ SESSION_LOCK = threading.RLock()
 # Watchdog config (bridge)
 READY_GRACE_SECS   = 20.0
 HB_INTERVAL_SECS   = 5.0
-HB_STALL_SECS      = 20.0
+HB_STALL_SECS      = 90.0  # relaxed to tolerate idle/background timer clamping
 
 # ──────────────────────────────────────────────────────────────────────
 # IV. Node NKN bridge (DM-first; hardened sends) + watchdog
@@ -147,6 +147,10 @@ let READY = false;
 let queue = []; // {to, data, isPub, topic}
 const SEND_OPTS = { noReply: true, maxHoldingSeconds: 120 };
 
+// Suspend window to pause drain on transient WS closures
+let suspendUntil = 0;
+function suspend(ms=2000){ suspendUntil = Date.now() + ms; READY = false; }
+
 function rateLimit(fn, ms){
   let last=0; return (...args)=>{ const t=Date.now(); if(t-last>ms){ last=t; fn(...args); } };
 }
@@ -158,7 +162,10 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
     seed: SEED_HEX,
     identifier: 'hub',
     numSubClients: 4,
-    wsConnHeartbeatTimeout: 20000,
+    // tolerate background-timer clamping & flaky NATs
+    wsConnHeartbeatTimeout: 60000,
+    reconnectIntervalMin: 1000,
+    reconnectIntervalMax: 10000,
   });
 
   client.on('connect', () => {
@@ -170,10 +177,10 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
   client.on('error', e => {
     const msg = (e && e.message) || String(e || '');
     log('client error', msg);
-    // [B] Notify Python & force restart on WS-closed
+    // Transient WS close: let MultiClient reconnect; pause draining
     if (msg.includes('WebSocket unexpectedly closed')) {
       try { sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() }); } catch {}
-      setTimeout(() => process.exit(57), 50);
+      suspend(2500);
     }
   });
   client.on('connectFailed', e => log('connect failed', e && e.message || e));
@@ -197,10 +204,9 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
     } catch (e) {
       const msg = (e && e.message) || String(e || '');
       logSendErr(`${to} → ${msg}`);
-      // [B] Immediate restart path
       if (msg.includes('WebSocket unexpectedly closed')) {
+        suspend(2500);
         try { sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() }); } catch {}
-        setTimeout(() => process.exit(58), 50);
       }
       return false;
     }
@@ -212,22 +218,21 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
     } catch (e) {
       const msg = (e && e.message) || String(e || '');
       logSendErr(`pub ${topic} → ${msg}`);
-      // [B] Immediate restart path
       if (msg.includes('WebSocket unexpectedly closed')) {
+        suspend(2500);
         try { sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() }); } catch {}
-        setTimeout(() => process.exit(59), 50);
       }
       return false;
     }
   }
 
   async function drain(){
-    if (!READY || queue.length===0) return;
+    if (!READY || Date.now() < suspendUntil || queue.length===0) return;
     const batch = queue.splice(0, Math.min(queue.length, 64));
     for(const it of batch){
       const ok = it.isPub ? await safePub(it.topic, it.data)
                           : await safeSendDM(it.to, it.data);
-      // [A] Re-queue on failure so the "last message" is retried post-reconnect
+      // Re-queue on failure so the "last message" is retried post-reconnect
       if (!ok) queue.unshift(it);
     }
   }
@@ -246,19 +251,18 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
       if (!READY) queue.push({to: cmd.to, data: cmd.data});
       else {
         const ok = await safeSendDM(cmd.to, cmd.data);
-        if (!ok) queue.unshift({to: cmd.to, data: cmd.data}); // [A] retry later
+        if (!ok) queue.unshift({to: cmd.to, data: cmd.data}); // retry later
       }
     } else if (cmd.type === 'pub' && cmd.topic && cmd.data) {
       if (!READY) queue.push({isPub:true, topic: cmd.topic, data: cmd.data});
       else {
         const ok = await safePub(cmd.topic, cmd.data);
-        if (!ok) queue.unshift({isPub:true, topic: cmd.topic, data: cmd.data}); // [A]
+        if (!ok) queue.unshift({isPub:true, topic: cmd.topic, data: cmd.data}); // retry later
       }
     }
   });
 })();
 """
-
 if not BRIDGE_JS.exists() or BRIDGE_JS.read_text() != BRIDGE_SRC:
     BRIDGE_JS.write_text(BRIDGE_SRC)
 
@@ -323,12 +327,8 @@ def _bridge_reader_stdout():
                 _last_hb = time.time()
 
             elif msg.get("type") == "wsclosed":
-                # Immediate restart for "WebSocket unexpectedly closed."
-                print("⚠️ bridge reported wsclosed — restarting bridge and resending outstanding chunks …")
-                with _bridge_lock:
-                    _restart_bridge_locked()
-                # No other action needed here: each _LLMStream's resend loop
-                # will keep re-sending any not-yet-ACKed chunks after restart.
+                # Transient: bridge will auto-reconnect; keep process alive and pause sends.
+                print("⚠️ bridge reported wsclosed — pausing sends until reconnect …")
 
             elif msg.get("type") == "nkn-dm":
                 src = msg.get("src") or ""
@@ -336,7 +336,6 @@ def _bridge_reader_stdout():
                 _handle_dm(src, body)
         except Exception:
             time.sleep(0.2)
-
 
 def _bridge_reader_stderr():
     while True:
