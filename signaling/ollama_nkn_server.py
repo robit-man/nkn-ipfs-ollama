@@ -167,7 +167,15 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
     log('ready at', client.addr);
   });
 
-  client.on('error', e => log('client error', e && e.message || e));
+  client.on('error', e => {
+    const msg = (e && e.message) || String(e || '');
+    log('client error', msg);
+    // [B] Notify Python & force restart on WS-closed
+    if (msg.includes('WebSocket unexpectedly closed')) {
+      try { sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() }); } catch {}
+      setTimeout(() => process.exit(57), 50);
+    }
+  });
   client.on('connectFailed', e => log('connect failed', e && e.message || e));
 
   const onMessage = (a, b) => {
@@ -187,7 +195,13 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
       await client.send(to, JSON.stringify(data), SEND_OPTS);
       return true;
     } catch (e) {
-      logSendErr(`${to} → ${e && e.message || e}`);
+      const msg = (e && e.message) || String(e || '');
+      logSendErr(`${to} → ${msg}`);
+      // [B] Immediate restart path
+      if (msg.includes('WebSocket unexpectedly closed')) {
+        try { sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() }); } catch {}
+        setTimeout(() => process.exit(58), 50);
+      }
       return false;
     }
   }
@@ -196,7 +210,13 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
       await client.publish(TOPIC_NS + '.' + topic, JSON.stringify(data));
       return true;
     } catch (e) {
-      logSendErr(`pub ${topic} → ${e && e.message || e}`);
+      const msg = (e && e.message) || String(e || '');
+      logSendErr(`pub ${topic} → ${msg}`);
+      // [B] Immediate restart path
+      if (msg.includes('WebSocket unexpectedly closed')) {
+        try { sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() }); } catch {}
+        setTimeout(() => process.exit(59), 50);
+      }
       return false;
     }
   }
@@ -205,8 +225,10 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
     if (!READY || queue.length===0) return;
     const batch = queue.splice(0, Math.min(queue.length, 64));
     for(const it of batch){
-      if (it.isPub) await safePub(it.topic, it.data);
-      else await safeSendDM(it.to, it.data);
+      const ok = it.isPub ? await safePub(it.topic, it.data)
+                          : await safeSendDM(it.to, it.data);
+      // [A] Re-queue on failure so the "last message" is retried post-reconnect
+      if (!ok) queue.unshift(it);
     }
   }
   setInterval(drain, 300);
@@ -222,14 +244,21 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
     let cmd; try { cmd = JSON.parse(line); } catch { return; }
     if (cmd.type === 'dm' && cmd.to && cmd.data) {
       if (!READY) queue.push({to: cmd.to, data: cmd.data});
-      else { await safeSendDM(cmd.to, cmd.data); }
+      else {
+        const ok = await safeSendDM(cmd.to, cmd.data);
+        if (!ok) queue.unshift({to: cmd.to, data: cmd.data}); // [A] retry later
+      }
     } else if (cmd.type === 'pub' && cmd.topic && cmd.data) {
       if (!READY) queue.push({isPub:true, topic: cmd.topic, data: cmd.data});
-      else { await safePub(cmd.topic, cmd.data); }
+      else {
+        const ok = await safePub(cmd.topic, cmd.data);
+        if (!ok) queue.unshift({isPub:true, topic: cmd.topic, data: cmd.data}); // [A]
+      }
     }
   });
 })();
 """
+
 if not BRIDGE_JS.exists() or BRIDGE_JS.read_text() != BRIDGE_SRC:
     BRIDGE_JS.write_text(BRIDGE_SRC)
 
@@ -293,12 +322,21 @@ def _bridge_reader_stdout():
             elif msg.get("type") == "hb":
                 _last_hb = time.time()
 
+            elif msg.get("type") == "wsclosed":
+                # Immediate restart for "WebSocket unexpectedly closed."
+                print("⚠️ bridge reported wsclosed — restarting bridge and resending outstanding chunks …")
+                with _bridge_lock:
+                    _restart_bridge_locked()
+                # No other action needed here: each _LLMStream's resend loop
+                # will keep re-sending any not-yet-ACKed chunks after restart.
+
             elif msg.get("type") == "nkn-dm":
                 src = msg.get("src") or ""
                 body = msg.get("msg") or {}
                 _handle_dm(src, body)
         except Exception:
             time.sleep(0.2)
+
 
 def _bridge_reader_stderr():
     while True:
