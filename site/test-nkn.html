@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>NKN — Minimal Peer DM (Wallet + Network Only)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Only dependency: NKN SDK -->
+  <script src="https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js"></script>
+  <style>
+    :root {
+      --bg:#0b0b0b; --fg:#eaeaea; --muted:#9aa0a6; --line:#1a1a1a; --accent:#fff;
+    }
+    * { box-sizing: border-box; }
+    html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 18px; margin: 0 0 12px; }
+    .card { border:1px solid var(--line); border-radius:12px; background:#0f0f0f; padding:12px; margin:12px 0; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .grow { flex: 1; min-width: 220px; }
+    label { display:block; font-size:12px; color:var(--muted); margin-bottom:6px; }
+    input, textarea { width:100%; background:#000; color:var(--fg); border:1px solid #232323; border-radius:10px; padding:10px; }
+    textarea { min-height: 74px; resize: vertical; }
+    button { background:#000; color:#fff; border:1px solid #fff; border-radius:10px; padding:10px 14px; cursor:pointer; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    code.kv { display:inline-block; background:#0a0a0a; border:1px solid #222; padding:6px 8px; border-radius:8px; word-break: break-all; }
+    .status { display:flex; gap:10px; align-items:center; font-size:13px; }
+    .dot { width:10px; height:10px; border-radius:50%; background:#444; border:1px solid #222; }
+    .dot.ok { background:#30cf6b; }
+    .dot.warn { background:#f7b500; }
+    .dot.err { background:#e84d4d; }
+    .log { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#0a0a0a; border:1px solid #222; border-radius:12px; padding:10px; max-height: 38vh; overflow:auto; }
+    .log p { margin:.35rem 0; }
+    .pill { font-size:11px; padding: 2px 8px; border-radius:999px; border:1px solid #2a2a2a; color:#ddd; }
+    .right { margin-left:auto; }
+    .tiny { font-size:12px; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>NKN Minimal — Get a Keypair & DM a Peer</h1>
+
+    <div class="card">
+      <div class="status">
+        <span id="statusDot" class="dot"></span>
+        <span id="statusText">Not connected</span>
+        <span class="right tiny">Uses MultiClient for reliability</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div class="grow">
+          <label>Your NKN Address (identifier.publicKeyHex)</label>
+          <div><code id="myAddr" class="kv">—</code></div>
+        </div>
+        <div class="grow">
+          <label>Your Public Key (hex)</label>
+          <div><code id="myPub" class="kv">—</code></div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="copyAddr">Copy Address</button>
+        <button id="copyPub">Copy PubKey</button>
+        <button id="resetSeed" style="border-color:#e84d4d;color:#e84d4d">Reset Key</button>
+        <button id="reconnect">Reconnect</button>
+      </div>
+      <div class="tiny" style="margin-top:8px">
+        Seed is stored locally in <code>localStorage</code>. Reset wipes it and generates a new keypair on next connect.
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div class="grow">
+          <label>Peer address (either <strong>pubKeyHex</strong> or <strong>identifier.pubKeyHex</strong>)</label>
+          <input id="peer" placeholder="e.g. b32c…87812c  or  web.b32c…87812c" spellcheck="false" />
+        </div>
+      </div>
+      <div style="margin-top:10px">
+        <label>Message</label>
+        <textarea id="msg" placeholder="Type a message to send via NKN…"></textarea>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="send" disabled>Send DM</button>
+        <span class="tiny">We’ll try ACK first, then no-reply fallback.</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom:6px">
+        <span class="pill">Log</span>
+        <span class="tiny">Inbound/Outbound messages and connection events</span>
+      </div>
+      <div id="log" class="log" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <script>
+    // ===== Minimal helpers =====
+    const $ = s => document.querySelector(s);
+    const short = s => s ? (s.slice(0, 7) + '…' + s.slice(-6)) : '—';
+    const STORAGE = { SEED: 'NKN_SEED_HEX_V1', LAST_PEER: 'NKN_LAST_PEER' };
+
+    function toHex(u8) { return Array.from(u8).map(b => b.toString(16).padStart(2,'0')).join(''); }
+    function getOrCreateSeed() {
+      let hex = localStorage.getItem(STORAGE.SEED);
+      if (/^[0-9a-fA-F]{64}$/.test(hex || '')) return hex.toLowerCase();
+      const u = new Uint8Array(32);
+      crypto.getRandomValues(u);
+      hex = toHex(u);
+      localStorage.setItem(STORAGE.SEED, hex);
+      return hex;
+    }
+
+    function setStatus(text, mode='') {
+      $('#statusText').textContent = text;
+      const dot = $('#statusDot');
+      dot.className = 'dot ' + (mode || '');
+    }
+
+    function log(line) {
+      const box = $('#log');
+      const p = document.createElement('p');
+      p.textContent = line;
+      box.appendChild(p);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    // Accept either bare pubkey (64 hex) OR identifier.pubkey; return both forms for fallback.
+    function parsePeer(raw) {
+      const t = (raw || '').trim();
+      const HEX64 = /^[0-9a-fA-F]{64}$/;
+      const IDHEX = /^([A-Za-z0-9_-]+)\.([0-9a-fA-F]{64})$/;
+      if (HEX64.test(t)) return { primary: t.toLowerCase(), alt: null };
+      const m = IDHEX.exec(t);
+      if (m) return { primary: `${m[1]}.${m[2].toLowerCase()}`, alt: m[2].toLowerCase() };
+      return null;
+    }
+
+    // ===== NKN: connect with MultiClient (unchanged method; LTE/CGNAT friendly) =====
+    let client = null;
+
+    async function connect() {
+      try {
+        setStatus('Connecting…', 'warn');
+        const seed = getOrCreateSeed();
+
+        // Keep your original connection pattern; just add sane mobile timeouts/buffering.
+        client = new nkn.MultiClient({
+          seed,
+          identifier: 'web',
+          numSubClients: 4,
+          originalClient: true,
+
+          // Extras that don't change the method but improve delivery on mobile:
+          responseTimeout: 15000,  // default is 5000; mobile paths can be slower
+          msgHoldingSeconds: 600   // buffer at nodes if peer briefly offline
+        });
+
+        client.onConnect(() => {
+          setStatus('Connected', 'ok');
+          try {
+            const addr = client.addr;
+            const pub = client.getPublicKey();
+            $('#myAddr').textContent = addr || '—';
+            $('#myPub').textContent = pub || '—';
+            log(`✓ Connected as ${addr} (pub ${short(pub)})`);
+            $('#send').disabled = false;
+          } catch (e) {
+            log('(!) Connected, but failed to read addr/pubkey: ' + e.message);
+          }
+        });
+
+        client.onMessage(({ src, payload }) => {
+          let text = payload;
+          if (payload instanceof Uint8Array) {
+            try { text = new TextDecoder().decode(payload); } catch {}
+          }
+          log(`← from ${short(src)}: ${text}`);
+          // Note: returning a value here would be treated as a reply (ACK is implicit).
+        });
+
+        client.on('error', (e) => {
+          setStatus('Error (see console)', 'err');
+          console.error('[nkn error]', e);
+          log('(!) Error: ' + (e?.message || e));
+        });
+
+        if (typeof client.on === 'function') {
+          client.on('connectFailed', () => { setStatus('Connect failed — retrying…', 'warn'); log('… connect failed; retrying'); });
+          client.on('willreconnect', () => { setStatus('Reconnecting…', 'warn'); log('… reconnecting'); });
+          client.on('close', () => { setStatus('Disconnected', 'err'); log('× Disconnected'); $('#send').disabled = true; });
+        }
+      } catch (e) {
+        setStatus('Init failed', 'err');
+        console.error(e);
+        log('(!) Init failed: ' + e.message);
+      }
+    }
+
+    function ensureConnected() {
+      if (!client) { alert('Not connected yet.'); return false; }
+      if (!client.addr) { alert('Client has no address yet — still connecting.'); return false; }
+      return true;
+    }
+
+    // ===== UI wiring =====
+    (function boot() {
+      // Restore last peer field
+      const lastPeer = localStorage.getItem(STORAGE.LAST_PEER);
+      if (lastPeer) $('#peer').value = lastPeer;
+
+      $('#copyAddr').onclick = () => {
+        const v = $('#myAddr').textContent || '';
+        navigator.clipboard?.writeText(v);
+        log('⧉ Copied address');
+      };
+      $('#copyPub').onclick = () => {
+        const v = $('#myPub').textContent || '';
+        navigator.clipboard?.writeText(v);
+        log('⧉ Copied public key');
+      };
+      $('#resetSeed').onclick = () => {
+        if (!confirm('Reset your local key? This will generate a new seed on next connect.')) return;
+        localStorage.removeItem(STORAGE.SEED);
+        location.reload();
+      };
+      $('#reconnect').onclick = () => {
+        try { client && client.close && client.close(); } catch {}
+        client = null;
+        setStatus('Reconnecting…', 'warn');
+        connect();
+      };
+
+      $('#send').onclick = async () => {
+        if (!ensureConnected()) return;
+        const peerRaw = ($('#peer').value || '').trim();
+        const parsed = parsePeer(peerRaw);
+        const text = ($('#msg').value || '').trim();
+        if (!parsed) { alert('Peer must be a 64-hex pubKey or identifier.64-hex'); return; }
+        if (!text) return;
+        localStorage.setItem(STORAGE.LAST_PEER, peerRaw);
+
+        const { primary, alt } = parsed;
+
+        // Try 1: ACK mode to the primary form (longer timeout)
+        try {
+          log(`→ to ${short(primary)}: ${text}`);
+          await client.send(primary, text, { responseTimeout: 15000 });
+          $('#msg').value = '';
+          log('✓ Delivered (ACK)');
+          return;
+        } catch (e1) {
+          log(`… primary ACK timed out (${e1?.message || e1})`);
+        }
+
+        // Try 2: ACK mode to the alternate form (if available)
+        if (alt) {
+          try {
+            log(`→ retry to ${short(alt)} (alt form)`);
+            await client.send(alt, text, { responseTimeout: 15000 });
+            $('#msg').value = '';
+            log('✓ Delivered to alt (ACK)');
+            return;
+          } catch (e2) {
+            log(`… alt ACK timed out (${e2?.message || e2})`);
+          }
+        }
+
+        // Try 3: Fire-and-forget to primary (don’t wait for ACK)
+        try {
+          log('→ fallback: sending without waiting for ACK');
+          await client.send(primary, text, { noReply: true, responseTimeout: 0, msgHoldingSeconds: 600 });
+          $('#msg').value = '';
+          log('→ Sent (no-reply); peer will receive when online');
+        } catch (e3) {
+          // Try 4: Fire-and-forget to alternate (if available)
+          if (alt) {
+            try {
+              log('→ final fallback: alt no-reply');
+              await client.send(alt, text, { noReply: true, responseTimeout: 0, msgHoldingSeconds: 600 });
+              $('#msg').value = '';
+              log('→ Sent to alt (no-reply)');
+              return;
+            } catch (e4) {
+              log('(!) Send failed (all attempts): ' + (e4?.message || e4));
+            }
+          } else {
+            log('(!) Send failed (all attempts): ' + (e3?.message || e3));
+          }
+        }
+      };
+
+      connect();
+    })();
+  </script>
+</body>
+</html>
