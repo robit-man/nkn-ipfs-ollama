@@ -66,6 +66,11 @@
       height: 100%
     }
 
+    input:focus,
+    textarea:focus {
+      outline: none;
+    }
+
     header {
       max-height: 400px;
       grid-area: top;
@@ -200,9 +205,7 @@
       background: transparent;
     }
 
-    .session .del:hover {
-      background: #111
-    }
+    .session .del:hover {}
 
     .col-main {
       position: relative;
@@ -360,9 +363,9 @@
     }
 
 
-    #systemToggleBtn{
-      color:#2a2a2a;
-      border-color:#2a2a2a;
+    #systemToggleBtn {
+      color: #2a2a2a;
+      border-color: #2a2a2a;
     }
 
     .btnSq {
@@ -829,68 +832,6 @@
       LEGACY_HUB: 'PEERBALLS_HUB_ADDR',
       LAST_MODEL: 'CLIENT_LAST_SELECTED_MODEL_V2'
     };
-    function getCurrentModel() {
-      const s = getSession();
-      // Prefer the session’s model; then the visible select; then the remembered one.
-      return (s && s.model) || (el('modelSelect') && el('modelSelect').value) || getSavedModel() || '';
-    }
-
-    // --- System Message helpers/state ---
-    const SYSTEM_GEN_PROMPT =
-      "You are a system prompt generator. Given the user's description, return ONE compact, actionable system prompt that sets role, tone, constraints, and safety. Use imperative, second person. No examples unless essential.";
-
-    const sysgenPending = new Set();   // track in-flight generation requests
-    let isSysGenStreaming = false;    // NEW
-    let sysgenCurrentId = null;       // NEW
-    let sysgenAcc = "";                 // accumulating streamed text
-    let sysgenPrevPlaceholder = "";     // to restore after finish/error
-
-    function toggleSystemEditor(forceOpen) {
-      const wrap = el('systemEditorWrap'); if (!wrap) return;
-      const toggleOut = el('systemToggleBtn');          // outside button
-      const toggleIn = el('systemToggleBtnInside');    // inside button (shown only when open)
-
-      const show = forceOpen ?? wrap.classList.contains('hide'); // true = open editor
-
-      if (show) {
-        wrap.classList.remove('hide');      // show editor
-        if (toggleOut) toggleOut.classList.add('hide');     // hide outside button
-        if (toggleIn) toggleIn.classList.remove('hide');   // show inside button
-      } else {
-        wrap.classList.add('hide');         // hide editor
-        if (toggleOut) toggleOut.classList.remove('hide');  // show outside button
-        if (toggleIn) toggleIn.classList.add('hide');      // hide inside button
-      }
-    }
-
-    function setSysGenBusy(isBusy) {
-      const b = el('sysGenBtn'); if (!b) return;
-      b.disabled = !!isBusy;
-      b.textContent = isBusy ? 'Generating…' : 'Generate';
-    }
-
-    function setConn(color, label) {
-      const dot = el('connDot'), text = el('connText');
-      if (!dot || !text) return;
-
-      dot.classList.remove('conn-red', 'conn-green', 'conn-blue');
-      dot.classList.add(color === 'green' ? 'conn-green' : color === 'red' ? 'conn-red' : 'conn-blue');
-
-      if (label && label.trim()) {
-        text.classList.remove('hide');        // show label
-        text.textContent = label;
-      } else {
-        text.textContent = '';                // clear label
-        text.classList.add('hide');           // collapse immediately (no width)
-      }
-    }
-
-    function showModelDropdown(show) {
-      const sel = el('modelSelect');
-      if (!sel) return;
-      sel.classList[show ? 'remove' : 'add']('hide');
-      sel.disabled = !show;
-    }
 
     function loadJSON(key, fallback) {
       try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch { return fallback; }
@@ -968,6 +909,12 @@
 
     const getSavedModel = () => localStorage.getItem(STORAGE.LAST_MODEL) || (sessions[0]?.model || '');
     const setSavedModel = (m) => { if (m) localStorage.setItem(STORAGE.LAST_MODEL, m); };
+
+    function getCurrentModel() {
+      const s = getSession();
+      // Prefer the session’s model; then the visible select; then the remembered one.
+      return (s && s.model) || (el('modelSelect') && el('modelSelect').value) || getSavedModel() || '';
+    }
 
     function newId(prefix = 'id') { return prefix + '-' + Math.random().toString(16).slice(2) + Date.now().toString(36); }
     function createSessionForModel(model) {
@@ -1086,10 +1033,139 @@
       const w = document.querySelector('.msg.assistant[data-stream="1"]'); if (w) w.dataset.stream = '0';
     }
 
+    // --- System Message helpers/state ---
+    const SYSTEM_GEN_PROMPT =
+      "You are a system prompt generator. Given the user's description, return ONE compact, actionable system prompt that sets role, tone, constraints, and safety. Use imperative, second person. No examples unless essential.";
+
+    // Keep these to avoid breaking any assumptions elsewhere
+    const sysgenPending = new Set();
+    let isSysGenStreaming = false;
+    let sysgenCurrentId = null;
+
+    function toggleSystemEditor(forceOpen) {
+      const wrap = el('systemEditorWrap'); if (!wrap) return;
+      const toggleOut = el('systemToggleBtn');
+      const toggleIn = el('systemToggleBtnInside');
+      const show = forceOpen ?? wrap.classList.contains('hide'); // true = open
+      if (show) {
+        wrap.classList.remove('hide');
+        if (toggleOut) toggleOut.classList.add('hide');
+        if (toggleIn) toggleIn.classList.remove('hide');
+      } else {
+        wrap.classList.add('hide');
+        if (toggleOut) toggleOut.classList.remove('hide');
+        if (toggleIn) toggleIn.classList.add('hide');
+      }
+    }
+    function setSysGenBusy(isBusy) {
+      const b = el('sysGenBtn'); if (!b) return;
+      b.disabled = !!isBusy;
+      b.textContent = isBusy ? 'Generating…' : 'Generate';
+    }
+
+    function setConn(color, label) {
+      const dot = el('connDot'), text = el('connText');
+      if (!dot || !text) return;
+      dot.classList.remove('conn-red', 'conn-green', 'conn-blue');
+      dot.classList.add(color === 'green' ? 'conn-green' : color === 'red' ? 'conn-red' : 'conn-blue');
+      if (label && label.trim()) {
+        text.classList.remove('hide');
+        text.textContent = label;
+      } else {
+        text.textContent = '';
+        text.classList.add('hide');
+      }
+    }
+    function showModelDropdown(show) {
+      const sel = el('modelSelect');
+      if (!sel) return;
+      sel.classList[show ? 'remove' : 'add']('hide');
+      sel.disabled = !show;
+    }
+
+    // ─────────── Generic stream routing
+    const ROUTES = new Map();          // reqId -> { sink:'chat'|'element', elId?, mode?, format?, lock? }
+    const streamingElements = new Set(); // element ids being streamed into (to suppress autosaves)
+
+    function resolveEl(elOrId) { return typeof elOrId === 'string' ? document.getElementById(elOrId) : elOrId; }
+    function isTextControl(el) { return !!el && ('value' in el); }
+    function lockElement(el, lock = true) {
+      if (!el) return;
+      if ('readOnly' in el) el.readOnly = !!lock;
+      if ('disabled' in el && !('readOnly' in el)) el.disabled = !!lock;
+      if (el.getAttribute && el.hasAttribute('contenteditable')) {
+        el.setAttribute('data-was-contenteditable', el.getAttribute('contenteditable') || 'false');
+        el.setAttribute('contenteditable', lock ? 'false' : (el.getAttribute('data-was-contenteditable') || 'true'));
+      }
+      el.setAttribute?.('aria-busy', lock ? 'true' : 'false');
+    }
+    function writeToElement(el, chunk, {
+      mode = 'append',      // 'append' | 'replace'
+      format = 'text',      // 'text' | 'markdown'
+      scroll = true,
+      caretToEnd = true
+    } = {}) {
+      if (!el) return;
+      let prev = isTextControl(el) ? (el.value || '') : (el.innerText || el.textContent || '');
+      let next = (mode === 'replace') ? chunk : (prev + chunk);
+
+      if (isTextControl(el)) {
+        el.value = next;
+        if (caretToEnd) {
+          try { el.selectionStart = el.selectionEnd = el.value.length; } catch { }
+          el.scrollTop = el.scrollHeight;
+        }
+      } else {
+        if (format === 'markdown') {
+          el.innerHTML = mdToHtml(next);
+          try { highlightIn(el); } catch { }
+        } else {
+          el.textContent = next;
+        }
+        if (scroll) {
+          const container = el.closest('.chat') || el.parentElement;
+          if (container && typeof container.scrollTop === 'number') container.scrollTop = container.scrollHeight;
+        }
+      }
+    }
+    function registerRoute(reqId, route) { ROUTES.set(reqId, route || { sink: 'chat' }); }
+    function routeFor(id) { return ROUTES.get(id) || { sink: 'chat' }; }
+    function clearRoute(id) { ROUTES.delete(id); }
+
+    // ─────────── Outbox queue (send while connecting -> queue; flush on reconnect)
+    const outbox = []; // [{ payload, route }]
+    let isConnected = false, isConnecting = false;
+
+    function requestLLM(payload, route) {
+      const id = payload.id || newId('req');
+      payload.id = id;
+      registerRoute(id, route);
+
+      if (!isConnected || !client) {
+        outbox.push({ payload, route });
+        // Optional: small hint for element targets
+        if (route?.sink === 'element' && route.elId) {
+          const n = el(route.elId);
+          if (n && ('placeholder' in n)) {
+            n.placeholder = (n.placeholder || '').startsWith('Queued…') ? n.placeholder : `Queued… ${n.placeholder || ''}`;
+          }
+        }
+        return id;
+      }
+      try { client.send(HUB_ADDR, JSON.stringify(payload)); } catch { }
+      return id;
+    }
+    function flushOutbox() {
+      while (isConnected && client && outbox.length) {
+        const { payload } = outbox.shift();
+        try { client.send(HUB_ADDR, JSON.stringify(payload)); } catch { }
+      }
+    }
+
     // ─────────── NKN (robust MultiClient + your message contract)
     let client = null, myAddr = null; let HUB_ADDR = settings.hub || '';
     function updateChips() { el('hubChip').textContent = 'hub: ' + (HUB_ADDR ? short(HUB_ADDR) : '—'); el('meChip').textContent = 'me: ' + (myAddr ? short(myAddr) : '—'); }
-    function trySend(addr, obj) { if (!client || !addr) return; try { client.send(addr, JSON.stringify(obj)); } catch { } }
+    function trySend(addr, obj) { if (!client || !addr || !isConnected) return; try { client.send(addr, JSON.stringify(obj)); } catch { } }
 
     // Streaming (ordered)
     const streams = new Map();
@@ -1111,9 +1187,8 @@
 
     // Models
     let modelsLoaded = false;
-    let modelRevealTimer = null;   // <— NEW
-    let clearLabelTimer = null;      // NEW
-    let allowModelsReveal = false;   // NEW (guard against any early reveals)
+    let modelRevealTimer = null;
+    let clearLabelTimer = null;
     function requestModelsList() { trySend(HUB_ADDR, { event: 'llm.request', api: 'list', stream: false }); }
     function ensureModels() {
       const backoff = [0, 500, 1500, 3000, 5000, 8000];
@@ -1135,8 +1210,7 @@
         const model = sel.value;
         if (model && modelsLoaded) { setSavedModel(model); createSessionForModel(model); }
       };
-
-      showModelDropdown(true);  // <— NEW (keeps it visible when models land)
+      showModelDropdown(true);
     }
 
     // Build history for seeding (exclude 'system'; it's sent separately)
@@ -1158,43 +1232,81 @@
     }
     function sendSessionReset(sid) { if (!sid || !HUB_ADDR) return; trySend(HUB_ADDR, { event: 'session.reset', sid }); }
 
+    // Heartbeat / reconnect
+    const HEARTBEAT_MS = 5000;
+    let hbTimer = null;
+    let lastPongAt = 0;
+
+    function startHeartbeat() {
+      if (hbTimer) clearInterval(hbTimer);
+      hbTimer = setInterval(() => {
+        if (!HUB_ADDR) return;
+
+        if (!client && !isConnecting) {
+          setConn('blue', 'Reconnecting…');
+          connectNKN();
+          return;
+        }
+
+        try { trySend(HUB_ADDR, { event: 'ctrl.ping', ts: Date.now() }); } catch { }
+
+        const stale = (Date.now() - lastPongAt) > HEARTBEAT_MS * 3;
+        if (stale && !isConnecting) {
+          setConn('blue', 'Reconnecting…');
+          try { client && client.close(); } catch { }
+          client = null;
+          isConnected = false;
+          connectNKN();
+        }
+      }, HEARTBEAT_MS);
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        const stale = (Date.now() - lastPongAt) > HEARTBEAT_MS * 3;
+        if ((!client || stale) && !isConnecting) connectNKN();
+      }
+    });
+
     // EXACTLY follow the proven NKN connect pattern; identifier MUST be 'client'
     function connectNKN() {
-      // Require hub set first (as in your original)
+      if (isConnecting) return;
       if (!isNknAddr(HUB_ADDR)) { openSettings(); return; }
+      isConnecting = true;
+      isConnected = false;
+
       updateChips();
       setConn('blue', 'Connecting…');
 
+      try { if (client) { try { client.close(); } catch { } } } catch { }
       client = new nkn.MultiClient({
         seed: getOrCreateSeed(),
-        identifier: 'client',     // <—— address prefix YOU asked for
+        identifier: 'client',
         numSubClients: 4,
         originalClient: true
       });
 
       client.onConnect(() => {
-        setConn('green', 'Connected');          // show "Connected" immediately
+        isConnecting = false;
+        isConnected = true;
+        setConn('green', 'Connected');
         myAddr = client.addr; updateChips();
         setConn('green', '');
+        lastPongAt = Date.now();
+        startHeartbeat();
         trySend(HUB_ADDR, { event: 'announce' });
 
-        // Clear prior timers on reconnects
         if (clearLabelTimer) clearTimeout(clearLabelTimer);
         if (modelRevealTimer) clearTimeout(modelRevealTimer);
 
         clearLabelTimer = setTimeout(() => {
-          // 1) Remove label first (green dot only)
-
-          // 2) Force a reflow so the label collapse is applied BEFORE we reveal the select
           const t = el('connText'); if (t) void t.offsetWidth;
-
-          // 3) Next tick: reveal the select and request models
           modelRevealTimer = setTimeout(() => {
             const sel = el('modelSelect');
             if (sel) {
               sel.innerHTML = '<option>Loading Models</option>';
               sel.disabled = true;
-              showModelDropdown(true);          // select appears only after label is gone
+              showModelDropdown(true);
             }
             modelsLoaded = false;
             requestModelsList();
@@ -1207,19 +1319,18 @@
           setSavedModel(s.model || getSavedModel());
           sendSessionOpen(s, /*seed*/true);
         }
-      });
 
+        flushOutbox(); // ← send any queued llm.requests
+      });
 
       // EXACT dispatch style: funnel to onInbound, only process if src===HUB_ADDR
       client.on('message', onInbound);
-      client.on('willreconnect', () => setConn('blue', 'Reconnecting…'));
-      client.on('connectFailed', () => setConn('red', 'Connect failed'));
-      client.on('close', () => setConn('red', 'Disconnected'));
-      client.on('error', () => setConn('red', 'Error'));
+      client.on('willreconnect', () => { isConnecting = false; isConnected = false; setConn('blue', 'Reconnecting…'); });
+      client.on('connectFailed', () => { isConnecting = false; isConnected = false; setConn('red', 'Connect failed'); });
+      client.on('close', () => { isConnecting = false; isConnected = false; setConn('red', 'Disconnected'); });
+      client.on('error', () => { isConnecting = false; isConnected = false; setConn('red', 'Error'); });
       window.addEventListener('beforeunload', () => { try { client && client.close(); } catch { } });
     }
-
-
 
     // Inbound
     function onInbound(a, b) {
@@ -1237,62 +1348,47 @@
 
       const ev = body.event;
 
-      // --- intercept one-off system-prompt generation replies ---
-      if (ev === 'llm.result' && sysgenPending.has(body.id)) {
-        const out = extractFull(body.data) || '';
-        const ta = el('systemMsg');
-        ta.readOnly = false;
-        ta.placeholder = sysgenPrevPlaceholder;
-        ta.value = out;
-
-        setSysGenBusy(false);
-        sysgenPending.delete(body.id);
-        isSysGenStreaming = false;
-        sysgenCurrentId = null;
-        sysgenAcc = "";
-        sysgenPrevPlaceholder = "";
-        return
-      }
-      if (ev === 'llm.error' && sysgenPending.has(body.id)) {
-        const ta = el('systemMsg');
-        ta.readOnly = false;
-        ta.placeholder = sysgenPrevPlaceholder; // restore
-        // leave ta.value as-is (user input) or empty if you cleared it
-        setSysGenBusy(false);
-        isSysGenStreaming = false;
-        sysgenPending.delete(body.id);
-        sysgenCurrentId = null;
-        sysgenAcc = "";
-        sysgenPrevPlaceholder = "";
-        alert('[System Prompt Generator] ' + (body.message || 'Error'));
-        return;
-      }
+      // Heartbeat pong
+      if (ev === 'ctrl.pong') { lastPongAt = Date.now(); setConn('green', ''); return; }
 
       if (ev === 'session.ready' || ev === 'session.info' || ev === 'ctrl.info') { return; }
       if (ev === 'ctrl.error') { console.warn('[ctrl.error]', body); return; }
 
-      if (ev === 'llm.models' && body.data && body.data.models) { populateModels(body.data.models); return; }
-      if (ev === 'llm.result' && body.data && body.data.models) { populateModels(body.data.models); return; }
+      if ((ev === 'llm.models' || ev === 'llm.result') && body.data && body.data.models) { populateModels(body.data.models); return; }
+
+      const route = routeFor(body.id);
 
       if (ev === 'llm.start') {
         const { id, stream } = body;
-        if (sysgenPending.has(id)) {
-          // stream into the textarea instead of a chat bubble
-          isSysGenStreaming = true;
-          sysgenCurrentId = id;
 
+        // Element sink
+        if (route.sink === 'element') {
+          const elx = resolveEl(route.elId);
+          if (route.lock) lockElement(elx, true);
+          if (route.elId) streamingElements.add(route.elId);
+          isSysGenStreaming = true; sysgenCurrentId = id;
+
+          // NEW: enable stop control during sysgen stream
+          pendingStreamId = id;
+          setStopMode(id);
+
+          let first = true;
           startStream(id, (part) => {
             const t = extractDelta(part);
-            if (t) {
-              const ta = el('systemMsg');
-              sysgenAcc += t;
-              ta.placeholder = sysgenAcc;   // ← type into placeholder
-            }
+            if (!t) return;
+            writeToElement(elx, t, {
+              mode: first && route.mode === 'replace' ? 'replace' : 'append',
+              format: route.format || 'text',
+              scroll: true,
+              caretToEnd: true
+            });
+            first = false;
           });
-          return; // do not create assistant chat bubble for sysgen
+          return;
         }
 
-        // (keep your existing chat-streaming code below for normal chats)
+
+        // Default chat sink
         if (stream) {
           pendingStreamId = id;
           addStreamingAssistantBubble();
@@ -1306,42 +1402,88 @@
         }
         return;
       }
-      if (ev === 'llm.chunk') { handleChunk(body.id, body.seq, body.data); return; }
-      if (ev === 'llm.done') {
-        if (sysgenCurrentId && body.id === sysgenCurrentId) {
-          sendAck(body.id, body.last_seq);
-          endStream(body.id);
-          const ta = el('systemMsg');
-          ta.value = (sysgenAcc || "").trim();   // commit the generated prompt
-          ta.placeholder = sysgenPrevPlaceholder; // restore original placeholder
-          ta.readOnly = false;
 
-          isSysGenStreaming = false;
-          setSysGenBusy(false);
-          sysgenPending.delete(body.id);
-          sysgenCurrentId = null;
-          sysgenAcc = "";
-          sysgenPrevPlaceholder = "";
+      if (ev === 'llm.chunk') { handleChunk(body.id, body.seq, body.data); return; }
+
+      if (ev === 'llm.done') {
+        sendAck(body.id, body.last_seq);
+        endStream(body.id);
+
+        if (route.sink === 'element') {
+          const elx = resolveEl(route.elId);
+          lockElement(elx, false);
+          if (route.elId) streamingElements.delete(route.elId);
+
+          if (route.elId === 'systemMsg') {
+            const s = getSession();
+            if (s) {
+              s.system = (el('systemMsg').value || '');
+              saveJSON(STORAGE.SESS, sessions);
+              sendSessionOpen(s, /*seed*/false);
+            }
+            setSysGenBusy(false);
+            isSysGenStreaming = false; sysgenCurrentId = null;
+            sysgenPending.delete(body.id);
+          }
+
+          setSendMode();           // NEW: put the play icon back
+          clearRoute(body.id);
           return;
         }
 
-
-        // (keep your existing chat 'done' handling below)
-        finishStreamingBubble(); sendAck(body.id, body.last_seq); endStream(body.id);
-        setSendMode(); return;
+        finishStreamingBubble();
+        setSendMode();
+        clearRoute(body.id);
+        return;
       }
+
       if (ev === 'llm.result') {
+        if (route.sink === 'element') {
+          const elx = resolveEl(route.elId);
+          const text = extractFull(body.data) || '';
+          writeToElement(elx, text, { mode: route.mode || 'replace', format: route.format || 'text' });
+          lockElement(elx, false);
+          if (route.elId) streamingElements.delete(route.elId);
+
+          if (route.elId === 'systemMsg') {
+            const s = getSession();
+            if (s) {
+              s.system = (el('systemMsg').value || '');
+              saveJSON(STORAGE.SESS, sessions);
+              sendSessionOpen(s, /*seed*/false);
+            }
+            setSysGenBusy(false);
+            sysgenPending.delete(body.id);
+          }
+          isSysGenStreaming = false; sysgenCurrentId = null;
+          clearRoute(body.id);
+          return;
+        }
         const sess = getSession(); if (!sess) return;
         const text = extractFull(body.data);
         appendMessage(sess.id, 'assistant', text);
         renderChat();
+        clearRoute(body.id);
         return;
       }
+
       if (ev === 'llm.error') {
+        if (route.sink === 'element') {
+          const elx = resolveEl(route.elId);
+          lockElement(elx, false);
+          if (route.elId) streamingElements.delete(route.elId);
+          setSysGenBusy(false);
+          isSysGenStreaming = false; sysgenCurrentId = null;
+          sysgenPending.delete(body.id);
+          clearRoute(body.id);
+          alert('[LLM Error] ' + (body.message || 'Error'));
+          return;
+        }
         const sess = getSession(); if (!sess) return;
         appendMessage(sess.id, 'assistant', '[error] ' + body.message);
         renderChat();
         setSendMode();
+        clearRoute(body.id);
         return;
       }
     }
@@ -1357,7 +1499,7 @@
       try { return JSON.stringify(obj); } catch { return String(obj); }
     }
 
-    // Compose & send (DELTA MODE)
+    // Compose & send (DELTA MODE) — uses router with default 'chat' sink (queue-aware)
     function sendPrompt() {
       const s = getSession(); if (!s) { alert('Choose a model first.'); return; }
       const text = el('prompt').value; if (!text.trim()) return;
@@ -1367,7 +1509,7 @@
       const reqId = newId('req');
       const doStream = !!settings.stream;
 
-      trySend(HUB_ADDR, {
+      requestLLM({
         event: 'llm.request',
         id: reqId,
         api: 'chat',
@@ -1375,17 +1517,11 @@
         delta: text.trim(),
         stream: doStream,
         kwargs: { options: currentOptions() }
+      }, {
+        sink: 'chat'
       });
     }
 
-    // Stop button behavior
-    function setStopMode(id) {
-      const btn = el('sendBtn');
-      currentStreamId = id;
-      isStreaming = true;
-      btn.textContent = '⏹';
-      btn.onclick = stopGeneration;
-    }
     const playSign = `<svg width="32px" height="32px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
 <path d="M16.6582 9.28638C18.098 10.1862 18.8178 10.6361 19.0647 11.2122C19.2803 11.7152 19.2803 12.2847 19.0647 12.7878C18.8178 13.3638 18.098 13.8137 16.6582 14.7136L9.896 18.94C8.29805 19.9387 7.49907 20.4381 6.83973 20.385C6.26501 20.3388 5.73818 20.0469 5.3944 19.584C5 19.053 5 18.1108 5 16.2264V7.77357C5 5.88919 5 4.94701 5.3944 4.41598C5.73818 3.9531 6.26501 3.66111 6.83973 3.6149C7.49907 3.5619 8.29805 4.06126 9.896 5.05998L16.6582 9.28638Z" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/>
 </svg>`;
@@ -1393,6 +1529,14 @@
 <rect x="4" y="4" width="16" height="16" rx="2" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
 
+    // Stop button behavior
+    function setStopMode(id) {
+      const btn = el('sendBtn');
+      currentStreamId = id;
+      isStreaming = true;
+      btn.innerHTML = stopSign;  // use innerHTML to render the SVG
+      btn.onclick = stopGeneration;
+    }
     function setSendMode() {
       const btn = el('sendBtn');
       isStreaming = false;
@@ -1408,9 +1552,9 @@
       setSendMode();
     }
 
-    // System editor → persist locally and push to hub
+    // System editor → persist locally and push to hub (suppressed while streaming to this element)
     el('systemMsg').addEventListener('input', debounce(() => {
-      if (isSysGenStreaming) return; // avoid pushing while generator streams
+      if (streamingElements.has('systemMsg')) return; // suppress while generator streams
       const s = getSession(); if (!s) return;
       s.system = el('systemMsg').value;
       saveJSON(STORAGE.SESS, sessions);
@@ -1440,31 +1584,25 @@
       })();
 
       // System Message toggle + actions
-      el('systemToggleBtn').onclick = () => toggleSystemEditor();  // show/hide editor
-      el('systemToggleBtnInside').onclick = () => toggleSystemEditor();  // show/hide editor
+      el('systemToggleBtn').onclick = () => toggleSystemEditor();
+      el('systemToggleBtnInside').onclick = () => toggleSystemEditor();
 
+      // System Prompt Generate (uses textarea content as input; streams back into same textarea)
       el('sysGenBtn').onclick = () => {
+        const s = getSession(); if (!s) { alert('Create/select a session first.'); return; }
         if (!HUB_ADDR) { openSettings(); return; }
 
-        const input = (el('systemMsg').value || '').trim();
-        if (!input) { alert('Type what you want your system prompt to do, then click Generate.'); return; }
+        const ta = el('systemMsg');
+        const userDesc = (ta.value || '').trim();
+        if (!userDesc) { alert('Type what you want your system prompt to do, then click Generate.'); return; }
 
         const model = getCurrentModel();
         if (!model) { alert('Choose a model first, then try Generate again.'); return; }
 
         const genId = newId('sysgen');
-        sysgenPending.add(genId);
-        setSysGenBusy(true);
 
-        // Prep textarea for placeholder streaming
-        const ta = el('systemMsg');
-        sysgenAcc = "";
-        sysgenPrevPlaceholder = ta.placeholder || "";
-        ta.value = "";               // keep empty so placeholder is visible
-        ta.placeholder = "";         // will be filled as tokens arrive
-        ta.readOnly = true;          // avoid user edits during streaming
-
-        trySend(HUB_ADDR, {
+        // messages-mode payload — note: NO sid here
+        const payload = {
           event: 'llm.request',
           id: genId,
           api: 'chat',
@@ -1472,12 +1610,32 @@
           stream: true,
           messages: [
             { role: 'system', content: SYSTEM_GEN_PROMPT },
-            { role: 'user', content: input }
+            { role: 'user', content: userDesc }
           ],
           kwargs: { options: currentOptions() },
           aux: 'sysgen'
-        });
+        };
+
+        // route the stream into the textarea
+        const route = {
+          sink: 'element',
+          elId: 'systemMsg',
+          mode: 'replace',  // first token replaces (so we don't pre-clear); subsequent chunks append
+          format: 'text',
+          lock: true
+        };
+
+        // UI state
+        sysgenPending.add(genId);
+        setSysGenBusy(true);
+        streamingElements.add('systemMsg');
+        lockElement(ta, true);          // don't clear; first chunk will replace due to mode:'replace'
+
+        // Send (queue-aware)
+        requestLLM(payload, route);
       };
+
+
 
       el('sysSaveBtn').onclick = () => {
         const s = getSession();
@@ -1485,11 +1643,9 @@
         s.system = el('systemMsg').value || '';
         saveJSON(STORAGE.SESS, sessions);
         sendSessionOpen(s, /*seed*/false);
-        // Optional: collapse after save
-        // toggleSystemEditor(false);
       };
 
-      // Apply hub from URL before anything else that depends on it (RESTORED FEATURE)
+      // Apply hub from URL before anything else that depends on it
       applyHubFromUrl();
 
       renderSessions(); renderSystemEditor(); renderChat(); updateSettingsUI();
@@ -1513,6 +1669,8 @@
     }
     boot();
   </script>
+
+
 </body>
 
 </html>
