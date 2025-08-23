@@ -20,7 +20,7 @@
   }
   </script>
 
-  <!-- Added: QR, Markdown, and Syntax Highlighting -->
+  <!-- QR, Markdown, and Syntax Highlighting -->
   <script src="https://unpkg.com/jsqr/dist/jsQR.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlightjs-themes@1.0.0/tomorrow-night-blue.min.css" />
@@ -55,11 +55,6 @@
       color: var(--fg);
       font-family: "Instrument Sans", sans-serif;
       touch-action: manipulation;
-      -ms-touch-action: manipulation;
-      -webkit-touch-callout: none;
-      -webkit-user-select: none;
-      -moz-user-select: none;
-      -ms-user-select: none;
       user-select: none;
     }
 
@@ -103,7 +98,9 @@
       color: var(--fg);
       padding: 8px 10px;
       border-radius: 10px;
-      min-width: 220px
+      line-height: 1;
+      height: 38px;
+      max-width: calc(100vw - 154px);
     }
 
     .chip {
@@ -125,20 +122,20 @@
       display: flex;
       flex-flow: row;
       justify-content: center;
-      min-width:34px;
-      min-height:34px;
+      min-width: 34px;
+      min-height: 34px;
       cursor: pointer;
       border: 1px solid #2a2a2a;
       border-radius: 10px;
       padding: 10px 10px;
-      font-size:14px;
+      font-size: 14px;
       line-height: 1;
       background: #0a0a0a;
       color: white;
     }
 
     .gear:active {
-      transform: translateY(1px)
+      transform: scale(1.02)
     }
 
     .col-left {
@@ -190,20 +187,17 @@
 
     .session .del {
       position: absolute;
-      top: 6px;
-      right: 6px;
-      width: 24px;
-      height: 24px;
+      top: 0px;
+      right: 0px;
+      height: 32px;
+      width: 32px;
       display: flex;
       align-items: center;
       justify-content: center;
-      border: 1px solid #2a2a2a;
-      border-radius: 999px;
-      background: #060606;
-      color: #cfcfcf;
-      font-size: 14px;
       line-height: 1;
-      cursor: pointer
+      cursor: pointer;
+      border: unset;
+      background: transparent;
     }
 
     .session .del:hover {
@@ -216,6 +210,7 @@
       grid-area: main;
       display: flex;
       flex-direction: column;
+      justify-content: flex-end;
       min-width: 0
     }
 
@@ -224,14 +219,21 @@
       border-bottom: 1px solid #141414;
       background: #050505;
       box-sizing: border-box;
-      height: 80px;
+      height: auto;
+      width: 100%;
+      line-height: 1;
+      box-shadow: 0px 0px 20px 10px black;
+      z-index: 2;
+      position: absolute;
+      top: 0px;
+
     }
 
     .sysedit label {
       display: block;
       font-size: 12px;
       color: #cfcfcf;
-      margin-bottom: 6px
+      margin-bottom: 6px;
     }
 
     .sysinput {
@@ -258,7 +260,7 @@
       flex: 1;
       overflow: auto;
       padding: 16px;
-      max-height: calc(100vh - 221px);
+      max-height: calc(100vh - 180px);
       scroll-behavior: smooth
     }
 
@@ -349,25 +351,108 @@
     .input {
       flex: 1;
       resize: none;
-      height: 56px;
+      height: 40px;
+      border: unset;
       background: #000;
-      border: 1px solid #2a2a2a;
       color: var(--fg);
       border-radius: 12px;
       padding: 12px
     }
 
+
+    #systemToggleBtn{
+      color:#2a2a2a;
+      border-color:#2a2a2a;
+    }
+
+    .btnSq {
+      aspect-ratio: 1 / 1;
+    }
+
     .btn {
-      background: #000;
+      background-color: black;
       border: 1px solid #fff;
       color: #fff;
-      padding: 12px 23px;
+      padding: 8px 8px;
+      line-height: 1;
+      display: flex;
+      flex-flow: column;
+      justify-content: center;
+      border-radius: 10px;
+      cursor: pointer
+    }
+
+    .btn:hover {
+      background-color: white;
+      border: 1px solid #fff;
+      color: #000;
+      padding: 8px 8px;
+      line-height: 1;
+      display: flex;
+      flex-flow: column;
+      justify-content: center;
       border-radius: 12px;
       cursor: pointer
     }
 
+    .btn:hover>svg path {
+      stroke: black;
+    }
+
     .btn:active {
       transform: translateY(1px)
+    }
+
+    @keyframes dotdotdot {
+      0% {
+        content: '.'
+      }
+
+      33% {
+        content: '..'
+      }
+
+      66% {
+        content: '...'
+      }
+
+      100% {
+        content: ''
+      }
+
+    }
+
+    .dot {
+      animation: dotdotdot 1s linear infinite;
+    }
+
+    @keyframes bump {
+      0% {
+        transform: translateX(0px)
+      }
+
+      40% {
+        transform: translateX(-3px)rotate(-5deg)
+      }
+
+      60% {
+        transform: translateX(3px)rotate(5deg)
+      }
+
+      100% {
+        transform: translateX(0px)rotate(0deg)
+      }
+
+    }
+
+    .sendButton {
+      background: transparent;
+      border: unset;
+      cursor: pointer;
+    }
+
+    .sendButton:hover {
+      animation: bump 0.3s ease-in-out;
     }
 
     .row {
@@ -384,7 +469,6 @@
     .overlay {
       position: fixed;
       inset: 0;
-      background: rgba(0, 0, 0, .6);
       display: none;
       align-items: center;
       justify-content: center;
@@ -446,12 +530,50 @@
       margin-top: 10px
     }
 
+    /* ── Connection status dot in header ───────────────────────────────────── */
+    .conn-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      border: 1px solid #2a2a2a;
+      display: inline-block;
+    }
+
+    .conn-blue {
+      background: #3b82f6;
+    }
+
+    /* connecting / reconnecting */
+    .conn-green {
+      background: #22c55e;
+    }
+
+    /* connected */
+    .conn-red {
+      background: #ef4444;
+    }
+
+    /* error / disconnected */
+
+    .hide {
+      display: none !important;
+    }
+
+    /* helper to hide model select until ready */
     #toggleSidebar {
       display: none;
     }
 
-    @media (max-width: 900px) {
+    .backdropModal {
+      height: 100vh;
+      width: 100vw;
+      position: fixed;
+      top: 0px;
+      left: 0px;
+      z-index: -1;
+    }
 
+    @media (max-width: 900px) {
       #toggleSidebar {
         display: flex;
       }
@@ -470,6 +592,16 @@
         top: 54px;
         bottom: 0px;
       }
+
+      #backdrop {
+        height: 100vh;
+        position: absolute;
+        bottom: 0px;
+        width: 100vw;
+        left: -100%;
+        backdrop-filter: blur(10px);
+        z-index: -1;
+      }
     }
   </style>
 </head>
@@ -477,33 +609,81 @@
 <body>
   <div class="app">
     <header>
-      <button class="gear" id="toggleSidebar" onclick="toggleSidebar()">☰</button>
+      <button class="gear" id="toggleSidebar" onclick="toggleSidebar()">
+        <!-- (icon unchanged) -->
+        <svg width="16px" height="16px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path
+            d="M11 5V19M6 8H8M6 11H8M6 14H8M6.2 19H17.8C18.9201 19 19.4802 19 19.908 18.782C20.2843 18.5903 20.5903 18.2843 20.782 17.908C21 17.4802 21 16.9201 21 15.8V8.2C21 7.0799 21 6.51984 20.782 6.09202C20.5903 5.71569 20.2843 5.40973 19.908 5.21799C19.4802 5 18.9201 5 17.8 5H6.2C5.0799 5 4.51984 5 4.09202 5.21799C3.71569 5.40973 3.40973 5.71569 3.21799 6.09202C3 6.51984 3 7.07989 3 8.2V15.8C3 16.9201 3 17.4802 3.21799 17.908C3.40973 18.2843 3.71569 18.5903 4.09202 18.782C4.51984 19 5.07989 19 6.2 19Z"
+            stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </button>
+
+      <!-- NEW: connection status (dot + label). The model select will be injected next to this. -->
+      <div id="statusRow" class="row">
+        <span id="connDot" class="conn-dot conn-blue" aria-hidden="true"></span>
+        <span id="connText" class="muted">Connecting…</span>
+      </div>
+
+      <!-- The select stays in DOM; we will move it next to #statusRow and hide it until models are ready -->
       <select id="modelSelect" class="topbar-select" title="Available models" disabled>
-        <option>— loading models —</option>
+        <option style="text-align:center;">Loading Models</option>
       </select>
-      <button id="settingsBtn" class="gear" aria-label="Settings">☷</button>
+
+      <button id="settingsBtn" class="gear btnSq" aria-label="Settings">
+        <!-- (icon unchanged) -->
+        <svg width="16px" height="16px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path
+            d="M12 3L14.0357 8.16153C14.2236 8.63799 14.3175 8.87622 14.4614 9.0771C14.5889 9.25516 14.7448 9.41106 14.9229 9.53859C15.1238 9.68245 15.362 9.77641 15.8385 9.96432L21 12L15.8385 14.0357C15.362 14.2236 15.1238 14.3175 14.9229 14.4614C14.7448 14.5889 14.5889 14.7448 14.4614 14.9229C14.3175 15.1238 14.2236 15.362 14.0357 15.8385L12 21L9.96432 15.8385C9.77641 15.362 9.68245 15.1238 9.53859 14.9229C9.41106 14.7448 9.25516 14.5889 9.0771 14.4614C8.87622 14.3175 8.63799 14.2236 8.16153 14.0357L3 12L8.16153 9.96432C8.63799 9.77641 8.87622 9.68245 9.0771 9.53859C9.25516 9.41106 9.41106 9.25516 9.53859 9.0771C9.68245 8.87622 9.77641 8.63799 9.96432 8.16153L12 3Z"
+            stroke="#ffffff" stroke-width="2" stroke-linejoin="round" />
+        </svg>
+      </button>
     </header>
 
     <aside id="sidebar" class="col-left">
       <div class="left-head row">
         <div style="font-weight:600">Sessions</div>
         <div class="spacer"></div>
-        <button id="newSessionBtn" class="btn" style="padding:8px 10px">New</button>
+        <button id="newSessionBtn" class="btn btnSq"><svg width="16px" height="16px" viewBox="0 0 24 24" fill="none"
+            xmlns="http://www.w3.org/2000/svg">
+            <path d="M6 12H18M12 6V18" stroke="#ffffff" stroke-width="2" stroke-linecap="round"
+              stroke-linejoin="round" />
+          </svg></button>
       </div>
       <div id="sessions" class="sessions"></div>
+      <div id="backdrop" class="backdrop" onclick="toggleSidebar()"></div>
     </aside>
 
     <main class="col-main">
       <div class="sysedit">
-        <textarea id="systemMsg" class="sysinput"
-          placeholder="(Optional) e.g. 'You are a concise assistant. Answer with short bullets.'"></textarea>
+        <!-- Collapsed default: a button (you'll style it) -->
+        <button id="systemToggleBtn" class="btn">System Message</button>
+
+        <!-- Revealed editor -->
+        <div id="systemEditorWrap" class="hide">
+          <textarea id="systemMsg" class="sysinput"
+            placeholder="(Optional) e.g. 'You are a concise assistant. Answer with short bullets.'"></textarea>
+
+          <div class="row" id="systemActions" style="margin-top:8px">
+
+            <button id="sysGenBtn" class="btn" type="button">Generate</button>
+            <button id="sysSaveBtn" class="btn" type="button">Save</button>
+            <button id="systemToggleBtnInside" class="btn">Close</button>
+
+          </div>
+        </div>
+
       </div>
 
       <div id="chat" class="chat"></div>
 
       <div class="composer">
         <textarea id="prompt" class="input" placeholder="Type a message… (Shift+Enter = newline)"></textarea>
-        <button id="sendBtn" class="btn">⮞</button>
+        <button id="sendBtn" class="sendButton"><svg width="16px" height="16px" viewBox="0 0 24 24" fill="none"
+            xmlns="http://www.w3.org/2000/svg">
+            <path
+              d="M16.6582 9.28638C18.098 10.1862 18.8178 10.6361 19.0647 11.2122C19.2803 11.7152 19.2803 12.2847 19.0647 12.7878C18.8178 13.3638 18.098 13.8137 16.6582 14.7136L9.896 18.94C8.29805 19.9387 7.49907 20.4381 6.83973 20.385C6.26501 20.3388 5.73818 20.0469 5.3944 19.584C5 19.053 5 18.1108 5 16.2264V7.77357C5 5.88919 5 4.94701 5.3944 4.41598C5.73818 3.9531 6.26501 3.66111 6.83973 3.6149C7.49907 3.5619 8.29805 4.06126 9.896 5.05998L16.6582 9.28638Z"
+              stroke="#ffffff" stroke-width="2" stroke-linejoin="round" />
+          </svg></button>
       </div>
     </main>
   </div>
@@ -542,6 +722,7 @@
         <button id="saveSettings" class="btn">Save</button>
       </div>
     </div>
+    <div class="backdropModal" onclick="closeSettings()"></div>
   </div>
 
   <!-- Copy-to-clipboard helper for code blocks -->
@@ -637,19 +818,79 @@
     // Markdown + code highlighting setup
     marked.setOptions({ gfm: true, breaks: true, headerIds: false, mangle: false });
     function mdToHtml(s) { try { return marked.parse(String(s || '')); } catch { return String(s || ''); } }
-    function highlightIn(node) {
-      try { node.querySelectorAll('pre code').forEach(block => { try { hljs.highlightElement(block); } catch { } }); } catch { }
-    }
+    function highlightIn(node) { try { node.querySelectorAll('pre code').forEach(block => { try { hljs.highlightElement(block); } catch { } }); } catch { } }
 
     const STORAGE = {
-      SESS: 'CLIENT_SESSIONS_V1',
-      SETTINGS: 'CLIENT_SETTINGS_V1',
-      SEED: 'CLIENT_SEED_HEX',
-      HUB: 'CLIENT_HUB_ADDR',
+      SESS: 'CLIENT_SESSIONS_V2',
+      SETTINGS: 'CLIENT_SETTINGS_V2',
+      SEED: 'CLIENT_SEED_HEX_V2',
+      HUB: 'CLIENT_HUB_ADDR_V2',
       LEGACY_SEED: 'PEERBALLS_SEED_HEX',
       LEGACY_HUB: 'PEERBALLS_HUB_ADDR',
-      LAST_MODEL: 'CLIENT_LAST_SELECTED_MODEL'
+      LAST_MODEL: 'CLIENT_LAST_SELECTED_MODEL_V2'
     };
+    function getCurrentModel() {
+      const s = getSession();
+      // Prefer the session’s model; then the visible select; then the remembered one.
+      return (s && s.model) || (el('modelSelect') && el('modelSelect').value) || getSavedModel() || '';
+    }
+
+    // --- System Message helpers/state ---
+    const SYSTEM_GEN_PROMPT =
+      "You are a system prompt generator. Given the user's description, return ONE compact, actionable system prompt that sets role, tone, constraints, and safety. Use imperative, second person. No examples unless essential.";
+
+    const sysgenPending = new Set();   // track in-flight generation requests
+    let isSysGenStreaming = false;    // NEW
+    let sysgenCurrentId = null;       // NEW
+    let sysgenAcc = "";                 // accumulating streamed text
+    let sysgenPrevPlaceholder = "";     // to restore after finish/error
+
+    function toggleSystemEditor(forceOpen) {
+      const wrap = el('systemEditorWrap'); if (!wrap) return;
+      const toggleOut = el('systemToggleBtn');          // outside button
+      const toggleIn = el('systemToggleBtnInside');    // inside button (shown only when open)
+
+      const show = forceOpen ?? wrap.classList.contains('hide'); // true = open editor
+
+      if (show) {
+        wrap.classList.remove('hide');      // show editor
+        if (toggleOut) toggleOut.classList.add('hide');     // hide outside button
+        if (toggleIn) toggleIn.classList.remove('hide');   // show inside button
+      } else {
+        wrap.classList.add('hide');         // hide editor
+        if (toggleOut) toggleOut.classList.remove('hide');  // show outside button
+        if (toggleIn) toggleIn.classList.add('hide');      // hide inside button
+      }
+    }
+
+    function setSysGenBusy(isBusy) {
+      const b = el('sysGenBtn'); if (!b) return;
+      b.disabled = !!isBusy;
+      b.textContent = isBusy ? 'Generating…' : 'Generate';
+    }
+
+    function setConn(color, label) {
+      const dot = el('connDot'), text = el('connText');
+      if (!dot || !text) return;
+
+      dot.classList.remove('conn-red', 'conn-green', 'conn-blue');
+      dot.classList.add(color === 'green' ? 'conn-green' : color === 'red' ? 'conn-red' : 'conn-blue');
+
+      if (label && label.trim()) {
+        text.classList.remove('hide');        // show label
+        text.textContent = label;
+      } else {
+        text.textContent = '';                // clear label
+        text.classList.add('hide');           // collapse immediately (no width)
+      }
+    }
+
+    function showModelDropdown(show) {
+      const sel = el('modelSelect');
+      if (!sel) return;
+      sel.classList[show ? 'remove' : 'add']('hide');
+      sel.disabled = !show;
+    }
 
     function loadJSON(key, fallback) {
       try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch { return fallback; }
@@ -688,7 +929,6 @@
         settings.hub = h;
         saveJSON(STORAGE.SETTINGS, settings);
         localStorage.setItem(STORAGE.HUB, h);
-        // Clean the URL so the param isn't kept around
         try {
           const url = new URL(location.href);
           ['hub', 'nkn', 'signaling', 'signal'].forEach(k => url.searchParams.delete(k));
@@ -736,7 +976,7 @@
       sessions.unshift(s); activeSessionId = id; saveJSON(STORAGE.SESS, sessions);
       setSavedModel(model);
       renderSessions(); renderSystemEditor(); renderChat();
-      sendSessionOpen(s, /*seed*/true); // seed (ensures model/system/options on server)
+      sendSessionOpen(s, /*seed*/true);
     }
     function getSession(id = activeSessionId) { return sessions.find(x => x.id === id) || null; }
     function setActiveSession(id) {
@@ -748,7 +988,7 @@
         if (sel && Array.from(sel.options).some(o => o.value === s.model)) sel.value = s.model;
       }
       renderSessions(); renderSystemEditor(); renderChat();
-      if (s) sendSessionOpen(s, /*seed*/true); // seed full history on selection
+      if (s) sendSessionOpen(s, /*seed*/true);
     }
     function appendMessage(sessId, role, content) {
       const s = getSession(sessId); if (!s) return; s.messages.push({ role, content, ts: Date.now() }); saveJSON(STORAGE.SESS, sessions);
@@ -781,7 +1021,11 @@
         div.innerHTML = `
         <div class="title">${s.title || s.model || 'Session'}</div>
         <small>${s.model || ''} • ${new Date(s.createdAt).toLocaleString()}</small>
-        <button class="del" title="Delete session" aria-label="Delete">×</button>
+        <button class="del" title="Delete session" aria-label="Delete"><svg width="16px" height="16px" viewBox="0 0 24 24" style="transform:rotate(45deg);" fill="none"
+            xmlns="http://www.w3.org/2000/svg">
+            <path d="M6 12H18M12 6V18" stroke="#ffffff" stroke-width="2" stroke-linecap="round"
+              stroke-linejoin="round" />
+          </svg></button>
       `;
         const del = div.querySelector('.del');
         del.addEventListener('click', (e) => {
@@ -842,28 +1086,23 @@
       const w = document.querySelector('.msg.assistant[data-stream="1"]'); if (w) w.dataset.stream = '0';
     }
 
-    // NKN
+    // ─────────── NKN (robust MultiClient + your message contract)
     let client = null, myAddr = null; let HUB_ADDR = settings.hub || '';
     function updateChips() { el('hubChip').textContent = 'hub: ' + (HUB_ADDR ? short(HUB_ADDR) : '—'); el('meChip').textContent = 'me: ' + (myAddr ? short(myAddr) : '—'); }
     function trySend(addr, obj) { if (!client || !addr) return; try { client.send(addr, JSON.stringify(obj)); } catch { } }
 
     // Streaming (ordered)
     const streams = new Map();
-
-    // NEW: track current/pending stream ids and cancellations for Stop button
-    let currentStreamId = null;           // the stream we can cancel now
-    let pendingStreamId = null;           // id announced by llm.start before first chunk
-    let isStreaming = false;              // UI mode flag
-    const cancelledStreams = new Set();   // ids we asked to cancel; ignore their chunks
+    let currentStreamId = null;
+    let pendingStreamId = null;
+    let isStreaming = false;
+    const cancelledStreams = new Set();
 
     function startStream(id, onChunk) { streams.set(id, { next: 1, lastAck: 0, buffer: new Map(), onChunk }); }
     function handleChunk(id, seq, data) {
-      if (cancelledStreams.has(id)) return; // ignore chunks after user stopped
+      if (cancelledStreams.has(id)) return;
       const st = streams.get(id); if (!st) return; st.buffer.set(seq, data);
-      // On first observed token for pending stream, flip to Stop
-      if (!isStreaming && currentStreamId === null && pendingStreamId === id) {
-        setStopMode(id);
-      }
+      if (!isStreaming && currentStreamId === null && pendingStreamId === id) { setStopMode(id); }
       while (st.buffer.has(st.next)) { const part = st.buffer.get(st.next); st.buffer.delete(st.next); st.onChunk(part); st.next++; }
       sendAck(id, st.next - 1);
     }
@@ -872,6 +1111,9 @@
 
     // Models
     let modelsLoaded = false;
+    let modelRevealTimer = null;   // <— NEW
+    let clearLabelTimer = null;      // NEW
+    let allowModelsReveal = false;   // NEW (guard against any early reveals)
     function requestModelsList() { trySend(HUB_ADDR, { event: 'llm.request', api: 'list', stream: false }); }
     function ensureModels() {
       const backoff = [0, 500, 1500, 3000, 5000, 8000];
@@ -887,24 +1129,18 @@
       modelsLoaded = (sel.options.length > 0);
       sel.disabled = !modelsLoaded;
       if (!modelsLoaded) { const opt = document.createElement('option'); opt.textContent = '— no models —'; sel.appendChild(opt); }
-      // Restore last selection (last session's model wins)
       const remembered = getSavedModel();
-      if (remembered && Array.from(sel.options).some(o => o.value === remembered)) {
-        sel.value = remembered;
-      }
+      if (remembered && Array.from(sel.options).some(o => o.value === remembered)) { sel.value = remembered; }
       sel.onchange = () => {
         const model = sel.value;
-        if (model && modelsLoaded) {
-          setSavedModel(model);
-          createSessionForModel(model);
-        }
+        if (model && modelsLoaded) { setSavedModel(model); createSessionForModel(model); }
       };
+
+      showModelDropdown(true);  // <— NEW (keeps it visible when models land)
     }
 
     // Build history for seeding (exclude 'system'; it's sent separately)
-    function buildHistoryForSession(sess) {
-      return (sess?.messages || []).map(m => ({ role: m.role, content: m.content }));
-    }
+    function buildHistoryForSession(sess) { return (sess?.messages || []).map(m => ({ role: m.role, content: m.content })); }
 
     // Session control → hub
     function currentOptions() { return { temperature: settings.temperature, top_p: settings.top_p, seed: settings.seed, num_ctx: settings.num_ctx }; }
@@ -917,23 +1153,54 @@
         system: (s.system || ''),
         options: currentOptions()
       };
-      if (seed) {
-        payload.history = buildHistoryForSession(s);
-        payload.replace = true; // authoritative seed
-      }
+      if (seed) { payload.history = buildHistoryForSession(s); payload.replace = true; }
       trySend(HUB_ADDR, payload);
     }
     function sendSessionReset(sid) { if (!sid || !HUB_ADDR) return; trySend(HUB_ADDR, { event: 'session.reset', sid }); }
 
+    // EXACTLY follow the proven NKN connect pattern; identifier MUST be 'client'
     function connectNKN() {
+      // Require hub set first (as in your original)
       if (!isNknAddr(HUB_ADDR)) { openSettings(); return; }
       updateChips();
-      client = new nkn.MultiClient({ seed: getOrCreateSeed(), identifier: 'client' });
+      setConn('blue', 'Connecting…');
+
+      client = new nkn.MultiClient({
+        seed: getOrCreateSeed(),
+        identifier: 'client',     // <—— address prefix YOU asked for
+        numSubClients: 4,
+        originalClient: true
+      });
+
       client.onConnect(() => {
+        setConn('green', 'Connected');          // show "Connected" immediately
         myAddr = client.addr; updateChips();
-        trySend(HUB_ADDR, { event: 'announce' }); // auto models push
-        const sel = el('modelSelect'); sel.innerHTML = '<option>— loading models —</option>'; sel.disabled = true;
-        modelsLoaded = false; ensureModels();
+        setConn('green', '');
+        trySend(HUB_ADDR, { event: 'announce' });
+
+        // Clear prior timers on reconnects
+        if (clearLabelTimer) clearTimeout(clearLabelTimer);
+        if (modelRevealTimer) clearTimeout(modelRevealTimer);
+
+        clearLabelTimer = setTimeout(() => {
+          // 1) Remove label first (green dot only)
+
+          // 2) Force a reflow so the label collapse is applied BEFORE we reveal the select
+          const t = el('connText'); if (t) void t.offsetWidth;
+
+          // 3) Next tick: reveal the select and request models
+          modelRevealTimer = setTimeout(() => {
+            const sel = el('modelSelect');
+            if (sel) {
+              sel.innerHTML = '<option>Loading Models</option>';
+              sel.disabled = true;
+              showModelDropdown(true);          // select appears only after label is gone
+            }
+            modelsLoaded = false;
+            requestModelsList();
+            ensureModels();
+          }, 0);
+        }, 10);
 
         const s = getSession();
         if (s) {
@@ -941,9 +1208,18 @@
           sendSessionOpen(s, /*seed*/true);
         }
       });
+
+
+      // EXACT dispatch style: funnel to onInbound, only process if src===HUB_ADDR
       client.on('message', onInbound);
+      client.on('willreconnect', () => setConn('blue', 'Reconnecting…'));
+      client.on('connectFailed', () => setConn('red', 'Connect failed'));
+      client.on('close', () => setConn('red', 'Disconnected'));
+      client.on('error', () => setConn('red', 'Error'));
       window.addEventListener('beforeunload', () => { try { client && client.close(); } catch { } });
     }
+
+
 
     // Inbound
     function onInbound(a, b) {
@@ -961,6 +1237,37 @@
 
       const ev = body.event;
 
+      // --- intercept one-off system-prompt generation replies ---
+      if (ev === 'llm.result' && sysgenPending.has(body.id)) {
+        const out = extractFull(body.data) || '';
+        const ta = el('systemMsg');
+        ta.readOnly = false;
+        ta.placeholder = sysgenPrevPlaceholder;
+        ta.value = out;
+
+        setSysGenBusy(false);
+        sysgenPending.delete(body.id);
+        isSysGenStreaming = false;
+        sysgenCurrentId = null;
+        sysgenAcc = "";
+        sysgenPrevPlaceholder = "";
+        return
+      }
+      if (ev === 'llm.error' && sysgenPending.has(body.id)) {
+        const ta = el('systemMsg');
+        ta.readOnly = false;
+        ta.placeholder = sysgenPrevPlaceholder; // restore
+        // leave ta.value as-is (user input) or empty if you cleared it
+        setSysGenBusy(false);
+        isSysGenStreaming = false;
+        sysgenPending.delete(body.id);
+        sysgenCurrentId = null;
+        sysgenAcc = "";
+        sysgenPrevPlaceholder = "";
+        alert('[System Prompt Generator] ' + (body.message || 'Error'));
+        return;
+      }
+
       if (ev === 'session.ready' || ev === 'session.info' || ev === 'ctrl.info') { return; }
       if (ev === 'ctrl.error') { console.warn('[ctrl.error]', body); return; }
 
@@ -969,8 +1276,25 @@
 
       if (ev === 'llm.start') {
         const { id, stream } = body;
+        if (sysgenPending.has(id)) {
+          // stream into the textarea instead of a chat bubble
+          isSysGenStreaming = true;
+          sysgenCurrentId = id;
+
+          startStream(id, (part) => {
+            const t = extractDelta(part);
+            if (t) {
+              const ta = el('systemMsg');
+              sysgenAcc += t;
+              ta.placeholder = sysgenAcc;   // ← type into placeholder
+            }
+          });
+          return; // do not create assistant chat bubble for sysgen
+        }
+
+        // (keep your existing chat-streaming code below for normal chats)
         if (stream) {
-          pendingStreamId = id;             // wait for first token to flip UI to Stop
+          pendingStreamId = id;
           addStreamingAssistantBubble();
           const sess = getSession(); if (!sess) return;
           sess.messages.push({ role: 'assistant', content: '', ts: Date.now() }); saveJSON(STORAGE.SESS, sessions);
@@ -984,9 +1308,27 @@
       }
       if (ev === 'llm.chunk') { handleChunk(body.id, body.seq, body.data); return; }
       if (ev === 'llm.done') {
+        if (sysgenCurrentId && body.id === sysgenCurrentId) {
+          sendAck(body.id, body.last_seq);
+          endStream(body.id);
+          const ta = el('systemMsg');
+          ta.value = (sysgenAcc || "").trim();   // commit the generated prompt
+          ta.placeholder = sysgenPrevPlaceholder; // restore original placeholder
+          ta.readOnly = false;
+
+          isSysGenStreaming = false;
+          setSysGenBusy(false);
+          sysgenPending.delete(body.id);
+          sysgenCurrentId = null;
+          sysgenAcc = "";
+          sysgenPrevPlaceholder = "";
+          return;
+        }
+
+
+        // (keep your existing chat 'done' handling below)
         finishStreamingBubble(); sendAck(body.id, body.last_seq); endStream(body.id);
-        setSendMode(); // back to send
-        return;
+        setSendMode(); return;
       }
       if (ev === 'llm.result') {
         const sess = getSession(); if (!sess) return;
@@ -999,7 +1341,6 @@
         const sess = getSession(); if (!sess) return;
         appendMessage(sess.id, 'assistant', '[error] ' + body.message);
         renderChat();
-        // ensure button resets even if an error interrupts a stream
         setSendMode();
         return;
       }
@@ -1037,7 +1378,7 @@
       });
     }
 
-    // NEW: Stop button behavior
+    // Stop button behavior
     function setStopMode(id) {
       const btn = el('sendBtn');
       currentStreamId = id;
@@ -1045,24 +1386,31 @@
       btn.textContent = '⏹';
       btn.onclick = stopGeneration;
     }
+    const playSign = `<svg width="32px" height="32px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M16.6582 9.28638C18.098 10.1862 18.8178 10.6361 19.0647 11.2122C19.2803 11.7152 19.2803 12.2847 19.0647 12.7878C18.8178 13.3638 18.098 13.8137 16.6582 14.7136L9.896 18.94C8.29805 19.9387 7.49907 20.4381 6.83973 20.385C6.26501 20.3388 5.73818 20.0469 5.3944 19.584C5 19.053 5 18.1108 5 16.2264V7.77357C5 5.88919 5 4.94701 5.3944 4.41598C5.73818 3.9531 6.26501 3.66111 6.83973 3.6149C7.49907 3.5619 8.29805 4.06126 9.896 5.05998L16.6582 9.28638Z" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/>
+</svg>`;
+    const stopSign = `<svg width="32px" height="32px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect x="4" y="4" width="16" height="16" rx="2" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+
     function setSendMode() {
       const btn = el('sendBtn');
       isStreaming = false;
       pendingStreamId = null;
       currentStreamId = null;
-      btn.textContent = '⮞';
+      btn.innerHTML = playSign;
       btn.onclick = sendPrompt;
     }
     function stopGeneration() {
       if (!currentStreamId || !HUB_ADDR) { setSendMode(); return; }
       cancelledStreams.add(currentStreamId);
       trySend(HUB_ADDR, { event: 'llm.cancel', id: currentStreamId });
-      // Immediately return the UI to Send mode; incoming llm.done will be handled gracefully.
       setSendMode();
     }
 
     // System editor → persist locally and push to hub
     el('systemMsg').addEventListener('input', debounce(() => {
+      if (isSysGenStreaming) return; // avoid pushing while generator streams
       const s = getSession(); if (!s) return;
       s.system = el('systemMsg').value;
       saveJSON(STORAGE.SESS, sessions);
@@ -1075,17 +1423,73 @@
 
     // Sidebar Toggle Mobile
     function toggleSidebar() {
-      const el = document.getElementById('sidebar');
-      if (!el) return; // quietly no-op if missing
-
-      // Read current computed left; treat 0px/0% as "open"
-      const curLeft = getComputedStyle(el).left.trim();
-      el.style.left = (curLeft === '0px' || curLeft === '0%') ? '-50%' : '0%';
+      const elx = document.getElementById('sidebar');
+      const elxb = document.getElementById('backdrop');
+      if (!elx) return;
+      const curLeft = getComputedStyle(elx).left.trim();
+      elx.style.left = (curLeft === '0px' || curLeft === '0%') ? '-50%' : '0%';
+      elxb.style.left = (curLeft === '0px' || curLeft === '0%') ? '-100%' : '0%';
     }
 
     // Boot
     function boot() {
-      // Apply hub from URL before anything else that depends on it
+      (() => {
+        const row = el('statusRow'), sel = el('modelSelect');
+        if (row && sel && sel.parentElement !== row) row.appendChild(sel);
+        showModelDropdown(false); // hide until models list arrives
+      })();
+
+      // System Message toggle + actions
+      el('systemToggleBtn').onclick = () => toggleSystemEditor();  // show/hide editor
+      el('systemToggleBtnInside').onclick = () => toggleSystemEditor();  // show/hide editor
+
+      el('sysGenBtn').onclick = () => {
+        if (!HUB_ADDR) { openSettings(); return; }
+
+        const input = (el('systemMsg').value || '').trim();
+        if (!input) { alert('Type what you want your system prompt to do, then click Generate.'); return; }
+
+        const model = getCurrentModel();
+        if (!model) { alert('Choose a model first, then try Generate again.'); return; }
+
+        const genId = newId('sysgen');
+        sysgenPending.add(genId);
+        setSysGenBusy(true);
+
+        // Prep textarea for placeholder streaming
+        const ta = el('systemMsg');
+        sysgenAcc = "";
+        sysgenPrevPlaceholder = ta.placeholder || "";
+        ta.value = "";               // keep empty so placeholder is visible
+        ta.placeholder = "";         // will be filled as tokens arrive
+        ta.readOnly = true;          // avoid user edits during streaming
+
+        trySend(HUB_ADDR, {
+          event: 'llm.request',
+          id: genId,
+          api: 'chat',
+          model,
+          stream: true,
+          messages: [
+            { role: 'system', content: SYSTEM_GEN_PROMPT },
+            { role: 'user', content: input }
+          ],
+          kwargs: { options: currentOptions() },
+          aux: 'sysgen'
+        });
+      };
+
+      el('sysSaveBtn').onclick = () => {
+        const s = getSession();
+        if (!s) { alert('Create/select a session first.'); return; }
+        s.system = el('systemMsg').value || '';
+        saveJSON(STORAGE.SESS, sessions);
+        sendSessionOpen(s, /*seed*/false);
+        // Optional: collapse after save
+        // toggleSystemEditor(false);
+      };
+
+      // Apply hub from URL before anything else that depends on it (RESTORED FEATURE)
       applyHubFromUrl();
 
       renderSessions(); renderSystemEditor(); renderChat(); updateSettingsUI();
@@ -1103,8 +1507,9 @@
         if (!model || sel.disabled) { alert('No models yet. Set hub and ensure it’s running.'); return; }
         createSessionForModel(model);
       };
+
       if (activeSessionId) setActiveSession(activeSessionId);
-      connectNKN();
+      connectNKN(); // uses MultiClient with identifier: 'client'
     }
     boot();
   </script>
