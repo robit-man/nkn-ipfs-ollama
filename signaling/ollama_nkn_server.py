@@ -465,15 +465,24 @@ def _print_models_on_start():
     except Exception as e:
         print(f"‼️  Ollama probe failed: {e}")
 
+# near the top-level (module scope)
+_last_models_sent: Dict[str, int] = {}  # addr -> ms
+
 def _send_models_list(to: str):
+    now = _now_ms()
+    last = _last_models_sent.get(to, 0)
+    if now - last < 1500:  # throttle to 1.5s per peer
+        return
+    _last_models_sent[to] = now
     try:
         data = _ollama_list()
-        pkt = {"event": "llm.models", "data": data, "ts": _now_ms()}
+        pkt = {"event": "llm.models", "data": data, "ts": now}
         _dm(to, pkt)
         _dm(to, {"event":"llm.result","id":"models","data":data,"ts":_now_ms()})
         _log("models.sent", f"→ {to} count={len(data.get('models',[]))}")
     except Exception as e:
         _dm(to, {"event":"llm.error","id":"models","message":f"models list failed: {e}","kind":"models","ts":_now_ms()})
+
 
 # ──────────────────────────────────────────────────────────────────────
 # VI. Session store
@@ -939,6 +948,19 @@ def _cancel_llm(body: dict):
 # ──────────────────────────────────────────────────────────────────────
 def _handle_dm(src_addr: str, body: dict):
     ev = (body.get("event") or "").strip()
+        # Control
+    if ev == "ctrl.ping":
+        _dm(src_addr, {
+            "event": "ctrl.pong",
+            "ts": _now_ms(),
+            # optional debug fields:
+            "nknAddress": state.get("nkn_address"),
+            "topicPrefix": state.get("topic_prefix"),
+            "llmActive": len(_llm_streams),
+            "sessions": len(SESSIONS),
+        })
+        return
+
     if not ev:
         _log("dm", f"from {src_addr}  event=<missing>  body={body}")
         return
