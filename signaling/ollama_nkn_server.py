@@ -650,7 +650,7 @@ def _sanitize_state(s: dict) -> Dict[str, float]:
     return {"lat": lat, "lon": lon}
 
 ACTIVE_WINDOW_MS = 6_000
-PRUNE_WINDOW_MS  = 10_000
+PRUNE_WINDOW_MS  = 30_000
 
 def _send_world_snapshot(targets=None):
     now = _now_ms()
