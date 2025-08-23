@@ -810,6 +810,7 @@
     })();
   </script>
 
+
   <script>
     // ─────────── Utils & storage
     const $ = s => document.querySelector(s);
@@ -1311,16 +1312,28 @@
       setConn('blue', 'Connecting…');
 
       try { if (client) { try { client.close(); } catch { } } } catch { }
+
+
+      const BOOT = window.__NKN_BOOT || { ON_IPFS: false, SEED_WS_POOL: [], SEED_RPC_POOL: [], shuffle: (a) => a };
+      const wsSeeds = BOOT.shuffle(BOOT.SEED_WS_POOL).slice(0, BOOT.ON_IPFS ? 1 : 2);   // tiny set
+      const rpcSeeds = BOOT.ON_IPFS ? [] : BOOT.shuffle(BOOT.SEED_RPC_POOL).slice(0, 1); // avoid HTTP on IPFS
+
       client = new nkn.MultiClient({
         seed: getOrCreateSeed(),
         identifier: 'client',
-        numSubClients: 4,
+        numSubClients: BOOT.ON_IPFS ? 1 : 3,            // cut concurrency on IPFS
         originalClient: true,
         reconnectIntervalMin: 1000,
         reconnectIntervalMax: 10000,
-        wsConnHeartbeatTimeout: 60000, // used on WS paths/fallbacks
-        // seedRPCServerAddr: ['https://mainnet-seed-0001.nkn.org:30003', ...] // optional: explicit seeds
+        wsConnHeartbeatTimeout: 60000,
+
+        // Prefer WebSocket seeds to dodge CORS entirely
+        seedWsAddr: wsSeeds,
+
+        // Only use a SINGLE RPC seed off-IPFS; NONE on IPFS (prevents 429/CORS)
+        ...(rpcSeeds.length ? { seedRPCServerAddr: rpcSeeds } : {}),
       });
+
 
       client.onConnect(() => {
         isConnecting = false;
