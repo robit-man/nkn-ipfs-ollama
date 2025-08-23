@@ -1069,8 +1069,18 @@ def _handle_dm(src_addr: str, body: dict):
             return
 
         else:
+            # ── messages-mode (no sid/delta): accept top-level messages and pass to Ollama
+            top_msgs = body.get("messages")
+            if isinstance(top_msgs, (list, tuple)):
+                # sanitize to {role, content} and drop unknown roles
+                msgs = _sanitize_history(top_msgs)
+                kw = body.get("kwargs") or {}
+                kw["messages"] = msgs
+                body["kwargs"] = kw
+                body.pop("messages", None)  # ensure only kwargs.messages is used
+
             rid = _start_llm(src_addr, body)
-            _log("llm.start", f"{src_addr} id={rid} api={api} model={model} stream={stream} (compat)")
+            _log("llm.start", f"{src_addr} id={rid} api={api} model={model} stream={stream} (compat/messages={bool(top_msgs)})")
             return
 
     if ev == "llm.ack":
