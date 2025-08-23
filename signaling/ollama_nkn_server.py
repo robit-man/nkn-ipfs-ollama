@@ -277,6 +277,8 @@ _last_hb = 0.0
 _ready_at = 0.0
 _bridge_starts = 0
 _bridge_lock = threading.Lock()
+_bridge_write_lock = threading.Lock()  # ← serialize writes to child stdin
+
 
 def _spawn_bridge() -> Popen:
     global _last_hb, _ready_at, _bridge_starts
@@ -293,8 +295,10 @@ def _spawn_bridge() -> Popen:
 def _bridge_send(obj: dict):
     try:
         if bridge and bridge.stdin:
-            bridge.stdin.write(json.dumps(obj) + "\n")
-            bridge.stdin.flush()
+            line = json.dumps(obj) + "\n"
+            with _bridge_write_lock:
+                bridge.stdin.write(line)
+                bridge.stdin.flush()
     except Exception:
         pass
 
@@ -465,23 +469,23 @@ def _print_models_on_start():
     except Exception as e:
         print(f"‼️  Ollama probe failed: {e}")
 
-# near the top-level (module scope)
 _last_models_sent: Dict[str, int] = {}  # addr -> ms
 
-def _send_models_list(to: str):
+def _send_models_list(to: str, req_id: Optional[str] = None):
     now = _now_ms()
     last = _last_models_sent.get(to, 0)
-    if now - last < 1500:  # throttle to 1.5s per peer
+    if now - last < 1500:  # throttle per-peer
         return
     _last_models_sent[to] = now
     try:
         data = _ollama_list()
-        pkt = {"event": "llm.models", "data": data, "ts": now}
-        _dm(to, pkt)
-        _dm(to, {"event":"llm.result","id":"models","data":data,"ts":_now_ms()})
-        _log("models.sent", f"→ {to} count={len(data.get('models',[]))}")
+        # Send both for compatibility; echo req_id on llm.result for correlation
+        _dm(to, {"event": "llm.models", "data": data, "ts": now})
+        _dm(to, {"event": "llm.result", "id": (req_id or "models"), "data": data, "ts": _now_ms()})
+        _log("models.sent", f"→ {to} id={req_id or 'models'} count={len(data.get('models',[]))}")
     except Exception as e:
-        _dm(to, {"event":"llm.error","id":"models","message":f"models list failed: {e}","kind":"models","ts":_now_ms()})
+        _dm(to, {"event":"llm.error","id": (req_id or "models"),
+                 "message":f"models list failed: {e}","kind":"models","ts":_now_ms()})
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -654,18 +658,33 @@ PRUNE_WINDOW_MS  = 30_000
 
 def _send_world_snapshot(targets=None):
     now = _now_ms()
+    # prune stale (safe because we iterate over a snapshot list)
     for addr, st in list(peers_by_addr.items()):
         if st.get("ts", 0) < (now - PRUNE_WINDOW_MS):
             _log("prune", f"{addr} idle >10s")
             peers_by_addr.pop(addr, None)
             clients.discard(addr)
+
+    # snapshot to avoid mutation during iteration
+    client_snapshot = tuple(clients)
+    peers_snapshot = dict(peers_by_addr)
+
     if targets is None:
-        targets = [a for a in clients if peers_by_addr.get(a, {}).get("ts", 0) >= (now - ACTIVE_WINDOW_MS)]
-    if not targets: return
-    peers_obj = { addr: {"lat": st["lat"], "lon": st["lon"], "ts": st["ts"]} for addr, st in peers_by_addr.items() }
-    pkt = {"event":"world", "peers": peers_obj, "ts": now}
+        targets = [
+            a for a in client_snapshot
+            if peers_snapshot.get(a, {}).get("ts", 0) >= (now - ACTIVE_WINDOW_MS)
+        ]
+    if not targets:
+        return
+
+    peers_obj = {
+        addr: {"lat": st["lat"], "lon": st["lon"], "ts": st["ts"]}
+        for addr, st in peers_snapshot.items()
+    }
+    pkt = {"event": "world", "peers": peers_obj, "ts": now}
     for to in targets:
         _dm(to, pkt)
+
 
 def _broadcaster_loop():
     while True:
@@ -808,10 +827,12 @@ class _LLMStream:
             self.done_seq = self.seq
             self._dm({"event":"llm.done","id":self.id,"last_seq":self.done_seq,"meta":meta,"ts":_now_ms()})
         try:
-            if callable(self.on_done):
+            # Non-stream flows already invoked on_done(final_text) in _send_result.
+            if callable(self.on_done) and self.stream:
                 self.on_done(None)
         except Exception as e:
             _log("llm.on_done.err", str(e))
+
 
     def ack(self, upto: int):
         with self._lock:
@@ -1038,9 +1059,10 @@ def _handle_dm(src_addr: str, body: dict):
         model  = (body.get("model") or "").strip() or None
 
         if api == "list" and not stream:
-            _send_models_list(src_addr)
-            _log("llm.list", f"{src_addr} → models sent")
+            _send_models_list(src_addr, body.get("id"))
+            _log("llm.list", f"{src_addr} id={body.get('id')} → models sent")
             return
+
 
         if sid and delta is not None:
             s = _get_session(src_addr, sid)
@@ -1145,7 +1167,8 @@ def _handle_dm(src_addr: str, body: dict):
         clients.add(src_addr)
         _log("announce", f"{src_addr}")
         _send_world_snapshot([src_addr])
-        _send_models_list(src_addr)
+        # Models are now request-based; client should send:
+        # {event: 'llm.request', api: 'list', stream: false}
         return
 
     if ev in ("frame-color", "frame-depth"):
