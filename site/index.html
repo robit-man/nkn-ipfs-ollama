@@ -1035,7 +1035,7 @@
 
     // --- System Message helpers/state ---
     const SYSTEM_GEN_PROMPT =
-      "You are a system prompt generator. Given the user's description, return ONE compact, actionable system prompt that sets role, tone, constraints, and safety. Use imperative, second person. No examples unless essential.";
+      "You are a system prompt generator. Given the user's description, return ONE highly detailed, actionable system prompt that sets role, tone, constraints. Use imperative, second person. No examples unless essential. Verbose and explicit enhancements to the provided content to ensure high quality expansion of instruction set to match determined intention.";
 
     // Keep these to avoid breaking any assumptions elsewhere
     const sysgenPending = new Set();
@@ -1158,15 +1158,34 @@
     function flushOutbox() {
       while (isConnected && client && outbox.length) {
         const { payload } = outbox.shift();
-        try { client.send(HUB_ADDR, JSON.stringify(payload)); } catch { }
+        const p = client.send(HUB_ADDR, JSON.stringify(payload), { noReply:true, maxHoldingSeconds:120 });
+        p && p.catch(err => {
+          // Put it back and bail; we'll try again on next tick/reconnect
+          outbox.unshift({ payload, route: null });
+          console.debug('[nkn.flush] send failed; will retry', err?.message || err);
+          // Break loop to avoid tight-spin on a bad state
+          return;
+        });
       }
     }
+
 
     // ─────────── NKN (robust MultiClient + your message contract)
     let client = null, myAddr = null; let HUB_ADDR = settings.hub || '';
     function updateChips() { el('hubChip').textContent = 'hub: ' + (HUB_ADDR ? short(HUB_ADDR) : '—'); el('meChip').textContent = 'me: ' + (myAddr ? short(myAddr) : '—'); }
-    function trySend(addr, obj) { if (!client || !addr || !isConnected) return; try { client.send(addr, JSON.stringify(obj)); } catch { } }
-
+    function trySend(addr, obj, opts = {}) {
+      if (!client || !addr || !isConnected) return false;
+      const payload = JSON.stringify(obj);
+      const sendOpts = { noReply: true, maxHoldingSeconds: 120, ...opts }; // caller can override
+      const p = client.send(addr, payload, sendOpts);
+      if (p && typeof p.then === 'function') {
+        p.catch(err => {
+          console.debug('[nkn.send] transient send failed; will rely on outbox/reconnect', err?.message || err);
+          // optional: outbox.push({ payload: obj, route: null });
+        });
+      }
+      return true;
+    }
     // Streaming (ordered)
     const streams = new Map();
     let currentStreamId = null;
@@ -1182,7 +1201,11 @@
       while (st.buffer.has(st.next)) { const part = st.buffer.get(st.next); st.buffer.delete(st.next); st.onChunk(part); st.next++; }
       sendAck(id, st.next - 1);
     }
-    function sendAck(id, upto) { const st = streams.get(id); if (!st || upto <= st.lastAck) return; st.lastAck = upto; trySend(HUB_ADDR, { event: 'llm.ack', id, upto }); }
+function sendAck(id, upto) {
+  const st = streams.get(id); if (!st || upto <= st.lastAck) return;
+  st.lastAck = upto;
+  trySend(HUB_ADDR, { event: 'llm.ack', id, upto }, { noReply:true, maxHoldingSeconds:120 });
+}
     function endStream(id) { streams.delete(id); cancelledStreams.delete(id); if (currentStreamId === id) currentStreamId = null; if (pendingStreamId === id) pendingStreamId = null; }
 
     // Models
@@ -1248,7 +1271,7 @@
           return;
         }
 
-        try { trySend(HUB_ADDR, { event: 'ctrl.ping', ts: Date.now() }); } catch { }
+        try { trySend(HUB_ADDR, { event:'ctrl.ping', ts: Date.now() }, { noReply:true, maxHoldingSeconds:120 }); } catch {}
 
         const stale = (Date.now() - lastPongAt) > HEARTBEAT_MS * 3;
         if (stale && !isConnecting) {
@@ -1260,6 +1283,15 @@
         }
       }, HEARTBEAT_MS);
     }
+
+
+    window.addEventListener('unhandledrejection', (e) => {
+      const s = String(e.reason && e.reason.message || e.reason || '');
+      if (/RTCDataChannel\.readyState|Message timeout|ConnectToNodeTimeoutError/i.test(s)) {
+        e.preventDefault();
+        console.debug('[nkn] suppressed transient send error:', s);
+      }
+    });
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
@@ -1283,7 +1315,11 @@
         seed: getOrCreateSeed(),
         identifier: 'client',
         numSubClients: 4,
-        originalClient: true
+        originalClient: true,
+        reconnectIntervalMin: 1000,
+        reconnectIntervalMax: 10000,
+        wsConnHeartbeatTimeout: 60000, // used on WS paths/fallbacks
+        // seedRPCServerAddr: ['https://mainnet-seed-0001.nkn.org:30003', ...] // optional: explicit seeds
       });
 
       client.onConnect(() => {
@@ -1294,7 +1330,7 @@
         setConn('green', '');
         lastPongAt = Date.now();
         startHeartbeat();
-        trySend(HUB_ADDR, { event: 'announce' });
+        trySend(HUB_ADDR, { event: 'announce' }, { noReply:true, maxHoldingSeconds:120 });
 
         if (clearLabelTimer) clearTimeout(clearLabelTimer);
         if (modelRevealTimer) clearTimeout(modelRevealTimer);
@@ -1548,9 +1584,10 @@
     function stopGeneration() {
       if (!currentStreamId || !HUB_ADDR) { setSendMode(); return; }
       cancelledStreams.add(currentStreamId);
-      trySend(HUB_ADDR, { event: 'llm.cancel', id: currentStreamId });
+      trySend(HUB_ADDR, { event: 'llm.cancel', id: currentStreamId }, { noReply:true, maxHoldingSeconds:120 });
       setSendMode();
     }
+
 
     // System editor → persist locally and push to hub (suppressed while streaming to this element)
     el('systemMsg').addEventListener('input', debounce(() => {
