@@ -469,6 +469,7 @@
 
     .btnSq {
       aspect-ratio: 1 / 1;
+
     }
 
     .btn {
@@ -601,10 +602,16 @@
       cursor: pointer;
     }
 
+    #sendBtn {
+      display: flex;
+    }
+
     .sendButton {
       background: transparent;
       border: unset;
       cursor: pointer;
+      flex-flow: column;
+      justify-content: center;
     }
 
     .sendButton:hover {
@@ -751,6 +758,27 @@
       z-index: -1;
     }
 
+
+    #systemActions .btnSq {
+      width: 36px;
+      height: 36px;
+      padding: 0;
+      font-weight: 700;
+      display: flex;
+      flex-flow: row !important;
+      justify-content: center;
+    }
+
+    #systemActions .btnSq>svg {
+      margin: auto;
+    }
+
+    .btn.toggled {
+      border-color: #ffffff;
+      box-shadow: 0 0 0 1px #ffffff inset;
+    }
+
+
     @media (max-width: 900px) {
       #toggleSidebar {
         display: flex;
@@ -767,7 +795,7 @@
         width: 50%;
         z-index: 21;
         left: -50%;
-        top: 54px;
+        top: 0px;
         bottom: 0px;
       }
 
@@ -779,6 +807,10 @@
         left: -100%;
         backdrop-filter: blur(10px);
         z-index: -1;
+      }
+
+      #modelCaps {
+        display: none !important;
       }
     }
   </style>
@@ -855,13 +887,18 @@
         <div id="attachPreview" class="row" style="align-items:center; flex-wrap:wrap;"></div>
 
         <!-- existing -->
-        <textarea id="prompt" class="input" placeholder="Type a message… (Shift+Enter = newline)"></textarea>
+        <textarea id="prompt" class="input" placeholder="Message... (Shift+Enter = newline)"></textarea>
 
         <!-- NEW: attach button and hidden input -->
-        <button id="attachBtn" class="gear btnSq" title="Attach images" style="display:none;">📎</button>
+        <button id="attachBtn" class="sendButton" title="Attach images" style="display:none;"><svg width="24px"
+            height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path
+              d="M14.2639 15.9375L12.5958 14.2834C11.7909 13.4851 11.3884 13.086 10.9266 12.9401C10.5204 12.8118 10.0838 12.8165 9.68048 12.9536C9.22188 13.1095 8.82814 13.5172 8.04068 14.3326L4.04409 18.2801M14.2639 15.9375L14.6053 15.599C15.4112 14.7998 15.8141 14.4002 16.2765 14.2543C16.6831 14.126 17.12 14.1311 17.5236 14.2687C17.9824 14.4251 18.3761 14.8339 19.1634 15.6514L20 16.4934M14.2639 15.9375L18.275 19.9565M18.275 19.9565C17.9176 20 17.4543 20 16.8 20H7.2C6.07989 20 5.51984 20 5.09202 19.782C4.71569 19.5903 4.40973 19.2843 4.21799 18.908C4.12796 18.7313 4.07512 18.5321 4.04409 18.2801M18.275 19.9565C18.5293 19.9256 18.7301 19.8727 18.908 19.782C19.2843 19.5903 19.5903 19.2843 19.782 18.908C20 18.4802 20 17.9201 20 16.8V16.4934M4.04409 18.2801C4 17.9221 4 17.4575 4 16.8V7.2C4 6.0799 4 5.51984 4.21799 5.09202C4.40973 4.71569 4.71569 4.40973 5.09202 4.21799C5.51984 4 6.07989 4 7.2 4H16.8C17.9201 4 18.4802 4 18.908 4.21799C19.2843 4.40973 19.5903 4.71569 19.782 5.09202C20 5.51984 20 6.0799 20 7.2V16.4934M17 8.99989C17 10.1045 16.1046 10.9999 15 10.9999C13.8954 10.9999 13 10.1045 13 8.99989C13 7.89532 13.8954 6.99989 15 6.99989C16.1046 6.99989 17 7.89532 17 8.99989Z"
+              stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg></button>
         <input id="fileInput" type="file" accept="image/*" multiple class="hide" />
 
-        <button id="sendBtn" class="sendButton"><svg width="16px" height="16px" viewBox="0 0 24 24" fill="none"
+        <button id="sendBtn" class="sendButton"><svg width="24px" height="24px" viewBox="0 0 24 24" fill="none"
             xmlns="http://www.w3.org/2000/svg">
             <path
               d="M16.6582 9.28638C18.098 10.1862 18.8178 10.6361 19.0647 11.2122C19.2803 11.7152 19.2803 12.2847 19.0647 12.7878C18.8178 13.3638 18.098 13.8137 16.6582 14.7136L9.896 18.94C8.29805 19.9387 7.49907 20.4381 6.83973 20.385C6.26501 20.3388 5.73818 20.0469 5.3944 19.584C5 19.053 5 18.1108 5 16.2264V7.77357C5 5.88919 5 4.94701 5.3944 4.41598C5.73818 3.9531 6.26501 3.66111 6.83973 3.6149C7.49907 3.5619 8.29805 4.06126 9.896 5.05998L16.6582 9.28638Z"
@@ -877,19 +914,40 @@
         placeholder="(Optional) e.g. 'You are a concise assistant. Answer with short bullets.'"></textarea>
 
       <div class="row between" id="systemActions" style="margin-top:8px">
-
-        <button id="sysGenBtn" class="btn" type="button"><svg width="24px" height="24px" viewBox="0 0 24 24" fill="none"
-            xmlns="http://www.w3.org/2000/svg">
-            <path
-              d="M5 16V20M6 4V8M7 18H3M8 6H4M13 4L14.7528 8.44437C14.9407 8.92083 15.0347 9.15906 15.1786 9.35994C15.3061 9.538 15.462 9.69391 15.6401 9.82143C15.8409 9.9653 16.0792 10.0593 16.5556 10.2472L21 12L16.5556 13.7528C16.0792 13.9407 15.8409 14.0347 15.6401 14.1786C15.462 14.3061 15.3061 14.462 15.1786 14.6401C15.0347 14.8409 14.9407 15.0792 14.7528 15.5556L13 20L11.2472 15.5556C11.0593 15.0792 10.9653 14.8409 10.8214 14.6401C10.6939 14.462 10.538 14.3061 10.3599 14.1786C10.1591 14.0347 9.92083 13.9407 9.44437 13.7528L5 12L9.44437 10.2472C9.92083 10.0593 10.1591 9.9653 10.3599 9.82143C10.538 9.69391 10.6939 9.538 10.8214 9.35994C10.9653 9.15906 11.0593 8.92083 11.2472 8.44437L13 4Z"
-              stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-          </svg></button>
-        <button id="sysSaveBtn" class="btn" type="button"><svg width="24px" height="24px" viewBox="0 0 24 24"
-            fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path
-              d="M9 11.2222L10.8462 13L15 9M21 20L17.6757 18.3378C17.4237 18.2118 17.2977 18.1488 17.1656 18.1044C17.0484 18.065 16.9277 18.0365 16.8052 18.0193C16.6672 18 16.5263 18 16.2446 18H6.2C5.07989 18 4.51984 18 4.09202 17.782C3.71569 17.5903 3.40973 17.2843 3.21799 16.908C3 16.4802 3 15.9201 3 14.8V7.2C3 6.07989 3 5.51984 3.21799 5.09202C3.40973 4.71569 3.71569 4.40973 4.09202 4.21799C4.51984 4 5.0799 4 6.2 4H17.8C18.9201 4 19.4802 4 19.908 4.21799C20.2843 4.40973 20.5903 4.71569 20.782 5.09202C21 5.51984 21 6.0799 21 7.2V20Z"
-              stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-          </svg></button>
+        <div class="row" style="gap:8px">
+          <button id="sysLocBtn" class="btn btnSq" type="button" title="Include location"><svg width="24px"
+              height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path
+                d="M10 8L14 12M14 8L10 12M19 10.2C19 14.1764 15.5 17.4 12 21C8.5 17.4 5 14.1764 5 10.2C5 6.22355 8.13401 3 12 3C15.866 3 19 6.22355 19 10.2Z"
+                stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg></button>
+          <button id="sysTimeBtn" class="btn btnSq" type="button" title="Include time"><svg width="24px" height="24px"
+              viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path
+                d="M3 5.5L5 3.5M21 5.5L19 3.5M9 9.5L15 15.5M15 9.5L9 15.5M20 12.5C20 16.9183 16.4183 20.5 12 20.5C7.58172 20.5 4 16.9183 4 12.5C4 8.08172 7.58172 4.5 12 4.5C16.4183 4.5 20 8.08172 20 12.5Z"
+                stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg></button>
+          <button id="sysUaBtn" class="btn btnSq" type="button" title="Include browser info"><svg width="24px"
+              height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path
+                d="M3 3L21 21M12 18H12.01M6 6V17.8C6 18.9201 6 19.4802 6.21799 19.908C6.40973 20.2843 6.71569 20.5903 7.09202 20.782C7.51984 21 8.0799 21 9.2 21H15C15.9319 21 16.3978 21 16.7654 20.8478C17.2554 20.6448 17.6448 20.2554 17.8478 19.7654C18 19.3978 18 18.9319 18 18M8.6499 3H14.8C15.9201 3 16.4802 3 16.908 3.21799C17.2843 3.40973 17.5903 3.71569 17.782 4.09202C18 4.51984 18 5.0799 18 6.2V12.3501"
+                stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg></button>
+        </div>
+        <div class="row" style="gap:8px">
+          <button id="sysGenBtn" class="btn" type="button"><svg width="24px" height="24px" viewBox="0 0 24 24"
+              fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path
+                d="M5 16V20M6 4V8M7 18H3M8 6H4M13 4L14.7528 8.44437C14.9407 8.92083 15.0347 9.15906 15.1786 9.35994C15.3061 9.538 15.462 9.69391 15.6401 9.82143C15.8409 9.9653 16.0792 10.0593 16.5556 10.2472L21 12L16.5556 13.7528C16.0792 13.9407 15.8409 14.0347 15.6401 14.1786C15.462 14.3061 15.3061 14.462 15.1786 14.6401C15.0347 14.8409 14.9407 15.0792 14.7528 15.5556L13 20L11.2472 15.5556C11.0593 15.0792 10.9653 14.8409 10.8214 14.6401C10.6939 14.462 10.538 14.3061 10.3599 14.1786C10.1591 14.0347 9.92083 13.9407 9.44437 13.7528L5 12L9.44437 10.2472C9.92083 10.0593 10.1591 9.9653 10.3599 9.82143C10.538 9.69391 10.6939 9.538 10.8214 9.35994C10.9653 9.15906 11.0593 8.92083 11.2472 8.44437L13 4Z"
+                stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg></button>
+          <button id="sysSaveBtn" class="btn" type="button"><svg width="24px" height="24px" viewBox="0 0 24 24"
+              fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path
+                d="M9 11.2222L10.8462 13L15 9M21 20L17.6757 18.3378C17.4237 18.2118 17.2977 18.1488 17.1656 18.1044C17.0484 18.065 16.9277 18.0365 16.8052 18.0193C16.6672 18 16.5263 18 16.2446 18H6.2C5.07989 18 4.51984 18 4.09202 17.782C3.71569 17.5903 3.40973 17.2843 3.21799 16.908C3 16.4802 3 15.9201 3 14.8V7.2C3 6.07989 3 5.51984 3.21799 5.09202C3.40973 4.71569 3.71569 4.40973 4.09202 4.21799C4.51984 4 5.0799 4 6.2 4H17.8C18.9201 4 19.4802 4 19.908 4.21799C20.2843 4.40973 20.5903 4.71569 20.782 5.09202C21 5.51984 21 6.0799 21 7.2V20Z"
+                stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg></button>
+        </div>
       </div>
     </div>
     <div id="systemToggleBtnInside" class="sysBackdrop"></div>
@@ -1410,6 +1468,10 @@
       ta.disabled = false;
       ta.value = s.system || '';
       ta.placeholder = "(Optional) e.g. 'You are a concise assistant. Answer with short bullets.'";
+
+      // keep metadata block in sync with toggles when opening the editor
+      applySystemMeta(false);
+      updateSysMetaButtons();
     }
 
     function renderChat() {
@@ -1463,6 +1525,131 @@
     const SYSTEM_GEN_PROMPT =
       "You are a system prompt generator. Given the user's description, return ONE highly detailed, actionable system prompt, with NO header explainer, or footer debrief, ONLY return the raw system prompt, Dont even label it, only the instructions that sets role, tone, constraints. Use imperative, second person. No examples unless relevant. Verbose and explicit enhancements to the provided content to ensure high quality expansion of instruction set to match determined intention.";
 
+
+    /* ===== System metadata toggles (LOC / TIME / UA) ===== */
+    const SYS_META_KEY = 'CLIENT_SYS_META_PREFS_V1';
+    let sysMetaPrefs = loadJSON(SYS_META_KEY, { loc: false, time: false, ua: false });
+    let sysMetaData = { loc: null, time: null, ua: null };
+
+    const META_BEGIN = '[[CLIENT_META_START]]';
+    const META_END = '[[CLIENT_META_END]]';
+
+    function saveSysMetaPrefs() { saveJSON(SYS_META_KEY, sysMetaPrefs); }
+    const includePhone = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M12 18H12.01M11 6H13M9.2 21H14.8C15.9201 21 16.4802 21 16.908 20.782C17.2843 20.5903 17.5903 20.2843 17.782 19.908C18 19.4802 18 18.9201 18 17.8V6.2C18 5.0799 18 4.51984 17.782 4.09202C17.5903 3.71569 17.2843 3.40973 16.908 3.21799C16.4802 3 15.9201 3 14.8 3H9.2C8.0799 3 7.51984 3 7.09202 3.21799C6.71569 3.40973 6.40973 3.71569 6.21799 4.09202C6 4.51984 6 5.07989 6 6.2V17.8C6 18.9201 6 19.4802 6.21799 19.908C6.40973 20.2843 6.71569 20.5903 7.09202 20.782C7.51984 21 8.07989 21 9.2 21Z" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+    const excludePhone = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M3 3L21 21M12 18H12.01M6 6V17.8C6 18.9201 6 19.4802 6.21799 19.908C6.40973 20.2843 6.71569 20.5903 7.09202 20.782C7.51984 21 8.0799 21 9.2 21H15C15.9319 21 16.3978 21 16.7654 20.8478C17.2554 20.6448 17.6448 20.2554 17.8478 19.7654C18 19.3978 18 18.9319 18 18M8.6499 3H14.8C15.9201 3 16.4802 3 16.908 3.21799C17.2843 3.40973 17.5903 3.71569 17.782 4.09202C18 4.51984 18 5.0799 18 6.2V12.3501" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+    const includeLoc = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M12 13V7M15 10.0008L9 10M19 10.2C19 14.1764 15.5 17.4 12 21C8.5 17.4 5 14.1764 5 10.2C5 6.22355 8.13401 3 12 3C15.866 3 19 6.22355 19 10.2Z" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+    const excludeLoc = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M10 8L14 12M14 8L10 12M19 10.2C19 14.1764 15.5 17.4 12 21C8.5 17.4 5 14.1764 5 10.2C5 6.22355 8.13401 3 12 3C15.866 3 19 6.22355 19 10.2Z" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+    const includeTime = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M12 16.5V8.5M16 12.5L8 12.5008M3 5.5L5 3.5M21 5.5L19 3.5M20 12.5C20 16.9183 16.4183 20.5 12 20.5C7.58172 20.5 4 16.9183 4 12.5C4 8.08172 7.58172 4.5 12 4.5C16.4183 4.5 20 8.08172 20 12.5Z" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+    const excludeTime = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M3 5.5L5 3.5M21 5.5L19 3.5M9 9.5L15 15.5M15 9.5L9 15.5M20 12.5C20 16.9183 16.4183 20.5 12 20.5C7.58172 20.5 4 16.9183 4 12.5C4 8.08172 7.58172 4.5 12 4.5C16.4183 4.5 20 8.08172 20 12.5Z" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+    function updateSysMetaButtons() {
+      const bLoc = el('sysLocBtn'), bTime = el('sysTimeBtn'), bUa = el('sysUaBtn');
+      if (bLoc) { bLoc.innerHTML = sysMetaPrefs.loc ? includeLoc : excludeLoc; bLoc.classList.toggle('toggled', sysMetaPrefs.loc); }
+      if (bTime) { bTime.innerHTML = sysMetaPrefs.time ? includeTime : excludeTime; bTime.classList.toggle('toggled', sysMetaPrefs.time); }
+      if (bUa) { bUa.innerHTML = sysMetaPrefs.ua ? includePhone : excludePhone; bUa.classList.toggle('toggled', sysMetaPrefs.ua); }
+    }
+
+    function stripMeta(raw) {
+      const s = raw || '';
+      const i = s.indexOf(META_BEGIN);
+      const j = s.indexOf(META_END);
+      if (i !== -1 && j !== -1 && j > i) return s.slice(0, i).trimEnd();
+      return s;
+    }
+
+    function captureTime() {
+      const now = new Date();
+      sysMetaData.time = {
+        iso: now.toISOString(),
+        local: now.toString(),
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone || 'local',
+        offset_min: -now.getTimezoneOffset()
+      };
+    }
+
+    function captureUa() {
+      sysMetaData.ua = {
+        ua: navigator.userAgent || '',
+        lang: navigator.language || '',
+        platform: navigator.platform || '',
+        tz: (Intl.DateTimeFormat().resolvedOptions().timeZone || ''),
+        viewport: `${window.innerWidth}x${window.innerHeight}`,
+        screen: (window.screen ? `${screen.width}x${screen.height}` : ''),
+        dpr: (window.devicePixelRatio || 1),
+        online: !!navigator.onLine
+      };
+    }
+
+    function ensureLoc() {
+      return new Promise((resolve, reject) => {
+        if (!navigator.geolocation) return reject(new Error('Geolocation not supported'));
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            const c = pos.coords || {};
+            sysMetaData.loc = {
+              lat: Number(c.latitude?.toFixed(5)),
+              lon: Number(c.longitude?.toFixed(5)),
+              accuracy_m: c.accuracy != null ? Math.round(c.accuracy) : null,
+              tz: Intl.DateTimeFormat().resolvedOptions().timeZone || 'local',
+              source: 'browser',
+              at: Date.now()
+            };
+            resolve();
+          },
+          (err) => reject(err),
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 300000 }
+        );
+      });
+    }
+
+    function buildMetaBlock() {
+      const items = [];
+      if (sysMetaPrefs.loc && sysMetaData.loc) {
+        const L = sysMetaData.loc;
+        items.push(`- location: lat=${L.lat}, lon=${L.lon}, accuracy_m=${L.accuracy_m}, tz=${L.tz} (source: ${L.source})`);
+      }
+      if (sysMetaPrefs.time) {
+        if (!sysMetaData.time) captureTime();
+        const T = sysMetaData.time;
+        items.push(`- time: iso=${T.iso}, local="${T.local}", tz=${T.tz}, offset_min=${T.offset_min}`);
+      }
+      if (sysMetaPrefs.ua) {
+        if (!sysMetaData.ua) captureUa();
+        const U = sysMetaData.ua;
+        items.push(`- client: ua="${U.ua}", lang=${U.lang}, platform=${U.platform}, viewport=${U.viewport}, screen=${U.screen}, dpr=${U.dpr}, online=${U.online}, tz=${U.tz}`);
+      }
+      if (!items.length) return '';
+      return `${META_BEGIN}
+# CLIENT_METADATA (for model guidance; safe to ignore)
+${items.join('\n')}
+${META_END}`;
+    }
+
+    function applySystemMeta(pushToHub = true) {
+      const ta = el('systemMsg'); if (!ta) return;
+      const base = stripMeta(ta.value || '');
+      const meta = buildMetaBlock();
+      const combined = meta ? (base.trimEnd() + '\n\n' + meta) : base;
+      ta.value = combined;
+
+      const s = getSession();
+      if (s) {
+        s.system = combined;
+        saveJSON(STORAGE.SESS, sessions);
+        if (pushToHub) sendSessionOpen(s, /*seed*/false);
+      }
+    }
     // Keep these to avoid breaking any assumptions elsewhere
     const sysgenPending = new Set();
     let isSysGenStreaming = false;
@@ -2749,6 +2936,36 @@
         saveJSON(STORAGE.SESS, sessions);
         sendSessionOpen(s, /*seed*/false);
       };
+
+
+      // --- System metadata toggles wiring ---
+      updateSysMetaButtons();
+      applySystemMeta(false); // ensure editor reflects current toggle prefs without sending yet
+
+      el('sysLocBtn').onclick = async () => {
+        sysMetaPrefs.loc = !sysMetaPrefs.loc; saveSysMetaPrefs(); updateSysMetaButtons();
+        if (sysMetaPrefs.loc) {
+          try { await ensureLoc(); }
+          catch (e) {
+            sysMetaPrefs.loc = false; saveSysMetaPrefs(); updateSysMetaButtons();
+            alert('Location permission denied or unavailable.');
+          }
+        }
+        applySystemMeta(true);
+      };
+
+      el('sysTimeBtn').onclick = () => {
+        sysMetaPrefs.time = !sysMetaPrefs.time; saveSysMetaPrefs(); updateSysMetaButtons();
+        if (sysMetaPrefs.time) captureTime();
+        applySystemMeta(true);
+      };
+
+      el('sysUaBtn').onclick = () => {
+        sysMetaPrefs.ua = !sysMetaPrefs.ua; saveSysMetaPrefs(); updateSysMetaButtons();
+        if (sysMetaPrefs.ua) captureUa();
+        applySystemMeta(true);
+      };
+
 
       // Attach button opens file picker
       el('attachBtn').onclick = () => { const fi = el('fileInput'); if (fi) fi.click(); };
