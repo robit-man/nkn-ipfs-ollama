@@ -9,6 +9,69 @@
   <meta name="theme-color" content="#000" />
   <!-- NKN SDK -->
   <script src="https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js"></script>
+  <script>
+    /* 1) Harden RTCPeerConnection.setRemoteDescription against closed-state races */
+    (() => {
+      const RTCPeer =
+        window.RTCPeerConnection ||
+        window.webkitRTCPeerConnection ||
+        window.mozRTCPeerConnection;
+
+      if (!RTCPeer || RTCPeer.prototype.__patchedRemoteDesc) return;
+
+      const origSRD = RTCPeer.prototype.setRemoteDescription;
+
+      RTCPeer.prototype.setRemoteDescription = function (...args) {
+        if (this.signalingState === 'closed') {
+          // Swallow “InvalidStateError: signalingState is 'closed'”
+          return Promise.resolve();
+        }
+        try {
+          const p = origSRD.apply(this, args);
+          return Promise.resolve(p).catch((err) => {
+            const name = err && err.name;
+            const msg = (err && (err.message || String(err))) || '';
+            if (name === 'InvalidStateError' || /signalingState.*closed/i.test(msg)) {
+              // Treat as benign; connection already torn down
+              return;
+            }
+            throw err;
+          });
+        } catch (err) {
+          const name = err && err.name;
+          const msg = (err && (err.message || String(err))) || '';
+          if (name === 'InvalidStateError' || /signalingState.*closed/i.test(msg)) {
+            return Promise.resolve();
+          }
+          throw err;
+        }
+      };
+
+      RTCPeer.prototype.__patchedRemoteDesc = true;
+    })();
+  </script>
+
+  <script>
+    /* 2) Mute noisy transient/unrecoverable rejections from the NKN stack */
+    window.addEventListener('unhandledrejection', (e) => {
+      const r = e && e.reason;
+      const name = r && r.name;
+      const msg = String((r && (r.message || r)) || e);
+
+      // Already had some filters — extend them to cover WebRTC/WebSocket flaps
+      const shouldSuppress =
+        name === 'InvalidStateError' ||
+        /setRemoteDescription/i.test(msg) ||
+        /RTC(DataChannel|PeerConnection)/i.test(msg) ||
+        /WebSocket unexpectedly closed/i.test(msg) ||
+        /Message timeout/i.test(msg) ||
+        /ConnectToNodeTimeoutError/i.test(msg);
+
+      if (shouldSuppress) {
+        e.preventDefault();
+      }
+    });
+  </script>
 
   <!-- Import map (kept as requested) -->
   <script type="importmap">
@@ -102,7 +165,7 @@
       border: 1px solid #2a2a2a;
       color: var(--fg);
       padding: 8px 10px;
-      border-radius: 10px;
+      border-radius: 8px;
       line-height: 1;
       height: 38px;
       max-width: calc(100vw - 154px);
@@ -113,7 +176,13 @@
       border: 1px solid #2a2a2a;
       border-radius: 999px;
       color: #eaeaea;
-      background: #0a0a0a
+      background: #0a0a0a;
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .chip b {
+      margin: auto;
     }
 
     .chiprow {
@@ -121,6 +190,8 @@
       flex-flow: row;
       gap: 1rem;
       margin-bottom: 1rem;
+      line-height: 1;
+
     }
 
     .gear {
@@ -131,7 +202,7 @@
       min-height: 34px;
       cursor: pointer;
       border: 1px solid #2a2a2a;
-      border-radius: 10px;
+      border-radius: 8px;
       padding: 10px 10px;
       font-size: 14px;
       line-height: 1;
@@ -381,7 +452,7 @@
       display: flex;
       flex-flow: column;
       justify-content: center;
-      border-radius: 10px;
+      border-radius: 8px;
       cursor: pointer
     }
 
@@ -394,7 +465,6 @@
       display: flex;
       flex-flow: column;
       justify-content: center;
-      border-radius: 12px;
       cursor: pointer
     }
 
@@ -427,6 +497,17 @@
 
     .dot {
       animation: dotdotdot 1s linear infinite;
+    }
+
+    @keyframes spin {
+      0% {
+        transform: rotate(0deg)
+      }
+
+      100% {
+        transform: rotate(360deg)
+      }
+
     }
 
     @keyframes bump {
@@ -509,7 +590,7 @@
       border: 1px solid #2a2a2a;
       color: #fff;
       padding: 10px;
-      border-radius: 10px
+      border-radius: 8px
     }
 
     .num {
@@ -517,7 +598,7 @@
       border: 1px solid #2a2a2a;
       color: #fff;
       padding: 10px;
-      border-radius: 10px;
+      border-radius: 8px;
       width: 120px
     }
 
@@ -539,7 +620,7 @@
       height: 10px;
       border-radius: 50%;
       border: 1px solid #2a2a2a;
-      display: inline-block;
+      display: none;
     }
 
     .conn-blue {
@@ -623,8 +704,8 @@
 
       <!-- NEW: connection status (dot + label). The model select will be injected next to this. -->
       <div id="statusRow" class="row">
-        <span id="connDot" class="conn-dot conn-blue" aria-hidden="true"></span>
-        <span id="connText" class="muted">Connecting…</span>
+        <span id="connDot" class="conn-dot" aria-hidden="true"></span>
+        <span id="connText" class="muted"></span>
       </div>
 
       <!-- The select stays in DOM; we will move it next to #statusRow and hide it until models are ready -->
@@ -694,15 +775,18 @@
   <!-- Settings Modal -->
   <div id="overlay" class="overlay">
     <div class="modal">
-      <div class="chiprow">
-        <div class="chip" id="hubChip">hub: —</div>
-        <div class="chip" id="meChip">me: —</div>
-      </div>
       <h3>Settings</h3>
       <div class="field">
         <label>Hub address (signaling server) <span class="muted">(identifier.publicKeyHex64)</span></label>
         <input id="hubInput" class="text" placeholder="e.g. hub.0123abcd…64hex" spellcheck="false" />
       </div>
+
+      <div class="chiprow">
+        <div class="chip"><b id="hubChipIcon"></b><b id="hubChip"></b></div>
+        <div id="linkIcon" style="margin: auto 0px;"></div>
+        <div class="chip"><b id="meChipIcon"></b><b id="meChip"></b></div>
+      </div>
+
       <div class="row" style="gap:20px;flex-wrap:wrap;justify-content: flex-start;">
         <div class="field"><label>Temperature</label><input id="optTemperature" class="num" type="number" step="0.01"
             min="0" max="2" /></div>
@@ -720,9 +804,14 @@
         <div class="muted" style="margin-top:2px">Uncheck to request non-streaming results.</div>
       </div>
       <div class="row">
+        <button id="resetKeyBtn" class="btn" style="border-color:#e84d4d;color:#e84d4d;background:#0a0a0a">Reset
+          Key</button>
         <div class="spacer"></div>
         <button id="closeModal" class="btn" style="background:#0a0a0a;border-color:#2a2a2a">Close</button>
         <button id="saveSettings" class="btn">Save</button>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:6px">
+        Resets your local NKN seed (32‑byte) and reconnects with a new keypair.
       </div>
     </div>
     <div class="backdropModal" onclick="closeSettings()"></div>
@@ -913,17 +1002,34 @@
 
     function getCurrentModel() {
       const s = getSession();
-      // Prefer the session’s model; then the visible select; then the remembered one.
-      return (s && s.model) || (el('modelSelect') && el('modelSelect').value) || getSavedModel() || '';
+      const candidate =
+        (s && s.model) ||
+        (el('modelSelect') && el('modelSelect').value) ||
+        getSavedModel() ||
+        '';
+      return isValidModelName(candidate) ? candidate : '';
     }
 
     function newId(prefix = 'id') { return prefix + '-' + Math.random().toString(16).slice(2) + Date.now().toString(36); }
     function createSessionForModel(model) {
+      // HARD GUARD: do not create sessions until real models are loaded & valid
+      if (!modelsLoaded || !isValidModelName(model)) {
+        console.warn('[session] blocked: model list not ready or invalid model:', model);
+        // Optional UX nudge:
+        try { alert('Models are not ready yet. Please wait for the list to load.'); } catch { }
+        return;
+      }
+
       const id = newId('sess');
       const s = { id, title: model, model, system: '', createdAt: Date.now(), messages: [] };
-      sessions.unshift(s); activeSessionId = id; saveJSON(STORAGE.SESS, sessions);
+      sessions.unshift(s);
+      activeSessionId = id;
+      saveJSON(STORAGE.SESS, sessions);
       setSavedModel(model);
-      renderSessions(); renderSystemEditor(); renderChat();
+
+      renderSessions();
+      renderSystemEditor();
+      renderChat();
       sendSessionOpen(s, /*seed*/true);
     }
     function getSession(id = activeSessionId) { return sessions.find(x => x.id === id) || null; }
@@ -1036,7 +1142,7 @@
 
     // --- System Message helpers/state ---
     const SYSTEM_GEN_PROMPT =
-      "You are a system prompt generator. Given the user's description, return ONE highly detailed, actionable system prompt that sets role, tone, constraints. Use imperative, second person. No examples unless essential. Verbose and explicit enhancements to the provided content to ensure high quality expansion of instruction set to match determined intention.";
+      "You are a system prompt generator. Given the user's description, return ONE highly detailed, actionable system prompt, with NO header explainer, or footer debrief, ONLY return the raw system prompt, Dont even label it, only the instructions that sets role, tone, constraints. Use imperative, second person. No examples unless relevant. Verbose and explicit enhancements to the provided content to ensure high quality expansion of instruction set to match determined intention.";
 
     // Keep these to avoid breaking any assumptions elsewhere
     const sysgenPending = new Set();
@@ -1064,19 +1170,83 @@
       b.textContent = isBusy ? 'Generating…' : 'Generate';
     }
 
-    function setConn(color, label) {
+    function asHtml(html) {
+      return { __html: String(html || '') };
+    }
+
+
+    const CONNECTING_HTML = asHtml(`<svg style="animation: spin 1s linear infinite;" width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M9 3.51221C5.50442 4.74772 3 8.08143 3 12.0001C3 16.9707 7.02944 21.0001 12 21.0001C16.9706 21.0001 21 16.9707 21 12.0001C21 8.08143 18.4956 4.74772 15 3.51221" stroke="#ffaa00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`);
+
+
+    const RECONNECTING_HTML = asHtml(`<svg style="animation: spin 1s linear infinite;" width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M9 3.51221C5.50442 4.74772 3 8.08143 3 12.0001C3 16.9707 7.02944 21.0001 12 21.0001C16.9706 21.0001 21 16.9707 21 12.0001C21 8.08143 18.4956 4.74772 15 3.51221" stroke="#00aaff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`);
+
+    const CHECK_HTML = asHtml(`<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M21 12C21 16.9706 16.9706 21 12 21M21 12C21 7.02944 16.9706 3 12 3M21 12C21 13.6569 16.9706 15 12 15C7.02944 15 3 13.6569 3 12M21 12C21 10.3431 16.9706 9 12 9C7.02944 9 3 10.3431 3 12M12 21C7.02944 21 3 16.9706 3 12M12 21C10.3431 21 9 16.9706 9 12C9 7.02944 10.3431 3 12 3M12 21C13.6569 21 15 16.9706 15 12C15 7.02944 13.6569 3 12 3M3 12C3 7.02944 7.02944 3 12 3" stroke="#00ff00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`);
+
+
+    function setConn(colorOrLabel, maybeLabel) {
       const dot = el('connDot'), text = el('connText');
       if (!dot || !text) return;
+
+      // Parse args
+      let color, label, labelProvided = false;
+      if (arguments.length === 1) {
+        if (colorOrLabel === 'red' || colorOrLabel === 'green' || colorOrLabel === 'blue') {
+          color = colorOrLabel;
+        } else {
+          label = colorOrLabel;
+          labelProvided = true;
+        }
+      } else if (arguments.length >= 2) {
+        color = colorOrLabel;
+        label = maybeLabel;
+        labelProvided = true;
+      }
+
+      // Always reset dot color to neutral (removes any default 'conn-blue')
       dot.classList.remove('conn-red', 'conn-green', 'conn-blue');
-      dot.classList.add(color === 'green' ? 'conn-green' : color === 'red' ? 'conn-red' : 'conn-blue');
-      if (label && label.trim()) {
-        text.classList.remove('hide');
-        text.textContent = label;
-      } else {
+
+      // Apply color only if explicitly provided
+      if (color === 'green' || color === 'red' || color === 'blue') {
+        dot.classList.add(color === 'green' ? 'conn-green'
+          : color === 'red' ? 'conn-red'
+            : 'conn-blue');
+      }
+
+      // Label: hidden by default unless provided
+      if (!labelProvided) {
         text.textContent = '';
         text.classList.add('hide');
+      } else {
+        const isHtmlObj = label && typeof label === 'object' && typeof label.__html === 'string';
+        const hasLabel =
+          (typeof label === 'string' && label.trim().length) ||
+          (isHtmlObj && label.__html.trim().length) ||
+          (label instanceof Node);
+
+        if (hasLabel) {
+          text.classList.remove('hide');
+          if (label instanceof Node) {
+            text.innerHTML = '';
+            text.appendChild(label);
+          } else if (isHtmlObj) {
+            text.innerHTML = label.__html; // trusted constants only
+          } else {
+            text.textContent = String(label);
+          }
+        } else {
+          text.textContent = '';
+          text.classList.add('hide');
+        }
       }
     }
+
+
     function showModelDropdown(show) {
       const sel = el('modelSelect');
       if (!sel) return;
@@ -1144,7 +1314,6 @@
 
       if (!isConnected || !client) {
         outbox.push({ payload, route });
-        // Optional: small hint for element targets
         if (route?.sink === 'element' && route.elId) {
           const n = el(route.elId);
           if (n && ('placeholder' in n)) {
@@ -1153,40 +1322,81 @@
         }
         return id;
       }
-      try { client.send(HUB_ADDR, JSON.stringify(payload), { noReply: true, maxHoldingSeconds: 120 }); } catch { }
+      try { client.send(HUB_ADDR, JSON.stringify(payload), { noReply: true, msgHoldingSeconds: 600 }); } catch { }
       return id;
     }
+
     function flushOutbox() {
       while (isConnected && client && outbox.length) {
         const { payload } = outbox.shift();
-        const p = client.send(HUB_ADDR, JSON.stringify(payload), { noReply: true, maxHoldingSeconds: 120 });
+        const p = client.send(HUB_ADDR, JSON.stringify(payload), { noReply: true, msgHoldingSeconds: 600 });
         p && p.catch(err => {
-          // Put it back and bail; we'll try again on next tick/reconnect
           outbox.unshift({ payload, route: null });
           console.debug('[nkn.flush] send failed; will retry', err?.message || err);
-          // Break loop to avoid tight-spin on a bad state
           return;
         });
       }
     }
 
 
+
     // ─────────── NKN (robust MultiClient + your message contract)
-    let client = null, myAddr = null; let HUB_ADDR = settings.hub || '';
-    function updateChips() { el('hubChip').textContent = 'hub: ' + (HUB_ADDR ? short(HUB_ADDR) : '—'); el('meChip').textContent = 'me: ' + (myAddr ? short(myAddr) : '—'); }
+    let client = null, myAddr = null;
+    let HUB_ADDR = settings.hub || '';
+    let HUB_KEY = (HUB_ADDR.split('.')[1] || '').toLowerCase();   // <— NEW
+
+    const linkConnected = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M14 7H16C18.7614 7 21 9.23858 21 12C21 14.7614 18.7614 17 16 17H14M10 7H8C5.23858 7 3 9.23858 3 12C3 14.7614 5.23858 17 8 17H10M8 12H16" stroke="#00ff00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+
+    const linkDisconnected = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M14 6C13.4477 6 13 6.44772 13 7C13 7.55228 13.4477 8 14 8V6ZM10 18C10.5523 18 11 17.5523 11 17C11 16.4477 10.5523 16 10 16V18ZM14 16C13.4477 16 13 16.4477 13 17C13 17.5523 13.4477 18 14 18V16ZM8 11C7.44772 11 7 11.4477 7 12C7 12.5523 7.44772 13 8 13V11ZM3.70711 2.29289C3.31658 1.90237 2.68342 1.90237 2.29289 2.29289C1.90237 2.68342 1.90237 3.31658 2.29289 3.70711L3.70711 2.29289ZM20.2929 21.7071C20.6834 22.0976 21.3166 22.0976 21.7071 21.7071C22.0976 21.3166 22.0976 20.6834 21.7071 20.2929L20.2929 21.7071ZM19.4115 14.0898C19.1224 14.5604 19.2696 15.1763 19.7402 15.4653C20.2108 15.7544 20.8266 15.6072 21.1157 15.1366L19.4115 14.0898ZM12 13C12.5523 13 13 12.5523 13 12C13 11.4477 12.5523 11 12 11V13ZM7.08376 7.08376L7.79087 6.37666L7.08376 7.08376ZM8 16C5.79086 16 4 14.2091 4 12H2C2 15.3137 4.68629 18 8 18V16ZM16 8C18.2091 8 20 9.79086 20 12H22C22 8.68629 19.3137 6 16 6V8ZM14 8H16V6H14V8ZM10 16H8V18H10V16ZM16 16H14V18H16V16ZM20 12C20 12.7678 19.7846 13.4823 19.4115 14.0898L21.1157 15.1366C21.6767 14.2232 22 13.1478 22 12H20ZM8 13H12V11H8V13ZM2.29289 3.70711L6.37666 7.79087L7.79087 6.37666L3.70711 2.29289L2.29289 3.70711ZM6.90166 6.10048C4.11245 6.61703 2 9.06076 2 12H4C4 10.0423 5.40739 8.41122 7.26586 8.06704L6.90166 6.10048ZM6.37666 7.79087L16.2091 17.6233L17.6233 16.2091L7.79087 6.37666L6.37666 7.79087ZM16.2091 17.6233L20.2929 21.7071L21.7071 20.2929L17.6233 16.2091L16.2091 17.6233ZM16.7341 15.933C16.4969 15.9769 16.2516 16 16 16V18C16.3743 18 16.7415 17.9656 17.0983 17.8995L16.7341 15.933Z" fill="#ff0000"/>
+</svg>`
+
+    const cloudUnknown = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M12.437 13C13.437 12 14.437 11.6046 14.437 10.5C14.437 9.39543 13.5416 8.5 12.437 8.5C11.5051 8.5 10.722 9.13739 10.5 10M12.437 16H12.447M8.4 19C5.41766 19 3 16.6044 3 13.6493C3 11.2001 4.8 8.9375 7.5 8.5C8.34694 6.48637 10.3514 5 12.6893 5C15.684 5 18.1317 7.32251 18.3 10.25C19.8893 10.9449 21 12.6503 21 14.4969C21 16.9839 18.9853 19 16.5 19L8.4 19Z" stroke="#ff0000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+    const cloudCheck = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M9 13.2222L10.8462 15L15 11M8.4 19C5.41766 19 3 16.6044 3 13.6493C3 11.2001 4.8 8.9375 7.5 8.5C8.34694 6.48637 10.3514 5 12.6893 5C15.684 5 18.1317 7.32251 18.3 10.25C19.8893 10.9449 21 12.6503 21 14.4969C21 16.9839 18.9853 19 16.5 19L8.4 19Z" stroke="#00ff00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+    const fingerPrintUnknown = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M6.89258 17.7897C6.9083 17.7633 6.92441 17.7369 6.9409 17.7107C8.14358 15.7988 8.8398 13.5379 8.8398 11.1034C8.8398 9.14189 10.4299 7.55176 12.3915 7.55176C14.353 7.55176 15.9431 9.14189 15.9431 11.1034C15.9431 12.0065 15.8816 12.8957 15.7626 13.7672M13.8825 19.8437C14.4257 18.7596 14.871 17.6179 15.2069 16.4309M18.6156 17.4359C19.1883 15.4236 19.4949 13.2993 19.4949 11.1033C19.4949 7.18026 16.3147 4 12.3916 4C11.0978 4 9.88477 4.34591 8.83997 4.9503M4.40039 14.9783C4.96924 13.8073 5.28831 12.4926 5.28831 11.1033C5.28831 9.8095 5.63422 8.59646 6.2386 7.55166M12.3915 11.1035C12.3915 14.2265 11.4958 17.1403 9.94727 19.6019" stroke="#ff0000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+    const fingerPrint = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M6.89258 17.7897C6.9083 17.7633 6.92441 17.7369 6.9409 17.7107C8.14358 15.7988 8.8398 13.5379 8.8398 11.1034C8.8398 9.14189 10.4299 7.55176 12.3915 7.55176C14.353 7.55176 15.9431 9.14189 15.9431 11.1034C15.9431 12.0065 15.8816 12.8957 15.7626 13.7672M13.8825 19.8437C14.4257 18.7596 14.871 17.6179 15.2069 16.4309M18.6156 17.4359C19.1883 15.4236 19.4949 13.2993 19.4949 11.1033C19.4949 7.18026 16.3147 4 12.3916 4C11.0978 4 9.88477 4.34591 8.83997 4.9503M4.40039 14.9783C4.96924 13.8073 5.28831 12.4926 5.28831 11.1033C5.28831 9.8095 5.63422 8.59646 6.2386 7.55166M12.3915 11.1035C12.3915 14.2265 11.4958 17.1403 9.94727 19.6019" stroke="#00ff00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+
+    const loadingLoop = `<svg style="animation: spin 1s linear infinite;" width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M9 3.51221C5.50442 4.74772 3 8.08143 3 12.0001C3 16.9707 7.02944 21.0001 12 21.0001C16.9706 21.0001 21 16.9707 21 12.0001C21 8.08143 18.4956 4.74772 15 3.51221" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`
+
+    function updateChips() {
+      const hasHub = !!(HUB_ADDR && isNknAddr(HUB_ADDR));
+      const hasMe = !!myAddr;
+
+      el('hubChipIcon').innerHTML = hasHub ? cloudCheck : cloudUnknown;
+      el('meChipIcon').innerHTML = hasMe ? fingerPrint : fingerPrintUnknown;
+      el('linkIcon').innerHTML = (hasHub && hasMe) ? linkConnected : linkDisconnected;
+
+      el('hubChip').innerHTML = hasHub ? short(HUB_ADDR) : loadingLoop;
+      el('meChip').innerHTML = hasMe ? short(myAddr) : loadingLoop;
+
+    }
+
     function trySend(addr, obj, opts = {}) {
       if (!client || !addr || !isConnected) return false;
       const payload = JSON.stringify(obj);
-      const sendOpts = { noReply: true, maxHoldingSeconds: 120, ...opts }; // caller can override
+      // Mobile-friendly defaults; caller can override
+      const sendOpts = { noReply: true, msgHoldingSeconds: 600, responseTimeout: 15000, ...opts };
       const p = client.send(addr, payload, sendOpts);
       if (p && typeof p.then === 'function') {
         p.catch(err => {
           console.debug('[nkn.send] transient send failed; will rely on outbox/reconnect', err?.message || err);
-          // optional: outbox.push({ payload: obj, route: null });
         });
       }
       return true;
     }
+
     // Streaming (ordered)
     const streams = new Map();
     let currentStreamId = null;
@@ -1213,29 +1423,164 @@
     let modelsLoaded = false;
     let modelRevealTimer = null;
     let clearLabelTimer = null;
-    function requestModelsList() { trySend(HUB_ADDR, { event: 'llm.request', api: 'list', stream: false }); }
-    function ensureModels() {
-      const backoff = [0, 500, 1500, 3000, 5000, 8000];
-      backoff.forEach((ms) => setTimeout(() => { if (!modelsLoaded) { requestModelsList(); } }, ms));
+    let modelsRetryTimer = null;
+    let modelsRetryBackoff = 800;        // grows up to MODELS_MAX_BACKOFF_MS
+    const MODELS_MAX_BACKOFF_MS = 15000;
+
+    let modelsInFlight = false;
+    let availableModels = [];            // canonical, de-duped, normalized names
+
+    // Correlation & observability
+    let lastModelsReqId = null;          // 'models:<nonce>'
+    let modelsLastSeenAt = 0;            // ms
+    let modelsSeenThisSession = 0;       // count of successful updates this page load
+
+    function setModelsUIState(ready) {
+      const sel = el('modelSelect');
+      const newBtn = el('newSessionBtn');
+      if (sel) sel.disabled = !ready;
+      if (newBtn) newBtn.disabled = !ready;
     }
-    function populateModels(models) {
-      const sel = el('modelSelect'); sel.innerHTML = '';
-      (models || []).forEach(m => {
-        const name = m.model || m.name || '';
-        if (!name) return;
-        const opt = document.createElement('option'); opt.value = name; opt.textContent = name; sel.appendChild(opt);
-      });
-      modelsLoaded = (sel.options.length > 0);
-      sel.disabled = !modelsLoaded;
-      if (!modelsLoaded) { const opt = document.createElement('option'); opt.textContent = '— no models —'; sel.appendChild(opt); }
-      const remembered = getSavedModel();
-      if (remembered && Array.from(sel.options).some(o => o.value === remembered)) { sel.value = remembered; }
-      sel.onchange = () => {
-        const model = sel.value;
-        if (model && modelsLoaded) { setSavedModel(model); createSessionForModel(model); }
-      };
+
+    function isValidModelName(name) {
+      if (!name || typeof name !== 'string') return false;
+      const v = name.trim();
+      if (!v) return false;
+      // Disallow any placeholder labels you use
+      const bad = [
+        'Loading Models', 'Loading Models…',
+        '— no models —', '— timed out fetching models —',
+        '— no models (hub error) —'
+      ];
+      if (bad.some(b => v.startsWith(b))) return false;
+      // Must exist in the loaded list
+      return availableModels.includes(v);
+    }
+
+    function showModelsError(msg) {
+      const sel = el('modelSelect'); if (!sel) return;
+      sel.innerHTML = '';
+      const opt = document.createElement('option');
+      opt.textContent = msg || '— no models —';
+      sel.appendChild(opt);
+
+      modelsInFlight = false;
+      modelsLoaded = false;
+      availableModels = [];
+      setModelsUIState(false);
       showModelDropdown(true);
     }
+
+    function showModelsLoading() {
+      const sel = el('modelSelect');
+      if (!sel) return;
+      sel.innerHTML = '<option>Loading Models…</option>';
+      sel.disabled = true;
+      showModelDropdown(true);
+    }
+
+    function requestModelsList(force = false) {
+      if (!HUB_ADDR || !client || !isConnected) return;
+
+      // Avoid spamming the hub unless forced or previous attempt cleared
+      if (modelsInFlight && !force) return;
+
+      modelsInFlight = true;
+      const nonce = Date.now();
+      lastModelsReqId = `models:${nonce}`;
+
+      // Fire both routes; echoing id helps correlation
+      trySend(HUB_ADDR, { event: 'llm.request', id: lastModelsReqId, api: 'list', stream: false });
+      trySend(HUB_ADDR, { event: 'ctrl.request', op: 'models', id: lastModelsReqId });
+
+      // Retry with capped backoff until we see any models response
+      if (modelsRetryTimer) clearTimeout(modelsRetryTimer);
+      modelsRetryTimer = setTimeout(() => {
+        if (!modelsLoaded) {
+          modelsInFlight = false;
+          modelsRetryBackoff = Math.min(modelsRetryBackoff * 1.6, MODELS_MAX_BACKOFF_MS);
+          requestModelsList(true);
+        }
+      }, modelsRetryBackoff);
+    }
+
+
+    function ensureModels() {
+      // call after connect
+      showModelsLoading();
+      modelsInFlight = false;
+      modelsLoaded = false;
+      modelsRetryBackoff = 800;
+      requestModelsList(true);
+    }
+
+    function populateModels(modelsLike) {
+      const sel = el('modelSelect'); if (!sel) return;
+
+      // Normalize: accept {models:[{model|name|digest|id|string}...]}, or bare array, or {data:{models:[...]}}
+      const arr = (() => {
+        const d = modelsLike;
+        if (Array.isArray(d)) return d;
+        if (d && typeof d === 'object') {
+          if (Array.isArray(d.models)) return d.models;
+          if (d.data && Array.isArray(d.data.models)) return d.data.models;
+          if (Array.isArray(d.data)) return d.data;
+        }
+        return [];
+      })();
+
+      const names = Array.from(new Set(arr.map((m) => {
+        if (!m) return '';
+        if (typeof m === 'string') return m.trim();
+        if (typeof m === 'object') return (m.model || m.name || m.id || m.digest || '').trim();
+        return '';
+      }).filter(Boolean)));
+
+      // Update globals
+      availableModels = names.slice();
+      modelsLoaded = availableModels.length > 0;
+      modelsLastSeenAt = Date.now();
+      if (modelsLoaded) modelsSeenThisSession++;
+
+      // Rebuild UI
+      sel.innerHTML = '';
+      if (modelsLoaded) {
+        for (const name of availableModels) {
+          const opt = document.createElement('option');
+          opt.value = name;
+          opt.textContent = name;
+          sel.appendChild(opt);
+        }
+      } else {
+        const opt = document.createElement('option');
+        opt.textContent = '— no models —';
+        sel.appendChild(opt);
+      }
+
+      setModelsUIState(modelsLoaded);
+
+      // Restore remembered value only if valid
+      const remembered = getSavedModel();
+      if (remembered && isValidModelName(remembered)) {
+        sel.value = remembered;
+      } else if (modelsLoaded && sel.options.length) {
+        sel.value = sel.options[0].value;
+      }
+
+      // Creating a session is only allowed when the selection is valid.
+      sel.onchange = () => {
+        const model = sel.value;
+        if (isValidModelName(model)) {
+          setSavedModel(model);
+          createSessionForModel(model);
+        } else if (availableModels[0]) {
+          sel.value = availableModels[0];
+        }
+      };
+
+      showModelDropdown(true);
+    }
+
 
     // Build history for seeding (exclude 'system'; it's sent separately)
     function buildHistoryForSession(sess) { return (sess?.messages || []).map(m => ({ role: m.role, content: m.content })); }
@@ -1267,7 +1612,7 @@
         if (!HUB_ADDR) return;
 
         if (!client && !isConnecting) {
-          setConn('blue', 'Reconnecting…');
+          setConn(RECONNECTING_HTML);
           connectNKN();
           return;
         }
@@ -1276,7 +1621,7 @@
 
         const stale = (Date.now() - lastPongAt) > HEARTBEAT_MS * 5;
         if (stale && !isConnecting) {
-          setConn('blue', 'Reconnecting…');
+          setConn(RECONNECTING_HTML);
           try { client && client.close(); } catch { }
           client = null;
           isConnected = false;
@@ -1301,65 +1646,54 @@
       }
     });
 
-    // EXACTLY follow the proven NKN connect pattern; identifier MUST be 'client'
+    // LTE-proven NKN connect: minimal, robust for 5G/CGNAT
     function connectNKN() {
       if (isConnecting) return;
       if (!isNknAddr(HUB_ADDR)) { openSettings(); return; }
+
       isConnecting = true;
       isConnected = false;
-
       updateChips();
-      setConn('blue', 'Connecting…');
+
+
+      setConn(CONNECTING_HTML);
 
       try { if (client) { try { client.close(); } catch { } } } catch { }
 
-
-      const BOOT = window.__NKN_BOOT || { ON_IPFS: false, SEED_WS_POOL: [], SEED_RPC_POOL: [], shuffle: (a) => a };
-      const wsSeeds = BOOT.shuffle(BOOT.SEED_WS_POOL).slice(0, BOOT.ON_IPFS ? 1 : 2);   // tiny set
-      const rpcSeeds = BOOT.ON_IPFS ? [] : BOOT.shuffle(BOOT.SEED_RPC_POOL).slice(0, 1); // avoid HTTP on IPFS
-
       client = new nkn.MultiClient({
         seed: getOrCreateSeed(),
-        identifier: 'client',
-        numSubClients: BOOT.ON_IPFS ? 1 : 3,            // cut concurrency on IPFS
+        identifier: 'web',         // per proven scheme
+        numSubClients: 4,
         originalClient: true,
-        reconnectIntervalMin: 1000,
-        reconnectIntervalMax: 10000,
-        wsConnHeartbeatTimeout: 60000,
 
-        // Prefer WebSocket seeds to dodge CORS entirely
-        seedWsAddr: wsSeeds,
-
-        // Only use a SINGLE RPC seed off-IPFS; NONE on IPFS (prevents 429/CORS)
-        ...(rpcSeeds.length ? { seedRPCServerAddr: rpcSeeds } : {}),
+        // Mobile-friendly defaults
+        responseTimeout: 15000,    // ACK waits longer on LTE
+        msgHoldingSeconds: 600     // queue at nodes while briefly offline
       });
-
 
       client.onConnect(() => {
         isConnecting = false;
         isConnected = true;
-        setConn('green', 'Connected');
+        setConn(CHECK_HTML);
         myAddr = client.addr; updateChips();
-        setConn('green', '');
+        setConn(CHECK_HTML);
         lastPongAt = Date.now();
         startHeartbeat();
-        trySend(HUB_ADDR, { event: 'announce' }, { noReply: true, maxHoldingSeconds: 120 });
 
+        // Let hub know we're up (fire-and-forget, long holding)
+        trySend(HUB_ADDR, { event: 'announce' }, { noReply: true, msgHoldingSeconds: 600 });
+
+        // Kick model load once per connect
         if (clearLabelTimer) clearTimeout(clearLabelTimer);
         if (modelRevealTimer) clearTimeout(modelRevealTimer);
-
         clearLabelTimer = setTimeout(() => {
           const t = el('connText'); if (t) void t.offsetWidth;
           modelRevealTimer = setTimeout(() => {
-            const sel = el('modelSelect');
-            if (sel) {
-              sel.innerHTML = '<option>Loading Models</option>';
-              sel.disabled = true;
-              showModelDropdown(true);
-            }
+            showModelsLoading();
             modelsLoaded = false;
-            requestModelsList();
-            ensureModels();
+            modelsInFlight = false;
+            availableModels = [];
+            requestModelsList(true);
           }, 0);
         }, 10);
 
@@ -1369,173 +1703,293 @@
           sendSessionOpen(s, /*seed*/true);
         }
 
-        flushOutbox(); // ← send any queued llm.requests
+        flushOutbox();
       });
 
-      // EXACT dispatch style: funnel to onInbound, only process if src===HUB_ADDR
+      // One message funnel; onInbound will filter to the configured hub
       client.on('message', onInbound);
-      client.on('willreconnect', () => { isConnecting = false; isConnected = false; setConn('blue', 'Reconnecting…'); });
-      client.on('connectFailed', () => { isConnecting = false; isConnected = false; setConn('red', 'Connect failed'); });
-      client.on('close', () => { isConnecting = false; isConnected = false; setConn('red', 'Disconnected'); });
-      client.on('error', () => { isConnecting = false; isConnected = false; setConn('red', 'Error'); });
+
+      client.on('willreconnect', () => {
+        isConnecting = false;
+        isConnected = false;
+        setConn(RECONNECTING_HTML);
+      });
+      client.on('connectFailed', () => {
+        isConnecting = false;
+        isConnected = false;
+        setConn('red', 'Connect failed');
+        setTimeout(connectNKN, 1200 + Math.random() * 600); // jittered retry
+      });
+      client.on('close', () => {
+        isConnecting = false;
+        isConnected = false;
+        setConn('red', 'Disconnected');
+        setTimeout(connectNKN, 1200 + Math.random() * 600);
+      });
+      client.on('error', () => {
+        isConnecting = false;
+        isConnected = false;
+        setConn('red', 'Error');
+        // Heartbeat loop will attempt reconnect when stale
+      });
+
       window.addEventListener('beforeunload', () => { try { client && client.close(); } catch { } });
     }
 
-    // Inbound
-    function onInbound(a, b) {
-      let src, payload;
-      if (a && typeof a === 'object' && (a.payload !== undefined || a.data !== undefined || a.src !== undefined)) {
-        src = a.src || a.from || ''; payload = a.payload ?? a.data;
-      } else { src = a; payload = b; }
-      let body = null;
+
+    function decodePayload(payload) {
+      const tryParse = (s) => {
+        try { return JSON.parse(s); } catch { return null; }
+      };
       try {
-        if (payload instanceof Uint8Array) body = JSON.parse(new TextDecoder().decode(payload));
-        else if (typeof payload === 'string') body = JSON.parse(payload);
-        else body = payload;
-      } catch { return; }
-      if (!body || src !== HUB_ADDR) return;
+        // Uint8Array / ArrayBuffer / DataView
+        if (payload instanceof Uint8Array) {
+          const s = new TextDecoder().decode(payload);
+          const obj = tryParse(s);
+          return obj || { raw: s };
+        }
+        if (payload instanceof ArrayBuffer) {
+          const s = new TextDecoder().decode(new Uint8Array(payload));
+          const obj = tryParse(s);
+          return obj || { raw: s };
+        }
+        if (payload instanceof DataView) {
+          const u8 = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+          const s = new TextDecoder().decode(u8);
+          const obj = tryParse(s);
+          return obj || { raw: s };
+        }
 
-      const ev = body.event;
+        if (typeof payload === 'string') {
+          // Handle double-JSON (some bridges serialize twice)
+          const once = tryParse(payload);
+          if (!once) return null;
+          if (typeof once === 'string') {
+            const twice = tryParse(once);
+            return twice || { raw: once };
+          }
+          return once;
+        }
 
-      // Heartbeat pong
-      if (ev === 'ctrl.pong') { lastPongAt = Date.now(); setConn('green', ''); return; }
+        if (payload && typeof payload === 'object') {
+          // Some bridges wrap as { payload: "<json-string>" }
+          if (typeof payload.payload === 'string') {
+            const inner = tryParse(payload.payload);
+            if (inner) return inner;
+          }
+          return payload;
+        }
+      } catch { }
+      return null;
+    }
 
-      if (ev === 'session.ready' || ev === 'session.info' || ev === 'ctrl.info') { return; }
-      if (ev === 'ctrl.error') { console.warn('[ctrl.error]', body); return; }
+    function onInbound(a, b) {
+      try {
+        let src, raw;
+        if (a && typeof a === 'object' && (a.payload !== undefined || a.data !== undefined || a.src !== undefined)) {
+          src = a.src || a.from || '';
+          raw = a.payload ?? a.data;
+        } else {
+          src = a;
+          raw = b;
+        }
 
-      if ((ev === 'llm.models' || ev === 'llm.result') && body.data && body.data.models) { populateModels(body.data.models); return; }
+        const body = decodePayload(raw);
+        if (!body || typeof body !== 'object') return;
 
-      const route = routeFor(body.id);
+        const ev = body.event || '';
+        const srcStr = String(src || '');
+        const fromKey = (srcStr.split('.')[1] || '').toLowerCase();
 
-      if (ev === 'llm.start') {
-        const { id, stream } = body;
-
-        // Element sink
-        if (route.sink === 'element') {
-          const elx = resolveEl(route.elId);
-          if (route.lock) lockElement(elx, true);
-          if (route.elId) streamingElements.add(route.elId);
-          isSysGenStreaming = true; sysgenCurrentId = id;
-
-          // NEW: enable stop control during sysgen stream
-          pendingStreamId = id;
-          setStopMode(id);
-
-          let first = true;
-          startStream(id, (part) => {
-            const t = extractDelta(part);
-            if (!t) return;
-            writeToElement(elx, t, {
-              mode: first && route.mode === 'replace' ? 'replace' : 'append',
-              format: route.format || 'text',
-              scroll: true,
-              caretToEnd: true
-            });
-            first = false;
-          });
+        // Robust acceptance:
+        // - Prefer hub public key match if we have it
+        // - Otherwise accept trusted families ('ctrl.', 'llm.', 'session.')
+        const isTrustedFamily = /^ctrl\.|^llm\.|^session\./.test(ev);
+        if (HUB_KEY && fromKey && fromKey !== HUB_KEY && isTrustedFamily) {
+          // Log once per minute if mismatched to help diagnose
+          if (!onInbound._lastKeyWarnAt || Date.now() - onInbound._lastKeyWarnAt > 60000) {
+            console.warn('[inbound] src key mismatch; accepting due to trusted event family', { ev, src: srcStr, expectedKey: HUB_KEY });
+            onInbound._lastKeyWarnAt = Date.now();
+          }
+        } else if (HUB_KEY && fromKey && fromKey !== HUB_KEY) {
           return;
         }
 
-
-        // Default chat sink
-        if (stream) {
-          pendingStreamId = id;
-          addStreamingAssistantBubble();
-          const sess = getSession(); if (!sess) return;
-          sess.messages.push({ role: 'assistant', content: '', ts: Date.now() }); saveJSON(STORAGE.SESS, sessions);
-          let acc = '';
-          startStream(id, (part) => {
-            const text = extractDelta(part);
-            if (text) { acc += text; setStreamingContent(acc); updateLastAssistantContent(sess.id, acc); }
-          });
+        // Heartbeat pong (+ nudge models if still not loaded)
+        if (ev === 'ctrl.pong') {
+          lastPongAt = Date.now();
+          setConn('green', '');
+          if (!modelsLoaded && !modelsInFlight) requestModelsList(true);
+          return;
         }
-        return;
-      }
 
-      if (ev === 'llm.chunk') { handleChunk(body.id, body.seq, body.data); return; }
+        // MODELS (handle multiple shapes, correlate id, and stop retries)
+        if (
+          ev === 'llm.models' ||
+          (ev === 'llm.result' && body.id && String(body.id).startsWith('models'))
+        ) {
+          // Stop retry loop
+          modelsInFlight = false;
+          if (modelsRetryTimer) clearTimeout(modelsRetryTimer);
+          modelsRetryBackoff = 800;
 
-      if (ev === 'llm.done') {
-        sendAck(body.id, body.last_seq);
-        endStream(body.id);
+          // Accept: body.data.models, body.models, or body.data
+          const payload = (body && body.data) ? body.data : body;
+          populateModels(payload);
 
-        if (route.sink === 'element') {
-          const elx = resolveEl(route.elId);
-          lockElement(elx, false);
-          if (route.elId) streamingElements.delete(route.elId);
+          // If still empty, keep UI visible but disabled
+          return;
+        }
 
-          if (route.elId === 'systemMsg') {
-            const s = getSession();
-            if (s) {
-              s.system = (el('systemMsg').value || '');
-              saveJSON(STORAGE.SESS, sessions);
-              sendSessionOpen(s, /*seed*/false);
+        // Noisy / informative only
+        if (ev === 'session.ready' || ev === 'session.info' || ev === 'ctrl.info') return;
+        if (ev === 'ctrl.error') {
+          console.warn('[ctrl.error]', body);
+          return;
+        }
+
+        // Route-aware handling for streams/results/errors
+        const route = routeFor(body.id);
+
+        if (ev === 'llm.start') {
+          const { id, stream } = body;
+
+          if (route.sink === 'element') {
+            const elx = resolveEl(route.elId);
+            if (route.lock) lockElement(elx, true);
+            if (route.elId) streamingElements.add(route.elId);
+            isSysGenStreaming = true; sysgenCurrentId = id;
+
+            pendingStreamId = id;
+            setStopMode(id);
+
+            let first = true;
+            startStream(id, (part) => {
+              const t = extractDelta(part);
+              if (!t) return;
+              writeToElement(elx, t, {
+                mode: first && route.mode === 'replace' ? 'replace' : 'append',
+                format: route.format || 'text',
+                scroll: true,
+                caretToEnd: true
+              });
+              first = false;
+            });
+            return;
+          }
+
+          if (stream) {
+            pendingStreamId = id;
+            addStreamingAssistantBubble();
+            const sess = getSession(); if (!sess) return;
+            sess.messages.push({ role: 'assistant', content: '', ts: Date.now() });
+            saveJSON(STORAGE.SESS, sessions);
+            let acc = '';
+            startStream(id, (part) => {
+              const text = extractDelta(part);
+              if (text) { acc += text; setStreamingContent(acc); updateLastAssistantContent(sess.id, acc); }
+            });
+          }
+          return;
+        }
+
+        if (ev === 'llm.chunk') { handleChunk(body.id, body.seq, body.data); return; }
+
+        if (ev === 'llm.done') {
+          sendAck(body.id, body.last_seq);
+          endStream(body.id);
+
+          if (route.sink === 'element') {
+            const elx = resolveEl(route.elId);
+            lockElement(elx, false);
+            if (route.elId) streamingElements.delete(route.elId);
+
+            if (route.elId === 'systemMsg') {
+              const s = getSession();
+              if (s) {
+                s.system = (el('systemMsg').value || '');
+                saveJSON(STORAGE.SESS, sessions);
+                sendSessionOpen(s, /*seed*/false);
+              }
+              setSysGenBusy(false);
+              isSysGenStreaming = false; sysgenCurrentId = null;
+              sysgenPending.delete(body.id);
             }
+
+            setSendMode();
+            clearRoute(body.id);
+            return;
+          }
+
+          finishStreamingBubble();
+          setSendMode();
+          clearRoute(body.id);
+          return;
+        }
+
+        if (ev === 'llm.result') {
+          if (route.sink === 'element') {
+            const elx = resolveEl(route.elId);
+            const text = extractFull(body.data) || '';
+            writeToElement(elx, text, { mode: route.mode || 'replace', format: route.format || 'text' });
+            lockElement(elx, false);
+            if (route.elId) streamingElements.delete(route.elId);
+
+            if (route.elId === 'systemMsg') {
+              const s = getSession();
+              if (s) {
+                s.system = (el('systemMsg').value || '');
+                saveJSON(STORAGE.SESS, sessions);
+                sendSessionOpen(s, /*seed*/false);
+              }
+              setSysGenBusy(false);
+              sysgenPending.delete(body.id);
+            }
+            isSysGenStreaming = false; sysgenCurrentId = null;
+            clearRoute(body.id);
+            return;
+          }
+          const sess = getSession(); if (!sess) return;
+          const text = extractFull(body.data);
+          appendMessage(sess.id, 'assistant', text);
+          renderChat();
+          clearRoute(body.id);
+          return;
+        }
+
+        if (ev === 'llm.error') {
+          if (body.kind === 'models' || (body.id && String(body.id).startsWith('models'))) {
+            modelsInFlight = false;
+            modelsLoaded = false;
+            if (modelsRetryTimer) clearTimeout(modelsRetryTimer);
+            showModelsError('— no models (hub error) —');
+            return;
+          }
+
+          if (route.sink === 'element') {
+            const elx = resolveEl(route.elId);
+            lockElement(elx, false);
+            if (route.elId) streamingElements.delete(route.elId);
             setSysGenBusy(false);
             isSysGenStreaming = false; sysgenCurrentId = null;
             sysgenPending.delete(body.id);
+            clearRoute(body.id);
+            alert('[LLM Error] ' + (body.message || 'Error'));
+            return;
           }
-
-          setSendMode();           // NEW: put the play icon back
+          const sess = getSession(); if (!sess) return;
+          appendMessage(sess.id, 'assistant', '[error] ' + body.message);
+          renderChat();
+          setSendMode();
           clearRoute(body.id);
           return;
         }
-
-        finishStreamingBubble();
-        setSendMode();
-        clearRoute(body.id);
-        return;
-      }
-
-      if (ev === 'llm.result') {
-        if (route.sink === 'element') {
-          const elx = resolveEl(route.elId);
-          const text = extractFull(body.data) || '';
-          writeToElement(elx, text, { mode: route.mode || 'replace', format: route.format || 'text' });
-          lockElement(elx, false);
-          if (route.elId) streamingElements.delete(route.elId);
-
-          if (route.elId === 'systemMsg') {
-            const s = getSession();
-            if (s) {
-              s.system = (el('systemMsg').value || '');
-              saveJSON(STORAGE.SESS, sessions);
-              sendSessionOpen(s, /*seed*/false);
-            }
-            setSysGenBusy(false);
-            sysgenPending.delete(body.id);
-          }
-          isSysGenStreaming = false; sysgenCurrentId = null;
-          clearRoute(body.id);
-          return;
-        }
-        const sess = getSession(); if (!sess) return;
-        const text = extractFull(body.data);
-        appendMessage(sess.id, 'assistant', text);
-        renderChat();
-        clearRoute(body.id);
-        return;
-      }
-
-      if (ev === 'llm.error') {
-        if (route.sink === 'element') {
-          const elx = resolveEl(route.elId);
-          lockElement(elx, false);
-          if (route.elId) streamingElements.delete(route.elId);
-          setSysGenBusy(false);
-          isSysGenStreaming = false; sysgenCurrentId = null;
-          sysgenPending.delete(body.id);
-          clearRoute(body.id);
-          alert('[LLM Error] ' + (body.message || 'Error'));
-          return;
-        }
-        const sess = getSession(); if (!sess) return;
-        appendMessage(sess.id, 'assistant', '[error] ' + body.message);
-        renderChat();
-        setSendMode();
-        clearRoute(body.id);
-        return;
+      } catch (err) {
+        console.warn('[onInbound] swallowed error', err);
       }
     }
+
+
 
     function extractDelta(part) {
       if (part?.message?.content) return part.message.content;
@@ -1627,6 +2081,9 @@
 
     // Boot
     function boot() {
+      setConn(); // clears blue & hides label
+
+      // Move the model select next to status + keep it hidden until we truly have models
       (() => {
         const row = el('statusRow'), sel = el('modelSelect');
         if (row && sel && sel.parentElement !== row) row.appendChild(sel);
@@ -1637,17 +2094,18 @@
       el('systemToggleBtn').onclick = () => toggleSystemEditor();
       el('systemToggleBtnInside').onclick = () => toggleSystemEditor();
 
-      // System Prompt Generate (uses textarea content as input; streams back into same textarea)
+      // System Prompt Generate (streams back into the textarea)
       el('sysGenBtn').onclick = () => {
         const s = getSession(); if (!s) { alert('Create/select a session first.'); return; }
         if (!HUB_ADDR) { openSettings(); return; }
+        if (!modelsLoaded) { alert('Models are not loaded yet. Please wait.'); return; }
 
         const ta = el('systemMsg');
         const userDesc = (ta.value || '').trim();
         if (!userDesc) { alert('Type what you want your system prompt to do, then click Generate.'); return; }
 
         const model = getCurrentModel();
-        if (!model) { alert('Choose a model first, then try Generate again.'); return; }
+        if (!model || el('modelSelect').disabled) { alert('Choose a model first, then try Generate again.'); return; }
 
         const genId = newId('sysgen');
 
@@ -1670,7 +2128,7 @@
         const route = {
           sink: 'element',
           elId: 'systemMsg',
-          mode: 'replace',  // first token replaces (so we don't pre-clear); subsequent chunks append
+          mode: 'replace',  // first token replaces; subsequent chunks append
           format: 'text',
           lock: true
         };
@@ -1679,13 +2137,11 @@
         sysgenPending.add(genId);
         setSysGenBusy(true);
         streamingElements.add('systemMsg');
-        lockElement(ta, true);          // don't clear; first chunk will replace due to mode:'replace'
+        lockElement(ta, true);
 
         // Send (queue-aware)
         requestLLM(payload, route);
       };
-
-
 
       el('sysSaveBtn').onclick = () => {
         const s = getSession();
@@ -1702,22 +2158,68 @@
 
       // Ensure HUB_ADDR reflects (possibly updated) settings.hub
       HUB_ADDR = settings.hub || '';
+      HUB_KEY = (HUB_ADDR.split('.')[1] || '').toLowerCase();  // <— NEW
       updateChips();
 
+      // Wire inputs
       el('sendBtn').onclick = sendPrompt;
-      el('prompt').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); } });
-      el('settingsBtn').onclick = openSettings; el('closeModal').onclick = closeSettings;
+      el('prompt').addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          sendPrompt();
+        }
+      });
+      el('settingsBtn').onclick = openSettings;
+      el('closeModal').onclick = closeSettings;
       el('saveSettings').onclick = () => { if (saveSettingsFromUI()) { closeSettings(); } };
-      el('newSessionBtn').onclick = () => {
-        const sel = el('modelSelect'); const model = sel.value || sel.options[0]?.value;
-        if (!model || sel.disabled) { alert('No models yet. Set hub and ensure it’s running.'); return; }
-        createSessionForModel(model);
-      };
 
+      // NEW: reset local NKN key and reconnect (no full reload needed)
+      (() => {
+        const btn = el('resetKeyBtn');
+        if (!btn) return;
+        btn.onclick = () => {
+          if (!confirm('Reset your local NKN key? A new keypair will be generated and the client will reconnect.')) return;
+          localStorage.removeItem(STORAGE.SEED);
+          try { client && client.close && client.close(); } catch { }
+          client = null;
+          myAddr = null;
+          updateChips();
+          setConn(RECONNECTING_HTML);
+          connectNKN();
+        };
+      })();
+
+
+      // Disallow creating a session until models have actually loaded
+      const newBtn = el('newSessionBtn');
+      if (newBtn) {
+        newBtn.disabled = true; // start disabled
+        newBtn.onclick = () => {
+          const sel = el('modelSelect');
+          const model = sel && sel.value;
+          if (!modelsLoaded || !model || sel.disabled || /loading|no models/i.test(String(sel.options[0]?.text || ''))) {
+            alert('Models are not ready yet. Please wait for the list to load.');
+            return;
+          }
+          createSessionForModel(model);
+        };
+      }
+
+      // Also protect the model select itself until ready
+      const modelSel = el('modelSelect');
+      if (modelSel) {
+        modelSel.disabled = true;     // will be enabled when populateModels() runs
+        modelSel.classList.add('hide');
+      }
+
+      // Keep existing session selection behavior
       if (activeSessionId) setActiveSession(activeSessionId);
-      connectNKN(); // uses MultiClient with identifier: 'client'
+
+      // Kick off NKN connect; onConnect() will show "Loading…" and invoke ensureModels()
+      connectNKN();
     }
     boot();
+
   </script>
 
 
