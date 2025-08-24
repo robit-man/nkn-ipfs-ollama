@@ -82,12 +82,15 @@ if not ENV_PATH.exists():
     seed_hex  = secrets.token_hex(32)  # 64 hex chars
     topic_ns  = "client"
     ollama_host = "http://127.0.0.1:11434"
+    # Default: disable WebRTC in browsers until a TURN is available
+    disable_webrtc = "1"
     ENV_PATH.write_text(
         f"PEER_SHARED_SECRET={pw}\n"
         f"JWT_SECRET={jwt_sec}\n"
         f"NKN_SEED_HEX={seed_hex}\n"
         f"NKN_TOPIC_PREFIX={topic_ns}\n"
         f"OLLAMA_HOST={ollama_host}\n"
+        f"NKN_DISABLE_WEBRTC={disable_webrtc}\n"
     )
     print("→ wrote .env (defaults created)")
 
@@ -102,6 +105,7 @@ NKN_SEED_HEX  = dotenv["NKN_SEED_HEX"].lower().replace("0x","")
 TOPIC_PREFIX  = dotenv.get("NKN_TOPIC_PREFIX","client")
 JWT_EXP       = timedelta(minutes=30)
 OLLAMA_HOST   = dotenv.get("OLLAMA_HOST","http://127.0.0.1:11434")
+DISABLE_WEBRTC= dotenv.get("NKN_DISABLE_WEBRTC", "1") in ("1","true","yes","on")
 
 # Session policy
 SESSION_TTL_SECS   = 60 * 45      # prune sessions idle > 45m
@@ -109,9 +113,9 @@ SESSION_MAX_TURNS  = 20           # keep last 20 user/assistant turns (40 msgs) 
 SESSION_LOCK = threading.RLock()
 
 # Watchdog config (bridge)
-READY_GRACE_SECS   = 20.0
+READY_GRACE_SECS   = 45.0   # was 20.0
 HB_INTERVAL_SECS   = 5.0
-HB_STALL_SECS      = 90.0  # relaxed to tolerate idle/background timer clamping
+HB_STALL_SECS      = 180.0  # was 90.0
 
 # ──────────────────────────────────────────────────────────────────────
 # IV. Node NKN bridge (DM-first; hardened sends) + watchdog
@@ -158,15 +162,22 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
 
 (async () => {
   if (!/^[0-9a-f]{64}$/.test(SEED_HEX)) throw new RangeError('invalid hex seed');
-  const client = new nkn.MultiClient({
-    seed: SEED_HEX,
-    identifier: 'hub',
-    numSubClients: 4,
-    // tolerate background-timer clamping & flaky NATs
-    wsConnHeartbeatTimeout: 60000,
-    reconnectIntervalMin: 1000,
-    reconnectIntervalMax: 10000,
-  });
+const SEED_WS = (process.env.NKN_BRIDGE_SEED_WS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const client = new nkn.MultiClient({
+  seed: SEED_HEX,
+  identifier: 'hub',
+  numSubClients: 4,
+  seedWsAddr: SEED_WS.length ? SEED_WS : undefined,   // pin to known-good WS seeds
+  // tolerate background-timer clamping & flaky NATs
+  wsConnHeartbeatTimeout: 120000,  // was 60000
+  reconnectIntervalMin: 1000,
+  reconnectIntervalMax: 10000,
+  connectTimeout: 15000,
+});
 
   client.on('connect', () => {
     READY = true;
@@ -178,10 +189,10 @@ const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
     const msg = (e && e.message) || String(e || '');
     log('client error', msg);
     // Transient WS close: let MultiClient reconnect; pause draining
-    if (msg.includes('WebSocket unexpectedly closed')) {
-      try { sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() }); } catch {}
-      suspend(2500);
-    }
+if (msg.includes('WebSocket unexpectedly closed') || msg.includes('VERIFY SIGNATURE ERROR')) {
+  try { sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() }); } catch {}
+  suspend(2500);  // let MultiClient rotate endpoints before we drain again
+}
   });
   client.on('connectFailed', e => log('connect failed', e && e.message || e));
 
@@ -279,6 +290,12 @@ _bridge_starts = 0
 _bridge_lock = threading.Lock()
 _bridge_write_lock = threading.Lock()  # ← serialize writes to child stdin
 
+# Track websocket flap storms (repeated 'wsclosed' events) so we can restart proactively
+_ws_flap_times: List[float] = []
+_ws_flap_lock = threading.Lock()
+WS_FLAP_WINDOW = 60.0   # seconds to look back
+WS_FLAP_MAX = 6         # restart if >= this many wsclosed in window
+
 
 def _spawn_bridge() -> Popen:
     global _last_hb, _ready_at, _bridge_starts
@@ -333,6 +350,17 @@ def _bridge_reader_stdout():
             elif msg.get("type") == "wsclosed":
                 # Transient: bridge will auto-reconnect; keep process alive and pause sends.
                 print("⚠️ bridge reported wsclosed — pausing sends until reconnect …")
+                # Track flap timestamps for watchdog storm detection
+                try:
+                    now = time.time()
+                    with _ws_flap_lock:
+                        _ws_flap_times.append(now)
+                        cutoff = now - WS_FLAP_WINDOW
+                        # prune old entries outside the window
+                        while _ws_flap_times and _ws_flap_times[0] < cutoff:
+                            _ws_flap_times.pop(0)
+                except Exception:
+                    pass
 
             elif msg.get("type") == "nkn-dm":
                 src = msg.get("src") or ""
@@ -384,12 +412,26 @@ def _watchdog_loop():
                 elif _ready_at > 0.0 and (now - _last_hb) > HB_STALL_SECS:
                     need_restart = True
 
+                # WS flap storm: too many 'wsclosed' in a short window
+                else:
+                    try:
+                        with _ws_flap_lock:
+                            flaps = len([t for t in _ws_flap_times if now - t <= WS_FLAP_WINDOW])
+                        if flaps >= WS_FLAP_MAX:
+                            print(f"↻ restarting NKN bridge (ws flap storm: {flaps}/{WS_FLAP_WINDOW}s) …")
+                            need_restart = True
+                    except Exception:
+                        pass
+
                 if need_restart:
-                    print("↻ restarting NKN bridge …")
+                    # reset flap counter before restart
+                    with _ws_flap_lock:
+                        _ws_flap_times.clear()
                     _restart_bridge_locked()
             time.sleep(1.0)
         except Exception:
             time.sleep(1.0)
+
 
 # Initial spawn and threads
 with _bridge_lock:
@@ -469,23 +511,93 @@ def _print_models_on_start():
     except Exception as e:
         print(f"‼️  Ollama probe failed: {e}")
 
-_last_models_sent: Dict[str, int] = {}  # addr -> ms
+# Monotonic per-peer cooldown + tiny cache to avoid spam during reconnects
+_last_models_sent: Dict[str, float] = {}  # addr -> monotonic seconds
+_models_cache: Dict[str, Any] = {"t": 0.0, "data": None}
 
-def _send_models_list(to: str, req_id: Optional[str] = None):
-    now = _now_ms()
-    last = _last_models_sent.get(to, 0)
-    if now - last < 1500:  # throttle per-peer
-        return
-    _last_models_sent[to] = now
-    try:
-        data = _ollama_list()
-        # Send both for compatibility; echo req_id on llm.result for correlation
-        _dm(to, {"event": "llm.models", "data": data, "ts": now})
-        _dm(to, {"event": "llm.result", "id": (req_id or "models"), "data": data, "ts": _now_ms()})
-        _log("models.sent", f"→ {to} id={req_id or 'models'} count={len(data.get('models',[]))}")
-    except Exception as e:
-        _dm(to, {"event":"llm.error","id": (req_id or "models"),
-                 "message":f"models list failed: {e}","kind":"models","ts":_now_ms()})
+def _ollama_list_cached(ttl: float = 5.0) -> dict:
+    now = time.monotonic()
+    cached = _models_cache.get("data")
+    if cached is not None and (now - _models_cache.get("t", 0.0)) < ttl:
+        return cached
+    data = _ollama_list()
+    _models_cache["t"] = now
+    _models_cache["data"] = data
+    return data
+
+def _send_models_list(to: str, req_id: Optional[str] = None, cooldown: float = 30.0):
+    """
+    Debounced, id-tagged models push.
+    - Uses monotonic time per-peer cooldown (default 30s).
+    - Skips resend if payload digest unchanged since last send to this peer.
+    - Falls back to _ollama_list() if _ollama_list_cached() is unavailable.
+    - Throttles error spam by updating last-send even on failure.
+    """
+    import hashlib  # local import to keep patch surgical
+
+    # Ensure globals exist even if this is dropped into older builds.
+    g = globals()
+    if "_last_models_sent" not in g:
+        g["_last_models_sent"] = {}
+    if "_last_models_digest" not in g:
+        g["_last_models_digest"] = {}
+    if "_models_send_lock" not in g:
+        g["_models_send_lock"] = threading.Lock()
+
+    now_mono = time.monotonic()
+    with _models_send_lock:
+        last = _last_models_sent.get(to, 0.0)
+        since = now_mono - last
+        if since < cooldown:
+            _log("models.skip", f"{to} within cooldown ({since:.2f}s<{cooldown:.2f}s)")
+            return
+
+        # Prefer cached list if present; fall back to live.
+        getter = g.get("_ollama_list_cached") or g.get("_ollama_list")
+        if not getter:
+            # Absolute fallback: avoid NameError
+            def getter():  # type: ignore
+                return {"models": []}
+
+        try:
+            data = getter()
+        except Exception as e:
+            # Throttle repeated failures, too
+            _last_models_sent[to] = now_mono
+            _dm(to, {
+                "event": "llm.error",
+                "id": (req_id or "models"),
+                "message": f"models list failed: {e}",
+                "kind": "models",
+                "ts": _now_ms(),
+            })
+            return
+
+        # Compute a stable digest for change-detection.
+        try:
+            raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            digest = hashlib.sha256(raw).hexdigest()
+        except Exception:
+            digest = None
+
+        if digest and g["_last_models_digest"].get(to) == digest:
+            _last_models_sent[to] = now_mono
+            _log("models.skip", f"{to} unchanged digest")
+            return
+
+        # Update send trackers before emitting to avoid re-entrancy storms.
+        _last_models_sent[to] = now_mono
+        if digest:
+            g["_last_models_digest"][to] = digest
+
+        rid = req_id or "models"
+        ts = _now_ms()
+
+        # Send both for compatibility; include id on both for correlation.
+        _dm(to, {"event": "llm.models", "id": rid, "data": data, "ts": ts})
+        _dm(to, {"event": "llm.result", "id": rid, "data": data, "ts": _now_ms()})
+        _log("models.sent", f"→ {to} id={rid} count={len((data or {}).get('models', []))}")
+
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -653,8 +765,8 @@ def _sanitize_state(s: dict) -> Dict[str, float]:
     lon = ((lon % 360.0) + 360.0) % 360.0
     return {"lat": lat, "lon": lon}
 
-ACTIVE_WINDOW_MS = 6_000
-PRUNE_WINDOW_MS  = 30_000
+ACTIVE_WINDOW_MS = 30_000    # was 6_000; give page time to settle
+PRUNE_WINDOW_MS  = 120_000   # was 30_000; avoid drop/rejoin churn
 
 def _send_world_snapshot(targets=None):
     now = _now_ms()
@@ -687,12 +799,13 @@ def _send_world_snapshot(targets=None):
 
 
 def _broadcaster_loop():
+    # Reduce background DM churn; browsers behind strict NATs mis-handle frequent RTC acks
     while True:
         try:
             _send_world_snapshot()
         except Exception as e:
             _log("broadcast-error", repr(e))
-        time.sleep(0.20)
+        time.sleep(2.0)  # was 0.20
 
 threading.Thread(target=_broadcaster_loop, daemon=True).start()
 
@@ -1182,7 +1295,7 @@ def _handle_dm(src_addr: str, body: dict):
     _log("dm-unknown", f"from {src_addr}  event={ev}  body={body}")
 
 # ──────────────────────────────────────────────────────────────────────
-# X. HTTP (metadata + models)
+# X. HTTP (metadata + models + bootstrap)
 # ──────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -1202,6 +1315,89 @@ def root():
         readyAt=_ready_at,
         lastHeartbeat=_last_hb,
     )
+
+# --- Bootstrap oracle: provide rotating seedWsAddr + ICE servers ---
+# Strategy:
+# - Maintain a rotating pool of WS seeds (wss://IP:30004) known to accept TLS.
+# - Optionally probe/refresh in the background (kept simple here).
+# - Provide ICE servers so WebRTC can survive stricter NATs.
+# You can later extend this to fetch fresh lists from public RPC on the *server side*
+# (no CORS issue) and filter by latency/health.
+
+_BOOT_WS_SEEDS = [
+    # Seed WS pool; keep 20–40 entries if you have them.
+    # The following are examples; add more from your infra or NKN seed pools:
+    "wss://66-113-14-95.ipv4.nknlabs.io:30004",
+    "wss://3-137-144-60.ipv4.nknlabs.io:30004",
+    "wss://144-202-102-11.ipv4.nknlabs.io:30004",
+    # add more here...
+]
+# Basic round-robin over the static list; you can replace with an active probe.
+_boot_idx = 0
+_boot_lock = threading.Lock()
+
+def _rotate_ws_seeds(k=6):
+    global _boot_idx
+    with _boot_lock:
+        if not _BOOT_WS_SEEDS:
+            return []
+        out = []
+        n = len(_BOOT_WS_SEEDS)
+        for i in range(min(k, n)):
+            out.append(_BOOT_WS_SEEDS[(_boot_idx + i) % n])
+        _boot_idx = (_boot_idx + 1) % n
+        return out
+
+# Default ICE config. Replace with your TURN if you have one for best reliability:
+_DEFAULT_ICE = (
+    {
+        "iceServers": [
+            {"urls": "stun:stun.l.google.com:19302"},
+            {"urls": "stun:global.stun.twilio.com:3478"},
+            # If you run TURN, include it (then set NKN_DISABLE_WEBRTC=0):
+            # {"urls": "turn:your.turn.server:3478", "username": "user", "credential": "pass"}
+        ],
+        "iceCandidatePoolSize": 2,
+    }
+    if not DISABLE_WEBRTC
+    else {"iceServers": [], "iceCandidatePoolSize": 0}
+)
+
+@app.route("/bootstrap")
+def bootstrap():
+    # Allow client to request WS seed count via ?k=
+    try:
+        from flask import request
+        k = int(request.args.get("k", "6"))
+        if k < 2: k = 2
+        if k > 16: k = 16
+    except Exception:
+        k = 6
+    seeds = _rotate_ws_seeds(k)
+
+    # When WebRTC is disabled, explicitly advertise WS-only policy so the frontend
+    # doesn't even attempt to open RTC data channels (which causes the ACK errors).
+    policy = "websocket-only" if DISABLE_WEBRTC else "auto"
+
+    payload = {
+        "ok": True,
+        "nknAddress": state.get("nkn_address"),
+        "topicPrefix": state.get("topic_prefix"),
+        "seeds_ws": seeds,         # existing name
+        "seedWsAddr": seeds,       # name used by nkn-sdk-js options
+        "wsOnly": True,            # hint to skip WebRTC entirely in the browser
+        "rtc": _DEFAULT_ICE,       # kept for compatibility; frontend can ignore if wsOnly==True
+        "retry": {
+            "reconnectIntervalMin": 1000,
+            "reconnectIntervalMax": 10000,
+            "wsConnHeartbeatTimeout": 120000,  # was 60000
+            "connectTimeoutMs": 15000          # was 12000
+        },
+        "ts": _now_ms()
+    }
+    return jsonify(payload)
+
+
 
 @app.route("/models")
 def models():
