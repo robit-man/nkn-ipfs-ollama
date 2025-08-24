@@ -1631,16 +1631,6 @@
       }, modelsRetryBackoff);
     }
 
-
-    function ensureModels() {
-      // call after connect
-      showModelsLoading();
-      modelsInFlight = false;
-      modelsLoaded = false;
-      modelsRetryBackoff = 1500;
-      requestModelsList(true);
-    }
-
     function populateModels(modelsLike) {
       const sel = el('modelSelect'); if (!sel) return;
 
@@ -1928,16 +1918,6 @@
         // Kick model load once per connect 
         if (clearLabelTimer) clearTimeout(clearLabelTimer);
         if (modelRevealTimer) clearTimeout(modelRevealTimer);
-        clearLabelTimer = setTimeout(() => {
-          const t = el('connText'); if (t) void t.offsetWidth;
-          modelRevealTimer = setTimeout(() => {
-            showModelsLoading();
-            modelsLoaded = false;
-            modelsInFlight = false;
-            availableModels = [];
-            requestModelsList(true);
-          }, 0);
-        }, 10);
 
         const s = getSession();
         if (s) {
@@ -2507,7 +2487,7 @@
       // Keep existing session selection behavior
       if (activeSessionId) setActiveSession(activeSessionId);
 
-      // Kick off NKN connect; onConnect() will show "Loading…" and invoke ensureModels()
+      // Kick off NKN connect; onConnect()
       connectNKN();
     }
     boot();
