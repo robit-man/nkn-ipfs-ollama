@@ -451,6 +451,53 @@ signal.signal(signal.SIGTERM, _shutdown)
 # ──────────────────────────────────────────────────────────────────────
 # V. JSON helpers & Ollama adapters
 # ──────────────────────────────────────────────────────────────────────
+
+# ── Blob (multi-part) ingest ──────────────────────────────────────────
+BLOB_DIR = BASE_DIR / "blobs"
+BLOB_DIR.mkdir(parents=True, exist_ok=True)
+
+BLOB_TTL_SECS = 60 * 60      # keep finished blobs 1h
+BLOB_STALL_SECS = 15 * 60    # kill half-finished uploads after 15m
+_BLOBS_LOCK = threading.RLock()
+# key: (src_addr, blob_id) -> dict(meta)
+_BLOBS: Dict[tuple, dict] = {}
+
+def _blob_key(src: str, blob_id: str): return (src, blob_id)
+
+def _blob_path(blob_id: str) -> Path:
+    # assemble to one flat namespace; blob_id expected safe (we generate it)
+    return BLOB_DIR / f"{blob_id}.bin"
+
+def _blob_tmp_path(blob_id: str) -> Path:
+    return BLOB_DIR / f"{blob_id}.tmp"
+
+def _blob_touch(meta: dict):
+    meta["updated_at"] = time.time()
+
+def _blob_gc_loop():
+    while True:
+        time.sleep(30)
+        now = time.time()
+        with _BLOBS_LOCK:
+            dead = []
+            for k, m in list(_BLOBS.items()):
+                created = m.get("created_at", now)
+                updated = m.get("updated_at", created)
+                done = bool(m.get("done"))
+                # hard stall for incomplete
+                if (not done and (now - updated) > BLOB_STALL_SECS) or \
+                   (done and (now - updated) > BLOB_TTL_SECS):
+                    try:
+                        _blob_tmp_path(m["id"]).unlink(missing_ok=True)
+                        _blob_path(m["id"]).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    dead.append(k)
+            for k in dead:
+                _BLOBS.pop(k, None)
+threading.Thread(target=_blob_gc_loop, daemon=True).start()
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -525,33 +572,20 @@ def _ollama_list_cached(ttl: float = 5.0) -> dict:
     _models_cache["data"] = data
     return data
 
-def _send_models_list(to: str, req_id: Optional[str] = None, cooldown: float = 30.0):
+def _send_models_list(to: str, req_id: Optional[str] = None):
     """
-    Debounced, id-tagged models push.
-    - Uses monotonic time per-peer cooldown (default 30s).
-    - Skips resend if payload digest unchanged since last send to this peer.
-    - Falls back to _ollama_list() if _ollama_list_cached() is unavailable.
-    - Throttles error spam by updating last-send even on failure.
-    """
-    import hashlib  # local import to keep patch surgical
+    Idempotent, id-tagged models push.
 
+    Always replies to each request (no digest suppression or cooldown),
+    but still uses the cached Ollama list when available. Emits both
+    `llm.models` and `llm.result` for compatibility, and also `ctrl.models`.
+    """
     # Ensure globals exist even if this is dropped into older builds.
     g = globals()
-    if "_last_models_sent" not in g:
-        g["_last_models_sent"] = {}
-    if "_last_models_digest" not in g:
-        g["_last_models_digest"] = {}
     if "_models_send_lock" not in g:
         g["_models_send_lock"] = threading.Lock()
 
-    now_mono = time.monotonic()
     with _models_send_lock:
-        last = _last_models_sent.get(to, 0.0)
-        since = now_mono - last
-        if since < cooldown:
-            _log("models.skip", f"{to} within cooldown ({since:.2f}s<{cooldown:.2f}s)")
-            return
-
         # Prefer cached list if present; fall back to live.
         getter = g.get("_ollama_list_cached") or g.get("_ollama_list")
         if not getter:
@@ -562,8 +596,6 @@ def _send_models_list(to: str, req_id: Optional[str] = None, cooldown: float = 3
         try:
             data = getter()
         except Exception as e:
-            # Throttle repeated failures, too
-            _last_models_sent[to] = now_mono
             _dm(to, {
                 "event": "llm.error",
                 "id": (req_id or "models"),
@@ -573,31 +605,14 @@ def _send_models_list(to: str, req_id: Optional[str] = None, cooldown: float = 3
             })
             return
 
-        # Compute a stable digest for change-detection.
-        try:
-            raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            digest = hashlib.sha256(raw).hexdigest()
-        except Exception:
-            digest = None
-
-        if digest and g["_last_models_digest"].get(to) == digest:
-            _last_models_sent[to] = now_mono
-            _log("models.skip", f"{to} unchanged digest")
-            return
-
-        # Update send trackers before emitting to avoid re-entrancy storms.
-        _last_models_sent[to] = now_mono
-        if digest:
-            g["_last_models_digest"][to] = digest
-
-        rid = req_id or "models"
+        rid = req_id or f"models:{_now_ms()}"
         ts = _now_ms()
 
-        # Send both for compatibility; include id on both for correlation.
+        # Send for all consumers: llm.models + llm.result + ctrl.models
         _dm(to, {"event": "llm.models", "id": rid, "data": data, "ts": ts})
         _dm(to, {"event": "llm.result", "id": rid, "data": data, "ts": _now_ms()})
+        _dm(to, {"event": "ctrl.models", "id": rid, "data": data, "ts": _now_ms()})
         _log("models.sent", f"→ {to} id={rid} count={len((data or {}).get('models', []))}")
-
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -841,6 +856,96 @@ def _extract_full_text(api: str, data: Any) -> str:
     except Exception:
         return str(data)
 
+# ── Image helpers (base64/data URL → bytes) ───────────────────────────
+_DATAURL_PREFIX = "data:"
+
+def _decode_b64_to_bytes(s: str) -> Optional[bytes]:
+    try:
+        if not isinstance(s, str): return None
+        b64 = s
+        if s.startswith(_DATAURL_PREFIX):
+            _, _, tail = s.partition(",")
+            b64 = tail or s
+        return base64.b64decode(b64, validate=False)
+    except Exception:
+        return None
+
+def _resolve_blob_ref(src_addr: str, ref: str) -> Optional[bytes]:
+    # Accept "blob:<id>" or raw id; only within same src sender
+    if not isinstance(ref, str): return None
+    bid = ref
+    if ref.startswith("blob:"):
+        bid = ref.split(":", 1)[1]
+    key = _blob_key(src_addr, bid)
+    with _BLOBS_LOCK:
+        meta = _BLOBS.get(key)
+        if not meta or not meta.get("done"): return None
+    p = _blob_path(bid)
+    try:
+        return p.read_bytes()
+    except Exception:
+        return None
+
+def _massage_images_in_messages(
+    msgs: List[Dict[str, Any]],
+    src_addr: Optional[str] = None,
+    *,
+    log_prefix: str = ""
+) -> List[Dict[str, Any]]:
+    """
+    Convert:
+      - images / images_b64: base64 or data URLs → bytes
+      - images_ref: 'blob:<id>' → bytes (resolved for the *same* src_addr)
+    Also prints a concise line so we can see what was attached.
+    """
+    out: List[Dict[str, Any]] = []
+    inline_ct = 0
+    ref_ct = 0
+    total_bytes = 0
+
+    for i, m in enumerate(msgs or []):
+        m2 = dict(m)
+        bin_list: List[bytes] = []
+
+        # Inline: base64 / data URLs
+        imgs = m2.get("images") or m2.get("images_b64")
+        if isinstance(imgs, (list, tuple)):
+            for it in imgs:
+                if isinstance(it, (bytes, bytearray)):
+                    b = bytes(it)
+                elif isinstance(it, str):
+                    b = _decode_b64_to_bytes(it)
+                else:
+                    b = None
+                if b:
+                    bin_list.append(b)
+                    inline_ct += 1
+                    total_bytes += len(b)
+
+        # Blob refs: only if we know who sent them (same sender scope)
+        if src_addr and isinstance(m2.get("images_ref"), (list, tuple)):
+            for ref in m2["images_ref"]:
+                b = _resolve_blob_ref(src_addr, ref)
+                if b:
+                    bin_list.append(b)
+                    ref_ct += 1
+                    total_bytes += len(b)
+
+        if bin_list:
+            m2["images"] = bin_list
+            m2.pop("images_b64", None)
+            m2.pop("images_ref", None)
+
+        out.append(m2)
+
+    if inline_ct or ref_ct:
+        _log(
+            "vision.attach",
+            f"🖼️ {log_prefix} inline={inline_ct} blobs={ref_ct} bytes≈{total_bytes}"
+        )
+    return out
+
+
 class _LLMStream:
     RESEND_INTERVAL = 0.6
     WINDOW_LIMIT    = 512
@@ -1018,8 +1123,16 @@ class _LLMStream:
             self._send_error(f"{type(e).__name__}: {e}", kind="exception")
 
     def _invoke_once(self, api: str) -> dict:
+        meta = {"mode":"stream","api":api}
         if api == "chat":
+            if isinstance(self.kwargs.get("messages"), list):
+                self.kwargs["messages"] = _massage_images_in_messages(
+                    self.kwargs["messages"],
+                    src_addr=self.src_addr,
+                    log_prefix=f"{self.src_addr} → {self.model}"
+                )
             return self.client.chat(model=self.model, stream=False, **self.kwargs)
+
         elif api == "generate":
             return self.client.generate(model=self.model, stream=False, **self.kwargs)
         elif api == "embed":
@@ -1046,6 +1159,12 @@ class _LLMStream:
     def _invoke_stream(self, api: str):
         meta = {"mode":"stream","api":api}
         if api == "chat":
+            if isinstance(self.kwargs.get("messages"), list):
+                self.kwargs["messages"] = _massage_images_in_messages(
+                    self.kwargs["messages"],
+                    src_addr=self.src_addr,
+                    log_prefix=f"{self.src_addr} → {self.model}"
+                )
             gen = self.client.chat(model=self.model, stream=True, **self.kwargs)
             return gen, meta
         elif api == "generate":
@@ -1110,6 +1229,154 @@ def _handle_dm(src_addr: str, body: dict):
                            "ollamaHost": OLLAMA_HOST})
         else:
             _dm(src_addr, {"event":"ctrl.error","ts":_now_ms(),"op":op,"message":"unknown op"})
+        return
+
+    # ─────────────────────────────────────────────────────
+    # BLOB multi-part ingest (client → hub)
+    # Events:
+    #  - blob.init  {id, name, mime, size, chunkSize, total, sha256?}
+    #  - blob.part  {id, seq, data}             # data = base64 chunk
+    #  - blob.done  {id}
+    #  - blob.cancel{id}
+    # Replies:
+    #  - blob.accept{id, resumeFrom:int=0}
+    #  - blob.ack   {id, seq}
+    #  - blob.ready {id, name, mime, size, sha256, url?, ref}   # ref = 'blob:<id>'
+    #  - blob.error {id, message}
+    if ev.startswith("blob."):
+        try:
+            be = ev.split(".", 1)[1]
+        except Exception:
+            be = ""
+
+        if be == "init":
+            bid = str(body.get("id") or "")
+            name = str(body.get("name") or "")
+            mime = str(body.get("mime") or "")
+            size = int(body.get("size") or 0)
+            csz  = int(body.get("chunkSize") or 0)
+            total= int(body.get("total") or 0)
+            sha  = str(body.get("sha256") or "") or None
+            if not (bid and size > 0 and csz > 0 and total > 0):
+                _dm(src_addr, {"event":"blob.error","id":bid,"message":"invalid init"})
+                return
+
+            key = _blob_key(src_addr, bid)
+            with _BLOBS_LOCK:
+                if key in _BLOBS:
+                    meta = _BLOBS[key]
+                    _blob_touch(meta)
+                    resume_from = len(meta.get("received", set()))
+                    _dm(src_addr, {"event":"blob.accept","id":bid,"resumeFrom":resume_from})
+                    return
+
+                tmp = _blob_tmp_path(bid)
+                try:
+                    # Pre-allocate (sparse is fine on most FS)
+                    with open(tmp, "wb") as f:
+                        f.truncate(size)
+                except Exception as e:
+                    _dm(src_addr, {"event":"blob.error","id":bid,"message":f"init write failed: {e}"})
+                    return
+
+                meta = {
+                    "id": bid, "name": name, "mime": mime, "size": size,
+                    "chunk": csz, "total": total, "received": set(),
+                    "created_at": time.time(), "updated_at": time.time(),
+                    "sha256_client": sha, "done": False
+                }
+                _BLOBS[key] = meta
+            _dm(src_addr, {"event":"blob.accept","id":bid,"resumeFrom":0})
+            return
+
+        if be == "part":
+            bid = str(body.get("id") or "")
+            seq = int(body.get("seq") or -1)
+            data = body.get("data")
+            key = _blob_key(src_addr, bid)
+            with _BLOBS_LOCK:
+                meta = _BLOBS.get(key)
+            if not meta or seq < 0 or seq >= meta["total"]:
+                _dm(src_addr, {"event":"blob.error","id":bid,"message":"bad part"})
+                return
+            b = _decode_b64_to_bytes(data) if isinstance(data, str) else None
+            if b is None:
+                _dm(src_addr, {"event":"blob.error","id":bid,"message":"decode fail"})
+                return
+            try:
+                off = seq * meta["chunk"]
+                with open(_blob_tmp_path(bid), "r+b") as f:
+                    f.seek(off)
+                    f.write(b)
+                with _BLOBS_LOCK:
+                    meta["received"].add(seq)
+                    _blob_touch(meta)
+                _dm(src_addr, {"event":"blob.ack","id":bid,"seq":seq})
+            except Exception as e:
+                _dm(src_addr, {"event":"blob.error","id":bid,"message":f"write fail: {e}"})
+            return
+
+        if be == "done":
+            bid = str(body.get("id") or "")
+            key = _blob_key(src_addr, bid)
+            with _BLOBS_LOCK:
+                meta = _BLOBS.get(key)
+            if not meta:
+                _dm(src_addr, {"event":"blob.error","id":bid,"message":"unknown id"})
+                return
+            missing = [i for i in range(meta["total"]) if i not in meta["received"]]
+            if missing:
+                _dm(src_addr, {"event":"blob.error","id":bid,"message":f"missing parts: {len(missing)}"})
+                return
+            # finalize
+            try:
+                tmp = _blob_tmp_path(bid)
+                final = _blob_path(bid)
+                tmp.replace(final)
+                # verify hash if client provided one
+                sha_hex = None
+                try:
+                    import hashlib
+                    sha = hashlib.sha256()
+                    with open(final, "rb") as f:
+                        for chunk in iter(lambda: f.read(1024*1024), b""):
+                            sha.update(chunk)
+                    sha_hex = sha.hexdigest()
+                except Exception:
+                    pass
+                with _BLOBS_LOCK:
+                    meta["done"] = True
+                    meta["sha256"] = sha_hex
+                    _blob_touch(meta)
+                _dm(src_addr, {
+                    "event":"blob.ready",
+                    "id": bid,
+                    "ref": f"blob:{bid}",
+                    "name": meta["name"],
+                    "mime": meta["mime"],
+                    "size": meta["size"],
+                    "sha256": sha_hex
+                })
+            except Exception as e:
+                _dm(src_addr, {"event":"blob.error","id":bid,"message":f"finalize fail: {e}"})
+            return
+
+        if be == "cancel":
+            bid = str(body.get("id") or "")
+            key = _blob_key(src_addr, bid)
+            with _BLOBS_LOCK:
+                meta = _BLOBS.pop(key, None)
+            try:
+                if meta:
+                    _blob_tmp_path(bid).unlink(missing_ok=True)
+                    _blob_path(bid).unlink(missing_ok=True)
+            except Exception:
+                pass
+            _dm(src_addr, {"event":"blob.ack","id":bid,"seq":-1})
+            return
+
+        # Unknown blob subevent
+        _dm(src_addr, {"event":"blob.error","id":body.get("id"),"message":"unknown blob op"})
         return
 
     # Sessions
@@ -1190,10 +1457,35 @@ def _handle_dm(src_addr: str, body: dict):
                 return
             _append_user(src_addr, sid, delta)
             req_messages = _build_chat_messages(s, new_user=None)
+
+            imgs_b64 = body.get("images") or body.get("images_b64")
+            imgs_ref = body.get("images_ref")
+
+            if (imgs_b64 or imgs_ref) and isinstance(req_messages, list) and req_messages:
+                # attach to the last user message
+                for j in range(len(req_messages) - 1, -1, -1):
+                    if req_messages[j].get("role") == "user":
+                        if imgs_b64: req_messages[j]["images_b64"] = imgs_b64
+                        if imgs_ref: req_messages[j]["images_ref"] = imgs_ref
+                        b64_ct = len(imgs_b64 or [])
+                        ref_ct = len(imgs_ref or [])
+                        _log("vision.recv", f"📥 {src_addr} sid={sid} b64={b64_ct} blobs={ref_ct}")
+                        break
+
+            # NEW: if caller included images, attach to the last user message
+            imgs_b64 = body.get("images") or body.get("images_b64")
+            if imgs_b64 and isinstance(req_messages, list) and req_messages:
+                for j in range(len(req_messages) - 1, -1, -1):
+                    if req_messages[j].get("role") == "user":
+                        # leave as base64 here; conversion → bytes happens in _invoke_* via _massage_images_in_messages
+                        req_messages[j]["images_b64"] = imgs_b64
+                        break
+
             opts = _merge_options(s, (kwargs.get("options") or {}))
             call_kwargs = dict(kwargs)
             call_kwargs["messages"] = req_messages
             call_kwargs["options"]  = opts
+
 
             def on_start():
                 if stream:
