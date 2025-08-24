@@ -4,7 +4,7 @@
 <head>
   <meta charset="utf-8" />
   <title>NKN Client — LLM Chat</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
 
   <meta name="theme-color" content="#000" />
   <!-- NKN SDK -->
@@ -134,11 +134,17 @@
       outline: none;
     }
 
+    a {
+      color: #00ffff;
+      text-decoration: unset;
+      font-weight: bold;
+    }
+
     header {
       max-height: 400px;
       grid-area: top;
       display: flex;
-      justify-content: space-between;
+      justify-content: flex-start;
       align-items: center;
       flex-flow: wrap;
       gap: 10px;
@@ -168,7 +174,7 @@
       border-radius: 8px;
       line-height: 1;
       height: 38px;
-      max-width: calc(100vw - 154px);
+      max-width: calc(100vw - 168px);
     }
 
     .chip {
@@ -289,7 +295,6 @@
     }
 
     .sysedit {
-      padding: 12px;
       border-bottom: 1px solid #141414;
       background: #050505;
       box-sizing: border-box;
@@ -318,7 +323,10 @@
       border: 1px solid #2a2a2a;
       color: #fff5;
       border-radius: 12px;
-      padding: 10px
+      padding: 10px;
+      field-sizing: content;
+      max-height: calc(80vh - 80px);
+
     }
 
     .sysinput:focus {
@@ -334,12 +342,14 @@
       flex: 1;
       overflow: auto;
       padding: 16px;
-      max-height: calc(100vh - 180px);
+      max-height: calc(100vh - 80px);
       scroll-behavior: smooth
     }
 
     .msg {
       max-width: 900px;
+      display: flex;
+      flex-flow: column;
       margin: 0 auto 14px auto;
       padding: 12px 14px;
       border-radius: 14px;
@@ -437,6 +447,7 @@
     #systemToggleBtn {
       color: #2a2a2a;
       border-color: #2a2a2a;
+      margin-left: auto;
     }
 
     .btnSq {
@@ -474,6 +485,13 @@
 
     .btn:active {
       transform: translateY(1px)
+    }
+
+    #connText {
+      display: flex;
+      flex-flow: column;
+      justify-content: center;
+      ;
     }
 
     @keyframes dotdotdot {
@@ -529,6 +547,11 @@
 
     }
 
+    #modelCaps {
+      margin-right: auto;
+      display: none;
+    }
+
     .sendButton {
       background: transparent;
       border: unset;
@@ -541,8 +564,12 @@
 
     .row {
       display: flex;
+      flex-flow: row;
       gap: 8px;
-      align-items: center
+    }
+
+    .between {
+      justify-content: space-between;
     }
 
     .muted {
@@ -554,6 +581,16 @@
       position: fixed;
       inset: 0;
       display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+      backdrop-filter: blur(10px);
+    }
+
+    .overlaySys {
+      position: fixed;
+      display: flex;
+      inset: 0;
       align-items: center;
       justify-content: center;
       z-index: 50;
@@ -575,7 +612,7 @@
 
     .modal>.row {
       display: flex;
-      justify-content: flex-start;
+      justify-content: space-between;
     }
 
     .field {
@@ -610,7 +647,6 @@
     }
 
     .modal .row {
-      justify-content: flex-end;
       margin-top: 10px
     }
 
@@ -649,6 +685,15 @@
     }
 
     .backdropModal {
+      height: 100vh;
+      width: 100vw;
+      position: fixed;
+      top: 0px;
+      left: 0px;
+      z-index: -1;
+    }
+
+    .sysBackdrop {
       height: 100vh;
       width: 100vw;
       position: fixed;
@@ -713,6 +758,21 @@
         <option style="text-align:center;">Loading Models</option>
       </select>
 
+      <div id="modelCaps" class="row"></div>
+
+
+      <button id="systemToggleBtn" class="gear btnSq"><svg width="16px" height="16px" viewBox="0 0 24 24" fill="none"
+          xmlns="http://www.w3.org/2000/svg">
+          <path
+            d="M3 7.2C3 6.07989 3 5.51984 3.21799 5.09202C3.40973 4.71569 3.71569 4.40973 4.09202 4.21799C4.51984 4 5.0799 4 6.2 4H17.8C18.9201 4 19.4802 4 19.908 4.21799C20.2843 4.40973 20.5903 4.71569 20.782 5.09202C21 5.51984 21 6.0799 21 7.2V20L17.6757 18.3378C17.4237 18.2118 17.2977 18.1488 17.1656 18.1044C17.0484 18.065 16.9277 18.0365 16.8052 18.0193C16.6672 18 16.5263 18 16.2446 18H6.2C5.07989 18 4.51984 18 4.09202 17.782C3.71569 17.5903 3.40973 17.2843 3.21799 16.908C3 16.4802 3 15.9201 3 14.8V7.2Z"
+            stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          <path
+            d="M8.40499 12.675C8.44031 12.4984 8.45796 12.4101 8.49025 12.3278C8.51891 12.2547 8.55608 12.1853 8.60098 12.1209C8.65157 12.0484 8.71523 11.9847 8.84255 11.8574L13 7.69995C13.5523 7.14767 14.4477 7.14767 15 7.69995C15.5523 8.25224 15.5523 9.14767 15 9.69995L10.8426 13.8574C10.7152 13.9847 10.6516 14.0484 10.579 14.099C10.5147 14.1439 10.4452 14.181 10.3721 14.2097C10.2898 14.242 10.2015 14.2596 10.025 14.295L8 14.7L8.40499 12.675Z"
+            stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+        </svg></button>
+
+
+
       <button id="settingsBtn" class="gear btnSq" aria-label="Settings">
         <!-- (icon unchanged) -->
         <svg width="16px" height="16px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -738,25 +798,6 @@
     </aside>
 
     <main class="col-main">
-      <div class="sysedit">
-        <!-- Collapsed default: a button (you'll style it) -->
-        <button id="systemToggleBtn" class="btn">System Message</button>
-
-        <!-- Revealed editor -->
-        <div id="systemEditorWrap" class="hide">
-          <textarea id="systemMsg" class="sysinput"
-            placeholder="(Optional) e.g. 'You are a concise assistant. Answer with short bullets.'"></textarea>
-
-          <div class="row" id="systemActions" style="margin-top:8px">
-
-            <button id="sysGenBtn" class="btn" type="button">Generate</button>
-            <button id="sysSaveBtn" class="btn" type="button">Save</button>
-            <button id="systemToggleBtnInside" class="btn">Close</button>
-
-          </div>
-        </div>
-
-      </div>
 
       <div id="chat" class="chat"></div>
 
@@ -770,6 +811,31 @@
           </svg></button>
       </div>
     </main>
+  </div>
+
+  <div class="overlaySys hide" id="systemEditorWrap">
+    <div class="modal">
+      <textarea id="systemMsg" class="sysinput"
+        placeholder="(Optional) e.g. 'You are a concise assistant. Answer with short bullets.'"></textarea>
+
+      <div class="row between" id="systemActions" style="margin-top:8px">
+
+        <button id="sysGenBtn" class="btn" type="button"><svg width="24px" height="24px" viewBox="0 0 24 24" fill="none"
+            xmlns="http://www.w3.org/2000/svg">
+            <path
+              d="M5 16V20M6 4V8M7 18H3M8 6H4M13 4L14.7528 8.44437C14.9407 8.92083 15.0347 9.15906 15.1786 9.35994C15.3061 9.538 15.462 9.69391 15.6401 9.82143C15.8409 9.9653 16.0792 10.0593 16.5556 10.2472L21 12L16.5556 13.7528C16.0792 13.9407 15.8409 14.0347 15.6401 14.1786C15.462 14.3061 15.3061 14.462 15.1786 14.6401C15.0347 14.8409 14.9407 15.0792 14.7528 15.5556L13 20L11.2472 15.5556C11.0593 15.0792 10.9653 14.8409 10.8214 14.6401C10.6939 14.462 10.538 14.3061 10.3599 14.1786C10.1591 14.0347 9.92083 13.9407 9.44437 13.7528L5 12L9.44437 10.2472C9.92083 10.0593 10.1591 9.9653 10.3599 9.82143C10.538 9.69391 10.6939 9.538 10.8214 9.35994C10.9653 9.15906 11.0593 8.92083 11.2472 8.44437L13 4Z"
+              stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg></button>
+        <button id="sysSaveBtn" class="btn" type="button"><svg width="24px" height="24px" viewBox="0 0 24 24"
+            fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path
+              d="M9 11.2222L10.8462 13L15 9M21 20L17.6757 18.3378C17.4237 18.2118 17.2977 18.1488 17.1656 18.1044C17.0484 18.065 16.9277 18.0365 16.8052 18.0193C16.6672 18 16.5263 18 16.2446 18H6.2C5.07989 18 4.51984 18 4.09202 17.782C3.71569 17.5903 3.40973 17.2843 3.21799 16.908C3 16.4802 3 15.9201 3 14.8V7.2C3 6.07989 3 5.51984 3.21799 5.09202C3.40973 4.71569 3.71569 4.40973 4.09202 4.21799C4.51984 4 5.0799 4 6.2 4H17.8C18.9201 4 19.4802 4 19.908 4.21799C20.2843 4.40973 20.5903 4.71569 20.782 5.09202C21 5.51984 21 6.0799 21 7.2V20Z"
+              stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg></button>
+      </div>
+    </div>
+    <div id="systemToggleBtnInside" class="sysBackdrop"></div>
+
   </div>
 
   <!-- Settings Modal -->
@@ -995,6 +1061,25 @@
 
     // Sessions
     let sessions = loadJSON(STORAGE.SESS, []);
+
+    // ── MIGRATION: normalize any message roles that were accidentally set to the model name.
+    (function migrateSessionRoles() {
+      let dirty = false;
+      for (const s of (sessions || [])) {
+        for (const m of (s?.messages || [])) {
+          // Keep a copy of the old value if it wasn't one of the canonical roles
+          if (m && typeof m.role === 'string' &&
+            m.role !== 'user' && m.role !== 'assistant' && m.role !== 'system') {
+            // Preserve who answered (for display/debug) without breaking role semantics
+            if (!m.agent) m.agent = m.role; // e.g., "gemma3:4b"
+            m.role = 'assistant';
+            dirty = true;
+          }
+        }
+      }
+      if (dirty) saveJSON(STORAGE.SESS, sessions);
+    })();
+
     let activeSessionId = (sessions[0]?.id) || null;
 
     const getSavedModel = () => localStorage.getItem(STORAGE.LAST_MODEL) || (sessions[0]?.model || '');
@@ -1111,9 +1196,19 @@
       const s = getSession(); const box = el('chat'); box.innerHTML = '';
       if (!s) { box.innerHTML = `<div class="muted" style="text-align:center;margin-top:30px">Choose a model above to create a session.</div>`; return; }
       s.messages.forEach(m => {
-        const w = document.createElement('div'); w.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+        const w = document.createElement('div');
+        // Keep canonical CSS classes
+        w.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+
         const contentHtml = messageHtml(m.role, m.content);
-        w.innerHTML = `<div class="meta">${m.role} • ${new Date(m.ts).toLocaleTimeString()}</div><div class="content">${contentHtml}</div>`;
+
+        // Show model label for assistant messages (prefer per-message agent, else session model)
+        const whoLabel = (m.role === 'user')
+          ? 'user'
+          : (m.agent || s.model || 'assistant');
+
+        w.innerHTML = `<div class="meta">${whoLabel} • ${new Date(m.ts).toLocaleTimeString()}</div>
+                      <div class="content">${contentHtml}</div>`;
         box.appendChild(w);
         highlightIn(w);
       });
@@ -1123,7 +1218,7 @@
     function addStreamingAssistantBubble() {
       const s = getSession(); if (!s) return;
       const w = document.createElement('div'); w.className = 'msg assistant'; w.dataset.stream = '1';
-      w.innerHTML = `<div class="meta">assistant • streaming…</div><div class="content" id="streamContent"></div>`;
+      w.innerHTML = `<div class="meta">` + s.model + ` • streaming…</div><div class="content" id="streamContent"></div>`;
       el('chat').appendChild(w); el('chat').scrollTop = el('chat').scrollHeight;
     }
     function setStreamingContent(text) {
@@ -1136,7 +1231,8 @@
     }
     function finishStreamingBubble() {
       const c = el('streamContent'); if (c) { c.removeAttribute('id'); }
-      const m = document.querySelector('.msg.assistant[data-stream="1"] .meta'); if (m) m.textContent = 'assistant • done';
+      const s = getSession();
+      const m = document.querySelector('.msg.assistant[data-stream="1"] .meta'); if (m) m.textContent = s.model + ' • done';
       const w = document.querySelector('.msg.assistant[data-stream="1"]'); if (w) w.dataset.stream = '0';
     }
 
@@ -1164,10 +1260,23 @@
         if (toggleIn) toggleIn.classList.add('hide');
       }
     }
+    const sparkle = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none"
+            xmlns="http://www.w3.org/2000/svg">
+            <path
+              d="M5 16V20M6 4V8M7 18H3M8 6H4M13 4L14.7528 8.44437C14.9407 8.92083 15.0347 9.15906 15.1786 9.35994C15.3061 9.538 15.462 9.69391 15.6401 9.82143C15.8409 9.9653 16.0792 10.0593 16.5556 10.2472L21 12L16.5556 13.7528C16.0792 13.9407 15.8409 14.0347 15.6401 14.1786C15.462 14.3061 15.3061 14.462 15.1786 14.6401C15.0347 14.8409 14.9407 15.0792 14.7528 15.5556L13 20L11.2472 15.5556C11.0593 15.0792 10.9653 14.8409 10.8214 14.6401C10.6939 14.462 10.538 14.3061 10.3599 14.1786C10.1591 14.0347 9.92083 13.9407 9.44437 13.7528L5 12L9.44437 10.2472C9.92083 10.0593 10.1591 9.9653 10.3599 9.82143C10.538 9.69391 10.6939 9.538 10.8214 9.35994C10.9653 9.15906 11.0593 8.92083 11.2472 8.44437L13 4Z"
+              stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>`
+
+    const generating = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none"
+            xmlns="http://www.w3.org/2000/svg">
+            <path
+              d="M5 16V20M6 4V8M7 18H3M8 6H4M13 4L14.7528 8.44437C14.9407 8.92083 15.0347 9.15906 15.1786 9.35994C15.3061 9.538 15.462 9.69391 15.6401 9.82143C15.8409 9.9653 16.0792 10.0593 16.5556 10.2472L21 12L16.5556 13.7528C16.0792 13.9407 15.8409 14.0347 15.6401 14.1786C15.462 14.3061 15.3061 14.462 15.1786 14.6401C15.0347 14.8409 14.9407 15.0792 14.7528 15.5556L13 20L11.2472 15.5556C11.0593 15.0792 10.9653 14.8409 10.8214 14.6401C10.6939 14.462 10.538 14.3061 10.3599 14.1786C10.1591 14.0347 9.92083 13.9407 9.44437 13.7528L5 12L9.44437 10.2472C9.92083 10.0593 10.1591 9.9653 10.3599 9.82143C10.538 9.69391 10.6939 9.538 10.8214 9.35994C10.9653 9.15906 11.0593 8.92083 11.2472 8.44437L13 4Z"
+              stroke="#ffcc00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>`
     function setSysGenBusy(isBusy) {
       const b = el('sysGenBtn'); if (!b) return;
       b.disabled = !!isBusy;
-      b.textContent = isBusy ? 'Generating…' : 'Generate';
+      b.innerHTML = isBusy ? generating : sparkle;
     }
 
     function asHtml(html) {
@@ -1183,6 +1292,11 @@
     const RECONNECTING_HTML = asHtml(`<svg style="animation: spin 1s linear infinite;" width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
 <path d="M9 3.51221C5.50442 4.74772 3 8.08143 3 12.0001C3 16.9707 7.02944 21.0001 12 21.0001C16.9706 21.0001 21 16.9707 21 12.0001C21 8.08143 18.4956 4.74772 15 3.51221" stroke="#00aaff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`);
+
+    const CONNECTFAIL_HTML = asHtml(`<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M12 17.0001H12.01M12 10.0001V14.0001M6.41209 21.0001H17.588C19.3696 21.0001 20.2604 21.0001 20.783 20.6254C21.2389 20.2985 21.5365 19.7951 21.6033 19.238C21.6798 18.5996 21.2505 17.819 20.3918 16.2579L14.8039 6.09805C13.8897 4.4359 13.4326 3.60482 12.8286 3.32987C12.3022 3.09024 11.6978 3.09024 11.1714 3.32987C10.5674 3.60482 10.1103 4.4359 9.19614 6.09805L3.6082 16.2579C2.74959 17.819 2.32028 18.5996 2.39677 19.238C2.46351 19.7951 2.76116 20.2985 3.21709 20.6254C3.7396 21.0001 4.63043 21.0001 6.41209 21.0001Z" stroke="#ff0000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`);
+
 
     const CHECK_HTML = asHtml(`<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
 <path d="M21 12C21 16.9706 16.9706 21 12 21M21 12C21 7.02944 16.9706 3 12 3M21 12C21 13.6569 16.9706 15 12 15C7.02944 15 3 13.6569 3 12M21 12C21 10.3431 16.9706 9 12 9C7.02944 9 3 10.3431 3 12M12 21C7.02944 21 3 16.9706 3 12M12 21C10.3431 21 9 16.9706 9 12C9 7.02944 10.3431 3 12 3M12 21C13.6569 21 15 16.9706 15 12C15 7.02944 13.6569 3 12 3M3 12C3 7.02944 7.02944 3 12 3" stroke="#00ff00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -1255,7 +1369,7 @@
     }
 
     // ─────────── Generic stream routing
-    const ROUTES = new Map();          // reqId -> { sink:'chat'|'element', elId?, mode?, format?, lock? }
+    const ROUTES = new Map();          // reqId -> { sink:'chat'|'element'|'callback', elId?, mode?, format?, lock?, cb? }
     const streamingElements = new Set(); // element ids being streamed into (to suppress autosaves)
 
     function resolveEl(elOrId) { return typeof elOrId === 'string' ? document.getElementById(elOrId) : elOrId; }
@@ -1435,6 +1549,7 @@
     let modelsLastSeenAt = 0;            // ms
     let modelsSeenThisSession = 0;       // count of successful updates this page load
 
+
     function setModelsUIState(ready) {
       const sel = el('modelSelect');
       const newBtn = el('newSessionBtn');
@@ -1510,7 +1625,7 @@
       showModelsLoading();
       modelsInFlight = false;
       modelsLoaded = false;
-      modelsRetryBackoff = 800;
+      modelsRetryBackoff = 500;
       requestModelsList(true);
     }
 
@@ -1567,11 +1682,18 @@
         sel.value = sel.options[0].value;
       }
 
+      // NEW: fetch details for the currently selected model
+      if (sel.value && isValidModelName(sel.value)) {
+        updateModelInfo(sel.value);
+      }
+
+
       // Creating a session is only allowed when the selection is valid.
       sel.onchange = () => {
         const model = sel.value;
         if (isValidModelName(model)) {
           setSavedModel(model);
+          updateModelInfo(model);       // ← NEW: fetch and render model details
           createSessionForModel(model);
         } else if (availableModels[0]) {
           sel.value = availableModels[0];
@@ -1581,10 +1703,108 @@
       showModelDropdown(true);
     }
 
+    // ── Model "show" helpers ─────────────────────────────────────────────
+    function normalizeModelShow(model, raw) {
+      const data = raw || {};
+      const det = data.details || {};
+      const lower = (s) => String(s || '').toLowerCase();
+
+      // Parse parameters string like "num_ctx=4096 temperature=0.2"
+      const paramsObj = {};
+      if (typeof data.parameters === 'string') {
+        data.parameters.split(/\s+/).forEach(tok => {
+          const [k, v] = tok.split('=');
+          if (k && v !== undefined) paramsObj[k.trim()] = v.trim();
+        });
+      }
+      const param = (k, d = null) => {
+        if (paramsObj[k] == null) return d;
+        const n = Number(paramsObj[k]);
+        return Number.isFinite(n) ? n : paramsObj[k];
+      };
+
+      const names = [
+        lower(model),
+        lower(det.family),
+        ...(Array.isArray(det.families) ? det.families.map(lower) : [])
+      ].join(' ');
+
+      const vision = /(llava|bakllava|vision|\bvl\b|moondream|qwen.*vl|idefics|blip|kosmos|xcomposer|minicpm-v)/i.test(names);
+      const embedding = /(embed|embedding|nomic|e5|bge|gte|all-minilm)/i.test(names);
+
+      return {
+        name: data.model || model,
+        modified_at: data.modified_at || null,
+        format: det.format || null,
+        family: det.family || null,
+        families: det.families || [],
+        parameter_size: det.parameter_size || null,
+        quantization: det.quantization || null,
+        num_ctx: param('num_ctx', null) || det.num_ctx || null,
+        temperature: param('temperature', null),
+        license: data.license || null,
+        capabilities: {
+          chat: true,
+          vision,
+          embedding,
+          function_calling: false, // Ollama show() doesn't advertise this; keep false
+        },
+        raw: data,
+      };
+    }
+
+    function renderModelInfo(info) {
+      const row = el('modelCaps'); if (!row) return;
+      const chips = [];
+
+      // Capability chips
+      if (info.capabilities.vision) chips.push('<div class="chip">Vision</div>');
+      if (info.capabilities.embedding) chips.push('<div class="chip">Embeddings</div>');
+      if (!info.capabilities.vision && !info.capabilities.embedding) chips.push('<div class="chip">Text-only</div>');
+
+      // Meta chips
+      if (info.parameter_size) chips.push(`<div class="chip">Size: ${info.parameter_size}</div>`);
+      if (info.quantization) chips.push(`<div class="chip">Quant: ${info.quantization}</div>`);
+      if (info.num_ctx) chips.push(`<div class="chip">Context: ${info.num_ctx}</div>`);
+
+      row.innerHTML = chips.join(' ');
+    }
+
+    function fetchModelInfo(model, cb) {
+      if (!model) { cb && cb({ ok: false, error: 'missing model' }); return; }
+      const id = `show:${model}:${Date.now()}`;
+      registerRoute(id, { sink: 'callback', cb });
+      requestLLM({
+        event: 'llm.request',
+        id,
+        api: 'show',
+        model,
+        stream: false
+      });
+    }
+
+    function updateModelInfo(model) {
+      // optional: show a tiny shimmer / placeholder
+      const row = el('modelCaps'); if (row) row.innerHTML = '';
+      fetchModelInfo(model, (res) => {
+        if (!res.ok) { /* optionally show an error chip */ return; }
+        const data = res.body && (res.body.data || res.body) || {};
+        const info = normalizeModelShow(model, data);
+        renderModelInfo(info);
+
+        // If later you add an image attachment button, you can gate it here:
+        // toggleImageAttach(info.capabilities.vision);
+      });
+    }
+
 
     // Build history for seeding (exclude 'system'; it's sent separately)
-    function buildHistoryForSession(sess) { return (sess?.messages || []).map(m => ({ role: m.role, content: m.content })); }
-
+    function buildHistoryForSession(sess) {
+      return (sess?.messages || []).map(m => {
+        const role = (m.role === 'user' || m.role === 'assistant' || m.role === 'system') ? m.role : 'assistant';
+        return { role, content: m.content };
+      });
+    }
     // Session control → hub
     function currentOptions() { return { temperature: settings.temperature, top_p: settings.top_p, seed: settings.seed, num_ctx: settings.num_ctx }; }
     function sendSessionOpen(s, seed) {
@@ -1630,6 +1850,16 @@
       }, HEARTBEAT_MS);
     }
 
+    document.addEventListener('dblclick', function (e) {
+      e.preventDefault();
+    });
+
+    document.addEventListener('touchmove', function (event) {
+      // Check if there are two or more touch points
+      if (event.touches.length > 1) {
+        event.preventDefault(); // Stop the browser from zooming
+      }
+    }, { passive: false });
 
     window.addEventListener('unhandledrejection', (e) => {
       const s = String(e.reason && e.reason.message || e.reason || '');
@@ -1683,7 +1913,7 @@
         // Let hub know we're up (fire-and-forget, long holding)
         trySend(HUB_ADDR, { event: 'announce' }, { noReply: true, msgHoldingSeconds: 600 });
 
-        // Kick model load once per connect
+        // Kick model load once per connect 
         if (clearLabelTimer) clearTimeout(clearLabelTimer);
         if (modelRevealTimer) clearTimeout(modelRevealTimer);
         clearLabelTimer = setTimeout(() => {
@@ -1717,7 +1947,7 @@
       client.on('connectFailed', () => {
         isConnecting = false;
         isConnected = false;
-        setConn('red', 'Connect failed');
+        setConn(CONNECTFAIL_HTML);
         setTimeout(connectNKN, 1200 + Math.random() * 600); // jittered retry
       });
       client.on('close', () => {
@@ -1928,6 +2158,15 @@
         }
 
         if (ev === 'llm.result') {
+          const route = routeFor(body.id);
+
+          // NEW: callback sink
+          if (route.sink === 'callback' && typeof route.cb === 'function') {
+            try { route.cb({ ok: true, body }); } catch { }
+            clearRoute(body.id);
+            return;
+          }
+
           if (route.sink === 'element') {
             const elx = resolveEl(route.elId);
             const text = extractFull(body.data) || '';
@@ -1949,15 +2188,30 @@
             clearRoute(body.id);
             return;
           }
+
           const sess = getSession(); if (!sess) return;
-          const text = extractFull(body.data);
-          appendMessage(sess.id, 'assistant', text);
+
+          // If this looks like an ollama.show() payload, display ONLY capabilities
+          const line = formatCapabilitiesLine(body.data);
+          console.log(line)
+          //appendMessage(sess.id, 'assistant', line);
+
           renderChat();
           clearRoute(body.id);
           return;
         }
 
+
         if (ev === 'llm.error') {
+          const route = routeFor(body.id);
+
+          // NEW: callback sink
+          if (route.sink === 'callback' && typeof route.cb === 'function') {
+            try { route.cb({ ok: false, body }); } catch { }
+            clearRoute(body.id);
+            return;
+          }
+
           if (body.kind === 'models' || (body.id && String(body.id).startsWith('models'))) {
             modelsInFlight = false;
             modelsLoaded = false;
@@ -1984,6 +2238,7 @@
           clearRoute(body.id);
           return;
         }
+
       } catch (err) {
         console.warn('[onInbound] swallowed error', err);
       }
@@ -2001,6 +2256,31 @@
       if (typeof obj?.response === 'string') return obj.response;
       try { return JSON.stringify(obj); } catch { return String(obj); }
     }
+
+    // Heuristic: does this look like an `ollama.show()` payload?
+    function isLikelyModelShowPayload(d) {
+      if (!d || typeof d !== 'object') return false;
+      // server may wrap as { data: {...} } or send raw {...}
+      const obj = d.data && typeof d.data === 'object' ? d.data : d;
+      return !!(obj.capabilities || obj.modelfile || obj.details || obj.modelinfo);
+    }
+
+    // Pull ONLY the `capabilities` key as a string list
+    function extractCapabilitiesOnly(d) {
+      const obj = d && typeof d === 'object' && d.data && typeof d.data === 'object' ? d.data : d;
+      const caps = Array.isArray(obj?.capabilities) ? obj.capabilities : [];
+      // normalize to unique, lowercase → display-case
+      const shown = Array.from(new Set(caps.map(s => String(s || '').trim().toLowerCase())))
+        .filter(Boolean)
+        .map(s => s.charAt(0).toUpperCase() + s.slice(1));
+      return shown;
+    }
+
+    function formatCapabilitiesLine(d) {
+      const caps = extractCapabilitiesOnly(d);
+      return 'Capabilities: ' + (caps.length ? caps.join(', ') : '—');
+    }
+
 
     // Compose & send (DELTA MODE) — uses router with default 'chat' sink (queue-aware)
     function sendPrompt() {
@@ -2025,10 +2305,10 @@
       });
     }
 
-    const playSign = `<svg width="32px" height="32px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+    const playSign = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
 <path d="M16.6582 9.28638C18.098 10.1862 18.8178 10.6361 19.0647 11.2122C19.2803 11.7152 19.2803 12.2847 19.0647 12.7878C18.8178 13.3638 18.098 13.8137 16.6582 14.7136L9.896 18.94C8.29805 19.9387 7.49907 20.4381 6.83973 20.385C6.26501 20.3388 5.73818 20.0469 5.3944 19.584C5 19.053 5 18.1108 5 16.2264V7.77357C5 5.88919 5 4.94701 5.3944 4.41598C5.73818 3.9531 6.26501 3.66111 6.83973 3.6149C7.49907 3.5619 8.29805 4.06126 9.896 5.05998L16.6582 9.28638Z" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/>
 </svg>`;
-    const stopSign = `<svg width="32px" height="32px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+    const stopSign = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
 <rect x="4" y="4" width="16" height="16" rx="2" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
 
