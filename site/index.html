@@ -569,6 +569,38 @@
       display: none;
     }
 
+    .thumb {
+      position: relative;
+      width: 54px;
+      height: 54px;
+      border-radius: 8px;
+      border: 1px solid #2a2a2a;
+      overflow: hidden;
+      margin-right: 6px;
+    }
+
+    .thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .thumb .x {
+      position: absolute;
+      top: -6px;
+      right: -6px;
+      background: #111;
+      border: 1px solid #2a2a2a;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      font-size: 12px;
+      line-height: 16px;
+      text-align: center;
+      cursor: pointer;
+    }
+
     .sendButton {
       background: transparent;
       border: unset;
@@ -819,7 +851,16 @@
       <div id="chat" class="chat"></div>
 
       <div class="composer">
+        <!-- NEW: attachments preview row -->
+        <div id="attachPreview" class="row" style="align-items:center; flex-wrap:wrap;"></div>
+
+        <!-- existing -->
         <textarea id="prompt" class="input" placeholder="Type a message… (Shift+Enter = newline)"></textarea>
+
+        <!-- NEW: attach button and hidden input -->
+        <button id="attachBtn" class="gear btnSq" title="Attach images" style="display:none;">📎</button>
+        <input id="fileInput" type="file" accept="image/*" multiple class="hide" />
+
         <button id="sendBtn" class="sendButton"><svg width="16px" height="16px" viewBox="0 0 24 24" fill="none"
             xmlns="http://www.w3.org/2000/svg">
             <path
@@ -1003,13 +1044,70 @@
       HUB: 'CLIENT_HUB_ADDR_V2',
       LEGACY_SEED: 'PEERBALLS_SEED_HEX',
       LEGACY_HUB: 'PEERBALLS_HUB_ADDR',
-      LAST_MODEL: 'CLIENT_LAST_SELECTED_MODEL_V2'
+      LAST_MODEL: 'CLIENT_LAST_SELECTED_MODEL_V2',
+      MODELINFO: 'CLIENT_MODEL_INFO_CACHE_V1'      // ← NEW
     };
+
 
     function loadJSON(key, fallback) {
       try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch { return fallback; }
     }
     function saveJSON(key, val) { localStorage.setItem(key, JSON.stringify(val)); }
+
+    // ── Model info cache (caps etc.) ──────────────────────────────────────────
+    const MODEL_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+    const MODEL_CACHE_MAX = 50;
+
+    let modelInfoCache = loadJSON(STORAGE.MODELINFO, {}); // { [model]: { ...info, _cachedAt } }
+
+    function cacheSetModelInfo(model, info) {
+      if (!model || !info) return;
+      // keep it lean: store only what we render / use
+      const slim = {
+        name: info.name || model,
+        format: info.format || null,
+        parameter_size: info.parameter_size || null,
+        quantization: info.quantization || null,
+        num_ctx: info.num_ctx || null,
+        capabilities: Array.isArray(info.capabilities) ? info.capabilities.map(String) : [],
+        modified_at: info.modified_at || null,
+        _cachedAt: Date.now()
+      };
+      modelInfoCache[model] = slim;
+
+      // LRU-ish cap
+      const keys = Object.keys(modelInfoCache);
+      if (keys.length > MODEL_CACHE_MAX) {
+        keys
+          .map(k => [k, modelInfoCache[k]?._cachedAt || 0])
+          .sort((a, b) => a[1] - b[1])
+          .slice(0, keys.length - MODEL_CACHE_MAX)
+          .forEach(([k]) => delete modelInfoCache[k]);
+      }
+      saveJSON(STORAGE.MODELINFO, modelInfoCache);
+    }
+
+    function cacheGetModelInfo(model) {
+      const rec = modelInfoCache && modelInfoCache[model];
+      if (!rec) return null;
+      if ((Date.now() - (rec._cachedAt || 0)) > MODEL_CACHE_TTL_MS) {
+        delete modelInfoCache[model];
+        saveJSON(STORAGE.MODELINFO, modelInfoCache);
+        return null;
+      }
+      return rec;
+    }
+
+    function tryRenderModelInfoFromCache(model) {
+      const row = el('modelCaps'); if (row) { row.style.display = 'flex'; }
+      const info = cacheGetModelInfo(model);
+      if (!info) return false;
+      renderModelInfo(info);
+      const hasVision = Array.isArray(info.capabilities) && info.capabilities.some(c => String(c).toLowerCase() === 'vision');
+      toggleImageAttach(!!hasVision);
+      return true;
+    }
+
 
     const toHex = buf => Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
     function getOrCreateSeed() {
@@ -1099,6 +1197,23 @@
 
     let activeSessionId = (sessions[0]?.id) || null;
 
+    // ── Blob upload (chunked) ─────────────────────────────────────────────
+    const PACK_INLINE_MAX = 120 * 1024;     // <= 900KB inline (data URL)
+    const BLOB_CHUNK_SIZE = 128 * 1024;  // was 240 KiB
+    const BLOB_WINDOW = 3;                  // concurrent parts "in flight" (tune as needed)
+
+    const uploads = new Map(); // blobId -> { file, name, mime, size, total, chunkSize, nextSeq, inflight:Set, acked:Set, done, readyRef, sha256?, startedAt }
+
+    let pendingBlobRefs = [];  // refs ready to use in next message (e.g. ['blob:...'])
+
+    function abToBase64(buf) {
+      let binary = '';
+      const bytes = new Uint8Array(buf);
+      const len = bytes.byteLength;
+      for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary);
+    }
+
     const getSavedModel = () => localStorage.getItem(STORAGE.LAST_MODEL) || (sessions[0]?.model || '');
     const setSavedModel = (m) => { if (m) localStorage.setItem(STORAGE.LAST_MODEL, m); };
 
@@ -1111,17 +1226,86 @@
         '';
       return isValidModelName(candidate) ? candidate : '';
     }
+    function looksLikeModels(x) {
+      const d = x?.data ?? x;
+      return Array.isArray(d) ||
+        Array.isArray(d?.models) ||
+        Array.isArray(d?.data?.models) ||
+        Array.isArray(d?.list) ||           // some hubs use {list:[...]}
+        Array.isArray(d?.data?.list);
+    }
+
+    function newBlobId() { return 'b' + Date.now().toString(36) + Math.random().toString(16).slice(2, 10); }
+
+    async function startBlobUpload(file) {
+      const id = newBlobId();
+      const size = file.size;
+      const name = file.name || 'file';
+      const mime = file.type || 'application/octet-stream';
+      const chunkSize = BLOB_CHUNK_SIZE;
+      const total = Math.ceil(size / chunkSize);
+
+      uploads.set(id, {
+        file, name, mime, size, total, chunkSize,
+        nextSeq: 0,
+        inflight: new Set(),
+        acked: new Set(),
+        done: false,
+        readyRef: null,
+        startedAt: Date.now()
+      });
+
+      // (Optional) If you want a client hash, you can do:
+      // const buf = await file.arrayBuffer();
+      // const hash = await crypto.subtle.digest('SHA-256', buf);
+      // const shaHex = Array.from(new Uint8Array(hash)).map(b=>b.toString(16).padStart(2,'0')).join('');
+      const shaHex = undefined;
+
+      // INIT
+      trySend(HUB_ADDR, {
+        event: 'blob.init',
+        id, name, mime, size,
+        chunkSize,
+        total,
+        sha256: shaHex
+      });
+
+      return id;
+    }
+
+    async function pumpBlob(id) {
+      const up = uploads.get(id);
+      if (!up || up.done || !client || !isConnected) return;
+
+      // Fill window
+      while (up.inflight.size < BLOB_WINDOW && up.nextSeq < up.total) {
+        const seq = up.nextSeq++;
+        // slice & read this chunk
+        const start = seq * up.chunkSize;
+        const end = Math.min(up.size, start + up.chunkSize);
+        const blob = up.file.slice(start, end);
+        const buf = await blob.arrayBuffer();
+        const b64 = abToBase64(buf);
+        up.inflight.add(seq);
+
+        trySend(HUB_ADDR, { event: 'blob.part', id, seq, data: b64 }, { noReply: true });
+      }
+
+      // If all sent and nothing in flight, ask to finalize
+      if (up.nextSeq >= up.total && up.inflight.size === 0 && !up.done) {
+        trySend(HUB_ADDR, { event: 'blob.done', id });
+      }
+    }
+
+
 
     function newId(prefix = 'id') { return prefix + '-' + Math.random().toString(16).slice(2) + Date.now().toString(36); }
     function createSessionForModel(model) {
-      // HARD GUARD: do not create sessions until real models are loaded & valid
       if (!modelsLoaded || !isValidModelName(model)) {
         console.warn('[session] blocked: model list not ready or invalid model:', model);
-        // Optional UX nudge:
         try { alert('Models are not ready yet. Please wait for the list to load.'); } catch { }
         return;
       }
-
       const id = newId('sess');
       const s = { id, title: model, model, system: '', createdAt: Date.now(), messages: [] };
       sessions.unshift(s);
@@ -1133,7 +1317,11 @@
       renderSystemEditor();
       renderChat();
       sendSessionOpen(s, /*seed*/true);
+
+      // prime the UI + cache
+      updateModelInfo(model);
     }
+
     function getSession(id = activeSessionId) { return sessions.find(x => x.id === id) || null; }
     function setActiveSession(id) {
       activeSessionId = id;
@@ -1142,10 +1330,25 @@
         setSavedModel(s.model);
         const sel = el('modelSelect');
         if (sel && Array.from(sel.options).some(o => o.value === s.model)) sel.value = s.model;
+
+        // NEW: update caps row when switching sessions (no server hit if cached)
+        if (!tryRenderModelInfoFromCache(s.model)) {
+          // Only fetch if not cached (avoids repeated round-trips when hopping sessions)
+          fetchModelInfo(s.model, (res) => {
+            if (!res?.ok) return;
+            const data = (res.body && (res.body.data || res.body)) || {};
+            const info = normalizeModelShow(s.model, data);
+            renderModelInfo(info);
+            const hasVision = Array.isArray(info.capabilities) && info.capabilities.some(c => String(c).toLowerCase() === 'vision');
+            toggleImageAttach(!!hasVision);
+            cacheSetModelInfo(s.model, info);
+          });
+        }
       }
       renderSessions(); renderSystemEditor(); renderChat();
       if (s) sendSessionOpen(s, /*seed*/true);
     }
+
     function appendMessage(sessId, role, content) {
       const s = getSession(sessId); if (!s) return; s.messages.push({ role, content, ts: Date.now() }); saveJSON(STORAGE.SESS, sessions);
     }
@@ -1212,20 +1415,23 @@
     function renderChat() {
       const s = getSession(); const box = el('chat'); box.innerHTML = '';
       if (!s) { box.innerHTML = `<div class="muted" style="text-align:center;margin-top:30px">Choose a model above to create a session.</div>`; return; }
+
       s.messages.forEach(m => {
         const w = document.createElement('div');
-        // Keep canonical CSS classes
         w.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
 
         const contentHtml = messageHtml(m.role, m.content);
+        const whoLabel = (m.role === 'user') ? 'user' : (m.agent || s.model || 'assistant');
 
-        // Show model label for assistant messages (prefer per-message agent, else session model)
-        const whoLabel = (m.role === 'user')
-          ? 'user'
-          : (m.agent || s.model || 'assistant');
+        let imagesHtml = '';
+        if (Array.isArray(m.images) && m.images.length) {
+          imagesHtml = `<div class="row" style="margin-top:6px;flex-wrap:wrap;gap:6px;">` +
+            m.images.map(src => `<img src="${src}" alt="" style="width:140px;height:140px;object-fit:cover;border-radius:8px;border:1px solid #2a2a2a;">`).join('') +
+            `</div>`;
+        }
 
         w.innerHTML = `<div class="meta">${whoLabel} • ${new Date(m.ts).toLocaleTimeString()}</div>
-                      <div class="content">${contentHtml}</div>`;
+                      <div class="content">${contentHtml}</div>${imagesHtml}`;
         box.appendChild(w);
         highlightIn(w);
       });
@@ -1530,6 +1736,36 @@
     let isStreaming = false;
     const cancelledStreams = new Set();
 
+    // ── Image attachments (pending for the next user message) ────────────
+    let pendingImages = []; // [{ name, size, type, dataURL }]
+
+    function renderAttachments() {
+      const wrap = el('attachPreview'); if (!wrap) return;
+      wrap.innerHTML = '';
+      for (let i = 0; i < pendingImages.length; i++) {
+        const p = pendingImages[i];
+        const div = document.createElement('div');
+        div.className = 'thumb';
+        div.innerHTML = `<img src="${p.dataURL}" alt="">
+                        <div class="x" title="Remove">×</div>`;
+        div.querySelector('.x').onclick = () => { pendingImages.splice(i, 1); renderAttachments(); };
+        wrap.appendChild(div);
+      }
+      wrap.style.display = pendingImages.length ? 'flex' : '';
+    }
+
+    // Show/Hide the attach button based on model capability
+    function toggleImageAttach(supported) {
+      const btn = el('attachBtn');
+      if (!btn) return;
+      btn.style.display = supported ? 'flex' : 'none';
+      if (!supported) {
+        pendingImages = [];
+        renderAttachments();
+      }
+    }
+
+
     function startStream(id, onChunk) { streams.set(id, { next: 1, lastAck: 0, buffer: new Map(), onChunk }); }
     function handleChunk(id, seq, data) {
       if (cancelledStreams.has(id)) return;
@@ -1551,7 +1787,7 @@
     let clearLabelTimer = null;
     let modelsRetryTimer = null;
     let modelsRetryBackoff = 800;        // grows up to MODELS_MAX_BACKOFF_MS
-    const MODELS_MAX_BACKOFF_MS = 15000;
+    const MODELS_MAX_BACKOFF_MS = 1500;
 
     let modelsInFlight = false;
     let availableModels = [];            // canonical, de-duped, normalized names
@@ -1598,37 +1834,15 @@
       showModelDropdown(true);
     }
 
-    function showModelsLoading() {
-      const sel = el('modelSelect');
-      if (!sel) return;
-      sel.innerHTML = '<option>Loading Models…</option>';
-      sel.disabled = true;
-      showModelDropdown(true);
-    }
-
     function requestModelsList(force = false) {
       if (!HUB_ADDR || !client || !isConnected) return;
 
-      // Avoid spamming the hub unless forced or previous attempt cleared
-      if (modelsInFlight && !force) return;
-
-      modelsInFlight = true;
       const nonce = Date.now();
       lastModelsReqId = `models:${nonce}`;
 
-      // Fire both routes; echoing id helps correlation
+      // Fire both forms; hubs differ
       trySend(HUB_ADDR, { event: 'llm.request', id: lastModelsReqId, api: 'list', stream: false });
       trySend(HUB_ADDR, { event: 'ctrl.request', op: 'models', id: lastModelsReqId });
-
-      // Retry with capped backoff until we see any models response
-      if (modelsRetryTimer) clearTimeout(modelsRetryTimer);
-      modelsRetryTimer = setTimeout(() => {
-        if (!modelsLoaded) {
-          modelsInFlight = false;
-          modelsRetryBackoff = Math.min(modelsRetryBackoff * 1.6, MODELS_MAX_BACKOFF_MS);
-          requestModelsList(true);
-        }
-      }, modelsRetryBackoff);
     }
 
     function populateModels(modelsLike) {
@@ -1638,9 +1852,16 @@
       const arr = (() => {
         const d = modelsLike;
         if (Array.isArray(d)) return d;
+
         if (d && typeof d === 'object') {
           if (Array.isArray(d.models)) return d.models;
           if (d.data && Array.isArray(d.data.models)) return d.data.models;
+
+          // ← NEW: accept {list:[...]} or {data:{list:[...]}}
+          if (Array.isArray(d.list)) return d.list;
+          if (d.data && Array.isArray(d.data.list)) return d.data.list;
+
+          // ← NEW: accept {data:[...]} as a last resort
           if (Array.isArray(d.data)) return d.data;
         }
         return [];
@@ -1709,68 +1930,78 @@
     function normalizeModelShow(model, raw) {
       const data = raw || {};
       const det = data.details || {};
-      const lower = (s) => String(s || '').toLowerCase();
+      const mi = data.modelinfo || {};
 
-      // Parse parameters string like "num_ctx=4096 temperature=0.2"
+      // parse "parameters" string like: "top_p 0.95\nstop \"\"\ntemperature 1\ntop_k 64"
       const paramsObj = {};
       if (typeof data.parameters === 'string') {
-        data.parameters.split(/\s+/).forEach(tok => {
-          const [k, v] = tok.split('=');
-          if (k && v !== undefined) paramsObj[k.trim()] = v.trim();
+        data.parameters.split(/\n+/).forEach(line => {
+          const m = line.match(/^\s*([A-Za-z0-9_]+)\s+(.+?)\s*$/);
+          if (m) paramsObj[m[1]] = m[2];
         });
       }
-      const param = (k, d = null) => {
-        if (paramsObj[k] == null) return d;
-        const n = Number(paramsObj[k]);
-        return Number.isFinite(n) ? n : paramsObj[k];
+      const paramNum = (k) => {
+        const v = paramsObj[k];
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
       };
 
-      const names = [
-        lower(model),
-        lower(det.family),
-        ...(Array.isArray(det.families) ? det.families.map(lower) : [])
-      ].join(' ');
+      // prefer raw capabilities array verbatim
+      const capabilities = Array.isArray(data.capabilities) ? data.capabilities.map(String) : [];
 
-      const vision = /(llava|bakllava|vision|\bvl\b|moondream|qwen.*vl|idefics|blip|kosmos|xcomposer|minicpm-v)/i.test(names);
-      const embedding = /(embed|embedding|nomic|e5|bge|gte|all-minilm)/i.test(names);
+      // try to pull context length from modelinfo (e.g. "gemma3.context_length": 131072)
+      const ctxFromModelInfo = (() => {
+        if (!mi || typeof mi !== 'object') return null;
+        for (const [k, v] of Object.entries(mi)) {
+          if (/context_length$/i.test(k)) {
+            const n = Number(v);
+            if (Number.isFinite(n)) return n;
+          }
+        }
+        return null;
+      })();
 
       return {
         name: data.model || model,
         modified_at: data.modified_at || null,
         format: det.format || null,
         family: det.family || null,
-        families: det.families || [],
+        families: Array.isArray(det.families) ? det.families : (det.family ? [det.family] : []),
         parameter_size: det.parameter_size || null,
-        quantization: det.quantization || null,
-        num_ctx: param('num_ctx', null) || det.num_ctx || null,
-        temperature: param('temperature', null),
+        quantization: det.quantization || det.quantization_level || null,
+        num_ctx: ctxFromModelInfo || paramNum('num_ctx') || det.num_ctx || null,
         license: data.license || null,
-        capabilities: {
-          chat: true,
-          vision,
-          embedding,
-          function_calling: false, // Ollama show() doesn't advertise this; keep false
-        },
+        capabilities,          // ← raw, unmodified
         raw: data,
       };
     }
 
+
     function renderModelInfo(info) {
       const row = el('modelCaps'); if (!row) return;
+
+      const esc = (s) => String(s).replace(/[&<>"']/g, m =>
+        m === '&' ? '&amp;' : m === '<' ? '&lt;' : m === '>' ? '&gt;' : m === '"' ? '&quot;' : '&#39;'
+      );
+
       const chips = [];
 
-      // Capability chips
-      if (info.capabilities.vision) chips.push('<div class="chip">Vision</div>');
-      if (info.capabilities.embedding) chips.push('<div class="chip">Embeddings</div>');
-      if (!info.capabilities.vision && !info.capabilities.embedding) chips.push('<div class="chip">Text-only</div>');
+      // RAW capabilities from model file
+      if (Array.isArray(info.capabilities) && info.capabilities.length) {
+        for (const c of info.capabilities) chips.push(`<div class="chip">${esc(c)}</div>`);
+      } else {
+        chips.push('<div class="chip">Capabilities: —</div>');
+      }
 
-      // Meta chips
-      if (info.parameter_size) chips.push(`<div class="chip">Size: ${info.parameter_size}</div>`);
-      if (info.quantization) chips.push(`<div class="chip">Quant: ${info.quantization}</div>`);
-      if (info.num_ctx) chips.push(`<div class="chip">Context: ${info.num_ctx}</div>`);
+      // Meta chips (from details/modelinfo where available)
+      if (info.format) chips.push(`<div class="chip">Format: ${esc(info.format)}</div>`);
+      if (info.parameter_size) chips.push(`<div class="chip">Size: ${esc(info.parameter_size)}</div>`);
+      if (info.quantization) chips.push(`<div class="chip">Quant: ${esc(info.quantization)}</div>`);
+      if (info.num_ctx) chips.push(`<div class="chip">Context: ${esc(info.num_ctx)}</div>`);
 
       row.innerHTML = chips.join(' ');
     }
+
 
     function fetchModelInfo(model, cb) {
       if (!model) { cb && cb({ ok: false, error: 'missing model' }); return; }
@@ -1786,18 +2017,30 @@
     }
 
     function updateModelInfo(model) {
-      // optional: show a tiny shimmer / placeholder
-      const row = el('modelCaps'); if (row) row.innerHTML = '';
-      fetchModelInfo(model, (res) => {
-        if (!res.ok) { /* optionally show an error chip */ return; }
-        const data = res.body && (res.body.data || res.body) || {};
-        const info = normalizeModelShow(model, data);
-        renderModelInfo(info);
+      const row = el('modelCaps');
+      if (row) { row.style.display = 'flex'; row.innerHTML = ''; }
 
-        // If later you add an image attachment button, you can gate it here:
-        // toggleImageAttach(info.capabilities.vision);
+      // 1) Fast path: render from cache immediately if present
+      const hadCache = tryRenderModelInfoFromCache(model);
+
+      // 2) Always attempt a fresh fetch (keeps cache current when chosen from dropdown)
+      fetchModelInfo(model, (res) => {
+        if (!res?.ok) { return; }
+        const data = (res.body && (res.body.data || res.body)) || {};
+        const info = normalizeModelShow(model, data);
+
+        // render (may overwrite cached UI with fresher values)
+        renderModelInfo(info);
+        const hasVision = Array.isArray(info.capabilities) && info.capabilities.some(c => String(c).toLowerCase() === 'vision');
+        toggleImageAttach(!!hasVision);
+
+        // cache for later session switches
+        cacheSetModelInfo(model, info);
+
+        console.log('[model.show]', { model, info, source: hadCache ? 'cache→refreshed' : 'fresh' });
       });
     }
+
 
 
     // Build history for seeding (exclude 'system'; it's sent separately)
@@ -1830,6 +2073,11 @@
 
     function startHeartbeat() {
       if (hbTimer) clearInterval(hbTimer);
+
+      try { trySend(HUB_ADDR, { event: 'ctrl.ping', ts: Date.now() }, { noReply: true, maxHoldingSeconds: 120 }); } catch { }
+
+
+
       hbTimer = setInterval(() => {
         if (!HUB_ADDR) return;
 
@@ -1875,6 +2123,7 @@
       if (document.visibilityState === 'visible') {
         const stale = (Date.now() - lastPongAt) > HEARTBEAT_MS * 3;
         if ((!client || stale) && !isConnecting) connectNKN();
+        else if (isConnected && !modelsLoaded && !modelsInFlight) requestModelsList(true);
       }
     });
 
@@ -1908,24 +2157,21 @@
         isConnected = true;
         setConn(CHECK_HTML);
         myAddr = client.addr; updateChips();
-        setConn(CHECK_HTML);
         lastPongAt = Date.now();
         startHeartbeat();
 
-        // Let hub know we're up (fire-and-forget, long holding)
         trySend(HUB_ADDR, { event: 'announce' }, { noReply: true, msgHoldingSeconds: 600 });
 
-        // Kick model load once per connect 
-        if (clearLabelTimer) clearTimeout(clearLabelTimer);
-        if (modelRevealTimer) clearTimeout(modelRevealTimer);
-
         const s = getSession();
-        if (s) {
-          setSavedModel(s.model || getSavedModel());
-          sendSessionOpen(s, /*seed*/true);
-        }
+        if (s) { setSavedModel(s.model || getSavedModel()); sendSessionOpen(s, /*seed*/true); }
 
         flushOutbox();
+
+        // Kick models fetch now that we're definitely connected
+        requestModelsList(true);
+        setTimeout(() => {
+          if (!modelsLoaded && !modelsInFlight) requestModelsList(true);
+        }, 2500);
       });
 
       // One message funnel; onInbound will filter to the configured hub
@@ -2037,29 +2283,69 @@
           return;
         }
 
+        if (ev === 'blob.accept') {
+          const id = body.id;
+          const up = uploads.get(id);
+          if (!up) return;
+          // Optionally honor resumeFrom (we send from 0 here; you can skip already-sent)
+          pumpBlob(id);
+          return;
+        }
+
+        if (ev === 'blob.ack') {
+          const id = body.id, seq = body.seq;
+          const up = uploads.get(id);
+          if (!up) return;
+          if (seq >= 0 && up.inflight.has(seq)) {
+            up.inflight.delete(seq);
+            up.acked.add(seq);
+            // keep pumping the window
+            pumpBlob(id);
+          }
+          return;
+        }
+
+        if (ev === 'blob.error') {
+          console.warn('[blob.error]', body.id, body.message);
+          // Optionally show status near the attachment thumbnail
+          return;
+        }
+
+        if (ev === 'blob.ready') {
+          const id = body.id, ref = body.ref; // 'blob:<id>'
+          const up = uploads.get(id);
+          if (up) {
+            up.done = true;
+            up.readyRef = ref;
+            pendingBlobRefs.push(ref);
+            // Optionally mark thumbnail as "uploaded"
+          }
+          return;
+        }
         // Heartbeat pong (+ nudge models if still not loaded)
         if (ev === 'ctrl.pong') {
           lastPongAt = Date.now();
           setConn('green', '');
-          if (!modelsLoaded && !modelsInFlight) requestModelsList(true);
+          if (!modelsLoaded) requestModelsList(true); // ← no modelsInFlight guard
           return;
         }
 
-        // MODELS (handle multiple shapes, correlate id, and stop retries)
+        // MODELS (llm.* or ctrl.*)
         if (
           ev === 'llm.models' ||
-          (ev === 'llm.result' && body.id && String(body.id).startsWith('models'))
+          ev === 'ctrl.models' ||
+          ev === 'models' || // ← NEW: bare 'models' event from some hubs
+          (ev === 'llm.result' && (body?.id?.startsWith('models') || body?.kind === 'models')) ||
+          (ev === 'ctrl.result' && (body?.id?.startsWith('models') || body?.kind === 'models')) ||
+          // ← NEW: payload-only fallback (no event, just a models-shaped object/array)
+          (!ev && looksLikeModels(body))
         ) {
-          // Stop retry loop
           modelsInFlight = false;
           if (modelsRetryTimer) clearTimeout(modelsRetryTimer);
           modelsRetryBackoff = 800;
 
-          // Accept: body.data.models, body.models, or body.data
-          const payload = (body && body.data) ? body.data : body;
+          const payload = body?.data ?? body; // normalize common wrappers
           populateModels(payload);
-
-          // If still empty, keep UI visible but disabled
           return;
         }
 
@@ -2150,15 +2436,20 @@
         }
 
         if (ev === 'llm.result') {
-          const route = routeFor(body.id);
-
-          // NEW: callback sink
-          if (route.sink === 'callback' && typeof route.cb === 'function') {
-            try { route.cb({ ok: true, body }); } catch { }
+          // If this is a models payload, let the dedicated handler do its job.
+          if (body.id && String(body.id).startsWith('models')) {
             clearRoute(body.id);
             return;
           }
 
+          const route = routeFor(body.id);
+
+          // NEW: support callback sink (used by updateModelInfo / show)
+          if (route && route.sink === 'callback' && typeof route.cb === 'function') {
+            try { route.cb({ ok: true, body }); } catch { }
+            clearRoute(body.id);
+            return;
+          }
           if (route.sink === 'element') {
             const elx = resolveEl(route.elId);
             const text = extractFull(body.data) || '';
@@ -2181,12 +2472,25 @@
             return;
           }
 
-          const sess = getSession(); if (!sess) return;
+          const sess = getSession(); if (!sess) { clearRoute(body.id); return; }
 
-          // If this looks like an ollama.show() payload, display ONLY capabilities
-          const line = formatCapabilitiesLine(body.data);
-          console.log(line)
-          //appendMessage(sess.id, 'assistant', line);
+          // Only flip the attach button for *show* payloads; never for models list
+          try {
+            if (isLikelyModelShowPayload(body.data)) {
+              const raw = (body.data && body.data.data) ? body.data.data : body.data;
+              const model = getCurrentModel() || '';
+              const info = normalizeModelShow(model, raw);
+
+              // cache → UI
+              cacheSetModelInfo(model, info);
+              renderModelInfo(info);
+
+              const hasVision = Array.isArray(info.capabilities) && info.capabilities.some(c => String(c).toLowerCase() === 'vision');
+              toggleImageAttach(hasVision);
+            }
+          } catch (e) {
+            console.debug('[caps-toggle] skipped:', e);
+          }
 
           renderChat();
           clearRoute(body.id);
@@ -2260,12 +2564,7 @@
     // Pull ONLY the `capabilities` key as a string list
     function extractCapabilitiesOnly(d) {
       const obj = d && typeof d === 'object' && d.data && typeof d.data === 'object' ? d.data : d;
-      const caps = Array.isArray(obj?.capabilities) ? obj.capabilities : [];
-      // normalize to unique, lowercase → display-case
-      const shown = Array.from(new Set(caps.map(s => String(s || '').trim().toLowerCase())))
-        .filter(Boolean)
-        .map(s => s.charAt(0).toUpperCase() + s.slice(1));
-      return shown;
+      return Array.isArray(obj?.capabilities) ? obj.capabilities.map(String) : [];
     }
 
     function formatCapabilitiesLine(d) {
@@ -2274,28 +2573,56 @@
     }
 
 
-    // Compose & send (DELTA MODE) — uses router with default 'chat' sink (queue-aware)
+    function approxBytes(obj) {
+      try { return new Blob([JSON.stringify(obj)]).size; }
+      catch { return (JSON.stringify(obj) || '').length; }
+    }
+
     function sendPrompt() {
       const s = getSession(); if (!s) { alert('Choose a model first.'); return; }
-      const text = el('prompt').value; if (!text.trim()) return;
+      const text = el('prompt').value; if (!text.trim() && pendingImages.length === 0) return;
 
-      appendMessage(s.id, 'user', text.trim()); renderChat(); el('prompt').value = '';
+      const inlineURLs = pendingImages.filter(p => !p.big).map(p => p.dataURL);
+      const blobsToUse = pendingBlobRefs.slice();
 
-      const reqId = newId('req');
+      // Build *exact* payload we would send
       const doStream = !!settings.stream;
-
-      requestLLM({
+      const payload = {
         event: 'llm.request',
-        id: reqId,
+        id: newId('req'),
         api: 'chat',
         sid: s.id,
         delta: text.trim(),
         stream: doStream,
-        kwargs: { options: currentOptions() }
-      }, {
-        sink: 'chat'
-      });
+        kwargs: { options: currentOptions() },
+        images: inlineURLs.length ? inlineURLs : undefined,
+        images_ref: blobsToUse.length ? blobsToUse : undefined
+      };
+
+      // Keep single WS message comfortably under ~800 KiB
+      const WS_MSG_BUDGET = 800 * 1024;
+      if (approxBytes(payload) > WS_MSG_BUDGET) {
+        alert('Images are too large to send inline. They will be uploaded as blobs—please wait for the green check then press Send again.');
+        return; // Let blob pipeline finish; user can press Send after 'blob.ready'
+      }
+
+      // (existing UI + send)
+      appendMessage(s.id, 'user', text.trim());
+      const last = s.messages[s.messages.length - 1];
+      last.images = pendingImages.map(p => p.dataURL);
+      saveJSON(STORAGE.SESS, sessions);
+      renderChat();
+      el('prompt').value = '';
+
+      requestLLM(payload, { sink: 'chat' });
+
+      pendingImages = [];
+      renderAttachments();
+      pendingBlobRefs = [];
     }
+
+
+
 
     const playSign = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
 <path d="M16.6582 9.28638C18.098 10.1862 18.8178 10.6361 19.0647 11.2122C19.2803 11.7152 19.2803 12.2847 19.0647 12.7878C18.8178 13.3638 18.098 13.8137 16.6582 14.7136L9.896 18.94C8.29805 19.9387 7.49907 20.4381 6.83973 20.385C6.26501 20.3388 5.73818 20.0469 5.3944 19.584C5 19.053 5 18.1108 5 16.2264V7.77357C5 5.88919 5 4.94701 5.3944 4.41598C5.73818 3.9531 6.26501 3.66111 6.83973 3.6149C7.49907 3.5619 8.29805 4.06126 9.896 5.05998L16.6582 9.28638Z" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/>
@@ -2422,6 +2749,42 @@
         saveJSON(STORAGE.SESS, sessions);
         sendSessionOpen(s, /*seed*/false);
       };
+
+      // Attach button opens file picker
+      el('attachBtn').onclick = () => { const fi = el('fileInput'); if (fi) fi.click(); };
+
+      // When files chosen, read as data URLs into pendingImages[]
+      el('fileInput').addEventListener('change', async (e) => {
+        const files = Array.from(e.target.files || []);
+        for (const f of files) {
+          if (!/^image\//i.test(f.type)) continue;
+
+          if (f.size > PACK_INLINE_MAX) {
+            // 1) enqueue a tiny preview for chat rendering
+            const previewURL = await new Promise((res, rej) => {
+              const fr = new FileReader();
+              fr.onload = () => res(String(fr.result || ''));
+              fr.onerror = rej; fr.readAsDataURL(f.slice(0, 200 * 1024)); // small preview okay
+            });
+            pendingImages.push({ name: f.name, size: f.size, type: f.type, dataURL: previewURL, big: true });
+            renderAttachments();
+
+            // 2) start a blob upload (multi-part)
+            const blobId = await startBlobUpload(f);
+            // Sending starts after 'blob.accept' (onInbound), which will call pumpBlob(blobId)
+          } else {
+            // small → inline as before
+            const dataURL = await new Promise((res, rej) => {
+              const fr = new FileReader();
+              fr.onload = () => res(String(fr.result || ''));
+              fr.onerror = rej; fr.readAsDataURL(f);
+            });
+            pendingImages.push({ name: f.name, size: f.size, type: f.type, dataURL });
+            renderAttachments();
+          }
+        }
+        e.target.value = '';
+      });
 
       // Apply hub from URL before anything else that depends on it
       applyHubFromUrl();
