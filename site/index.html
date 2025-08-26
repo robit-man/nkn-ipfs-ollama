@@ -1743,13 +1743,17 @@
       updateSysMetaButtons();
     }
 
+   
     function renderChat() {
+      //console.log("RENDERING CHAT----------------------------------------------------------------")
       const s = getSession(); const box = el('chat'); box.innerHTML = '';
+      //console.log(s)
       if (!s) { box.innerHTML = `<div class="muted" style="text-align:center;margin-top:30px">Choose a model above to create a session.</div>`; return; }
 
       s.messages.forEach(m => {
         const w = document.createElement('div');
         w.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+      //console.log(w)
 
         const contentHtml = messageHtml(m.role, m.content);
         const whoLabel = (m.role === 'user') ? 'user' : (m.agent || s.model || 'assistant');
@@ -1769,6 +1773,7 @@
       box.scrollTop = box.scrollHeight;
     }
 
+
     function addStreamingAssistantBubble() {
       const s = getSession(); if (!s) return;
       const w = document.createElement('div'); w.className = 'msg assistant'; w.dataset.stream = '1';
@@ -1776,13 +1781,23 @@
       el('chat').appendChild(w); el('chat').scrollTop = el('chat').scrollHeight;
     }
     function setStreamingContent(text) {
-      const c = el('streamContent');
+      let c = el('streamContent');
+      if (!c) {                      // bubble was wiped by a re-render → re-add it
+        addStreamingAssistantBubble();
+        c = el('streamContent');
+      }
       if (c) {
-        c.innerHTML = mdToHtml(text || '');
-        highlightIn(c);
-        el('chat').scrollTop = el('chat').scrollHeight;
+        requestAnimationFrame(() => {
+          c.innerHTML = mdToHtml(text || '');
+          try { highlightIn(c); } catch { }
+          const container = c.closest('.chat') || c.parentElement;
+          if (container && typeof container.scrollTop === 'number') {
+            container.scrollTop = container.scrollHeight;
+          }
+        });
       }
     }
+
     function finishStreamingBubble() {
       const c = el('streamContent'); if (c) { c.removeAttribute('id'); }
       const s = getSession();
@@ -2465,6 +2480,7 @@ ${META_END}`;
         st.onChunk(part);
         st.next++;
       }
+      renderChat();
       sendAck(id, st.next - 1);
     }
     /* ========= Coalesced ACKs for streams ========= */
@@ -3235,42 +3251,14 @@ ${META_END}`;
           return true;
         }
 
-        if (route.sink === 'element') {
-          const elx = resolveEl(route.elId);
-          const text = extractFull(body.data) || '';
-          writeToElement(elx, text, { mode: route.mode || 'replace', format: route.format || 'text' });
-          lockElement(elx, false);
-          if (route.elId) streamingElements.delete(route.elId);
-
-          if (route.elId === 'systemMsg') {
-            const s = getSession();
-            if (s) { s.system = (el('systemMsg').value || ''); saveJSON(STORAGE.SESS, sessions); sendSessionOpen(s, /*seed*/false); }
-            setSysGenBusy(false);
-            sysgenPending.delete(body.id);
-          }
-          isSysGenStreaming = false; sysgenCurrentId = null;
-          clearRoute(body.id);
-          return true;
-        }
-
-        // Non-element (chat) result — keep your capability toggle for show payloads
-        try {
-          if (isLikelyModelShowPayload(body.data)) {
-            const raw = (body.data && body.data.data) ? body.data.data : body.data;
-            const model = getCurrentModel() || '';
-            const info = normalizeModelShow(model, raw);
-            cacheSetModelInfo(model, info);
-            renderModelInfo(info);
-            const hasVision = Array.isArray(info.capabilities) && info.capabilities.some(c => String(c).toLowerCase() === 'vision');
-            toggleImageAttach(hasVision);
-          }
-        } catch (e) { console.debug('[caps-toggle] skipped:', e); }
-
+        // Only re-render chat if we are NOT mid-stream
         const sess = getSession(); if (!sess) { clearRoute(body.id); return true; }
-        renderChat();
+        if (!isStreaming && !pendingStreamId) renderChat();
+
         clearRoute(body.id);
         return true;
       }
+
 
       if (ev === 'llm.error') {
         // callback sink
@@ -3319,24 +3307,27 @@ ${META_END}`;
         }
 
         const body = decodePayload(raw);
-        if (!body || typeof body !== 'object') return;
+        if (!body || typeof body !== 'object') return false;       // ← suppress SDK ACK
 
         const ev = body.event || '';
         const srcStr = String(src || '');
 
         try { logRecvPacket(srcStr, raw, body); } catch { }
 
-        if (!_sameHubOrTrusted(ev, srcStr)) return;
+        if (!_sameHubOrTrusted(ev, srcStr)) return false;           // ← suppress SDK ACK
 
-        // Route to CTRL first; if not handled there, DATA handler gets a chance
-        if (onInboundCtrl(ev, body, srcStr)) return;
-        if (onInboundData(ev, body, srcStr)) return;
+        // If either handler consumed it, suppress SDK ACK.
+        if (onInboundCtrl(ev, body, srcStr)) return false;          // ← was `return;`
+        if (onInboundData(ev, body, srcStr)) return false;          // ← was `return;`
 
-        // fallthrough: ignore unknown/noisy frames silently
+        // Unknown/noisy frames: still suppress SDK ACK (we don’t want RTC DC acks at all)
+        return false;
       } catch (err) {
         console.warn('[onInbound] swallowed error', err);
+        return false;                                               // ← suppress SDK ACK on errors too
       }
     }
+
     /* ========= /Inbound demux ========= */
 
 
