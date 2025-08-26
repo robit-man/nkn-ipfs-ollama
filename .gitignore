@@ -1,3 +1,6 @@
 */*.pem
 */*.json
 */venv
+signaling/blobs
+signaling/bridge-node
+signaling/.env

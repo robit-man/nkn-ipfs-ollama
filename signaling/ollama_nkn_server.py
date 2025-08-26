@@ -84,6 +84,7 @@ if not ENV_PATH.exists():
     ollama_host = "http://127.0.0.1:11434"
     # Default: disable WebRTC in browsers until a TURN is available
     disable_webrtc = "1"
+    nkn_subclients = "4"  # default MultiClient sub-clients
     ENV_PATH.write_text(
         f"PEER_SHARED_SECRET={pw}\n"
         f"JWT_SECRET={jwt_sec}\n"
@@ -91,6 +92,7 @@ if not ENV_PATH.exists():
         f"NKN_TOPIC_PREFIX={topic_ns}\n"
         f"OLLAMA_HOST={ollama_host}\n"
         f"NKN_DISABLE_WEBRTC={disable_webrtc}\n"
+        f"NKN_NUM_SUBCLIENTS={nkn_subclients}\n"
     )
     print("→ wrote .env (defaults created)")
 
@@ -106,6 +108,7 @@ TOPIC_PREFIX  = dotenv.get("NKN_TOPIC_PREFIX","client")
 JWT_EXP       = timedelta(minutes=30)
 OLLAMA_HOST   = dotenv.get("OLLAMA_HOST","http://127.0.0.1:11434")
 DISABLE_WEBRTC= dotenv.get("NKN_DISABLE_WEBRTC", "1") in ("1","true","yes","on")
+NKN_NUM_SUBCLIENTS = int(dotenv.get("NKN_NUM_SUBCLIENTS", "4"))
 
 # Session policy
 SESSION_TTL_SECS   = 60 * 45      # prune sessions idle > 45m
@@ -167,10 +170,12 @@ const SEED_WS = (process.env.NKN_BRIDGE_SEED_WS || '')
   .map(s => s.trim())
   .filter(Boolean);
 
+const NUM_SUBCLIENTS = parseInt(process.env.NKN_NUM_SUBCLIENTS || '4', 10) || 4;
+
 const client = new nkn.MultiClient({
   seed: SEED_HEX,
   identifier: 'hub',
-  numSubClients: 4,
+  numSubClients: NUM_SUBCLIENTS,
   seedWsAddr: SEED_WS.length ? SEED_WS : undefined,   // pin to known-good WS seeds
   // tolerate background-timer clamping & flaky NATs
   wsConnHeartbeatTimeout: 120000,  // was 60000
@@ -278,8 +283,9 @@ if not BRIDGE_JS.exists() or BRIDGE_JS.read_text() != BRIDGE_SRC:
     BRIDGE_JS.write_text(BRIDGE_SRC)
 
 bridge_env = os.environ.copy()
-bridge_env["NKN_SEED_HEX"]     = NKN_SEED_HEX
-bridge_env["NKN_TOPIC_PREFIX"] = TOPIC_PREFIX
+bridge_env["NKN_SEED_HEX"]       = NKN_SEED_HEX
+bridge_env["NKN_TOPIC_PREFIX"]   = TOPIC_PREFIX
+bridge_env["NKN_NUM_SUBCLIENTS"] = str(NKN_NUM_SUBCLIENTS)
 
 # Bridge process + watchdog state
 bridge = None
@@ -635,24 +641,46 @@ class Session:
 SESSIONS: Dict[tuple, Session] = {}  # (src_addr, sid) -> Session
 
 def _sess_key(src_addr: str, sid: str): return (src_addr, sid or "")
+# allow tool role; preserve tool-related fields
+_VALID_ROLES = {"system", "user", "assistant", "tool"}
 
-_VALID_ROLES = {"system", "user", "assistant"}
-def _sanitize_msg(m: dict) -> Dict[str, str]:
-    role = str(m.get("role","")).strip().lower()
+def _sanitize_msg(m: dict) -> Dict[str, Any]:
+    role = str(m.get("role", "")).strip().lower()
     if role not in _VALID_ROLES:
         role = "user"
-    content = m.get("content")
+
+    # content can be empty for assistant messages that only carry tool_calls
+    content = m.get("content", "")
     if not isinstance(content, str):
         content = "" if content is None else str(content)
-    return {"role": role, "content": content}
 
-def _sanitize_history(history) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
-    if not isinstance(history, (list, tuple)): return out
-    for m in history:
-        if isinstance(m, dict) and "content" in m:
-            out.append(_sanitize_msg(m))
+    out: Dict[str, Any] = {"role": role, "content": content}
+
+    # carry through tool message fields if present
+    # (OpenAI-style; Ollama aligns with this structure when emitting tool calls)
+    if "name" in m: out["name"] = str(m["name"])
+    if "tool_call_id" in m: out["tool_call_id"] = str(m["tool_call_id"])
+    if "tool_call_id".replace("_", "") in m:  # tolerate camelCase from some clients
+        out["tool_call_id"] = str(m["toolCallId"])
+
+    # IMPORTANT: keep assistant tool_calls array if present
+    if isinstance(m.get("tool_calls"), list):
+        # normalize a bit but keep as-is for the client & model
+        out["tool_calls"] = m["tool_calls"]
+
     return out
+
+def _sanitize_history(history) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not isinstance(history, (list, tuple)):
+        return out
+    for m in history:
+        if isinstance(m, dict):
+            # don't require 'content' for assistant tool_calls-only messages
+            if "role" in m or "content" in m or "tool_calls" in m:
+                out.append(_sanitize_msg(m))
+    return out
+
 
 def _open_session(src_addr:str, sid:str, model:str=None, system:str=None, options:dict=None,
                   history: Optional[List[Dict[str,str]]]=None, replace: bool=False) -> Session:
@@ -893,13 +921,171 @@ def _massage_images_in_messages(
     log_prefix: str = ""
 ) -> List[Dict[str, Any]]:
     """
-    Convert:
-      - images / images_b64: base64 or data URLs → bytes
-      - images_ref: 'blob:<id>' → bytes (resolved for the *same* src_addr)
-    Also prints a concise line so we can see what was attached.
+    Convert and normalize message image attachments.
+
+    Accepts:
+      - images / images_b64: list of base64 strings, data URLs, bytes,
+                             OR chunked forms:
+                               • {"parts":[b64,...]} / {"chunks":[...]}
+                               • {"id":str,"seq":int,"total":int,"data":b64}
+                               • {"chunkId":str,"chunkIndex":int,"chunkTotal":int,"data":b64}
+      - images_ref: 'blob:<id>' → resolved bytes (scoped to same src_addr)
+
+    Reassembles chunked inline images, decodes to bytes, deduplicates, and returns
+    updated messages with m["images"] = List[bytes] while removing images_b64/images_ref.
     """
+    # ---- Config (read globals if present; fallback to sane defaults) -----------------
+    g = globals()
+    INLINE_IMAGE_MAX_B = int(g.get("INLINE_IMAGE_MAX_B", 64 * 1024))     # only used for validation elsewhere
+    MAX_REASSEMBLED_IMAGE_BYTES = int(g.get("MAX_BLOB_BYTES", 10 * 1024 * 1024))  # 10 MiB cap (tunable)
+
+    def _strip_dataurl_prefix(s: str) -> str:
+        # Keep only the base64 payload part
+        if isinstance(s, str) and s.startswith(_DATAURL_PREFIX):
+            _, _, tail = s.partition(",")
+            return tail or ""
+        return s or ""
+
+    def _is_chunk_obj(x: Any) -> bool:
+        if not isinstance(x, dict): return False
+        if isinstance(x.get("parts") or x.get("chunks"), (list, tuple)): return True
+        has_seq = ("seq" in x or "chunkIndex" in x)
+        has_total = ("total" in x or "chunkTotal" in x)
+        has_id = ("id" in x or "chunkId" in x)
+        return has_seq and has_total and has_id and ("data" in x)
+
+    def _collect_chunks_from_list(items: List[Any]) -> List[bytes]:
+        """
+        From a heterogeneous list of items (strings/bytes/dicts), produce a list of decoded images (bytes).
+        Supports both single-shot base64/dataURL and multiple chunking schemes.
+        """
+        bin_out: List[bytes] = []
+        # Buckets for {id -> {total:int, parts: dict(seq->b64)}}
+        buckets: Dict[str, Dict[str, Any]] = {}
+
+        # For dedup within a single message
+        seen_hashes: set = set()
+
+        for it in items:
+            # Case 1: already bytes
+            if isinstance(it, (bytes, bytearray)):
+                b = bytes(it)
+                if b:
+                    import hashlib
+                    h = hashlib.sha256(b).hexdigest()
+                    if h not in seen_hashes:
+                        seen_hashes.add(h)
+                        bin_out.append(b)
+                continue
+
+            # Case 2: plain string (base64 or data URL)
+            if isinstance(it, str):
+                b = _decode_b64_to_bytes(it)
+                if b:
+                    import hashlib
+                    h = hashlib.sha256(b).hexdigest()
+                    if h not in seen_hashes:
+                        seen_hashes.add(h)
+                        bin_out.append(b)
+                continue
+
+            # Case 3: chunked object forms
+            if _is_chunk_obj(it):
+                # 3a) parts/chunks inline array
+                parts_arr = it.get("parts") or it.get("chunks")
+                if isinstance(parts_arr, (list, tuple)) and parts_arr:
+                    try:
+                        joined_b64 = "".join(_strip_dataurl_prefix(str(p) or "") for p in parts_arr)
+                        b = _decode_b64_to_bytes(joined_b64)
+                        if b:
+                            if len(b) > MAX_REASSEMBLED_IMAGE_BYTES:
+                                _log("vision.drop", f"⚠️ chunked image too large ({len(b)} bytes) — dropped")
+                            else:
+                                import hashlib
+                                h = hashlib.sha256(b).hexdigest()
+                                if h not in seen_hashes:
+                                    seen_hashes.add(h)
+                                    bin_out.append(b)
+                    except Exception as e:
+                        _log("vision.chunk.err", f"parts join/decode failed: {e}")
+                    continue
+
+                # 3b) seq/total style (possibly multiple objects across the array)
+                cid = str(it.get("id") or it.get("chunkId") or "")
+                if not cid:
+                    # treat as single if we at least have data
+                    b = _decode_b64_to_bytes(it.get("data") or "")
+                    if b:
+                        import hashlib
+                        h = hashlib.sha256(b).hexdigest()
+                        if h not in seen_hashes:
+                            seen_hashes.add(h)
+                            bin_out.append(b)
+                    continue
+
+                total = int(it.get("total") or it.get("chunkTotal") or 0)
+                seq = int(it.get("seq") if it.get("seq") is not None else it.get("chunkIndex") or 0)
+                data_b64 = _strip_dataurl_prefix(str(it.get("data") or ""))
+
+                bkt = buckets.setdefault(cid, {"total": max(0, total), "parts": {}})
+                if bkt["total"] <= 0 and total > 0:
+                    bkt["total"] = total
+                # store part
+                if seq not in bkt["parts"] and data_b64:
+                    bkt["parts"][seq] = data_b64
+                continue
+
+            # Unknown type — ignore gracefully
+            try:
+                s = str(it)
+                b = _decode_b64_to_bytes(s)
+                if b:
+                    import hashlib
+                    h = hashlib.sha256(b).hexdigest()
+                    if h not in seen_hashes:
+                        seen_hashes.add(h)
+                        bin_out.append(b)
+            except Exception:
+                pass
+
+        # Assemble any complete buckets
+        for cid, rec in buckets.items():
+            total = int(rec.get("total") or 0)
+            parts: Dict[int, str] = rec.get("parts") or {}
+            if total <= 0:
+                total = max(parts.keys(), default=-1) + 1  # guess based on highest seq
+            if total > 0 and len(parts) >= total:
+                try:
+                    joined_b64 = "".join(parts[i] for i in range(total))
+                except Exception:
+                    # if a sequence missing, skip
+                    missing = [i for i in range(total) if i not in parts]
+                    _log("vision.chunk.warn", f"{cid} missing sequences: {missing[:8]}{'…' if len(missing)>8 else ''}")
+                    joined_b64 = None
+
+                if joined_b64:
+                    try:
+                        b = _decode_b64_to_bytes(joined_b64)
+                        if b:
+                            if len(b) > MAX_REASSEMBLED_IMAGE_BYTES:
+                                _log("vision.drop", f"⚠️ chunked image {cid} too large ({len(b)} bytes) — dropped")
+                            else:
+                                import hashlib
+                                h = hashlib.sha256(b).hexdigest()
+                                if h not in seen_hashes:
+                                    seen_hashes.add(h)
+                                    bin_out.append(b)
+                    except Exception as e:
+                        _log("vision.chunk.err", f"{cid} join/decode failed: {e}")
+            else:
+                _log("vision.chunk.warn", f"{cid} incomplete: have {len(parts)}/{total}")
+
+        return bin_out
+
+    # ---------------- Main loop over messages ---------------------------------------
     out: List[Dict[str, Any]] = []
     inline_ct = 0
+    inline_chunked_ct = 0
     ref_ct = 0
     total_bytes = 0
 
@@ -907,20 +1093,23 @@ def _massage_images_in_messages(
         m2 = dict(m)
         bin_list: List[bytes] = []
 
-        # Inline: base64 / data URLs
+        # Inline: base64/data URLs (+ chunked forms)
         imgs = m2.get("images") or m2.get("images_b64")
-        if isinstance(imgs, (list, tuple)):
+        if isinstance(imgs, (list, tuple)) and imgs:
+            # Quick scan to count chunked vs single
             for it in imgs:
-                if isinstance(it, (bytes, bytearray)):
-                    b = bytes(it)
-                elif isinstance(it, str):
-                    b = _decode_b64_to_bytes(it)
+                if _is_chunk_obj(it):
+                    inline_chunked_ct += 1
                 else:
-                    b = None
-                if b:
-                    bin_list.append(b)
                     inline_ct += 1
-                    total_bytes += len(b)
+            # Decode & reassemble
+            try:
+                decoded = _collect_chunks_from_list(list(imgs))
+                if decoded:
+                    bin_list.extend(decoded)
+                    total_bytes += sum(len(b) for b in decoded)
+            except Exception as e:
+                _log("vision.inline.err", f"decode/reassemble failed: {e}")
 
         # Blob refs: only if we know who sent them (same sender scope)
         if src_addr and isinstance(m2.get("images_ref"), (list, tuple)):
@@ -933,17 +1122,25 @@ def _massage_images_in_messages(
 
         if bin_list:
             m2["images"] = bin_list
+            # scrub original fields to avoid downstream confusion
             m2.pop("images_b64", None)
             m2.pop("images_ref", None)
+            # Also scrub any chunk descriptors lingering in "images"
+            try:
+                if isinstance(m2.get("images"), list):
+                    m2["images"] = [bytes(x) if isinstance(x, (bytes, bytearray)) else x for x in m2["images"]]
+            except Exception:
+                pass
 
         out.append(m2)
 
-    if inline_ct or ref_ct:
+    if inline_ct or inline_chunked_ct or ref_ct:
         _log(
             "vision.attach",
-            f"🖼️ {log_prefix} inline={inline_ct} blobs={ref_ct} bytes≈{total_bytes}"
+            f"🖼️ {log_prefix} inline={inline_ct} inline_chunked={inline_chunked_ct} blobs={ref_ct} bytes≈{total_bytes}"
         )
     return out
+
 
 
 class _LLMStream:
@@ -1521,12 +1718,20 @@ def _handle_dm(src_addr: str, body: dict):
             # ── messages-mode (no sid/delta): accept top-level messages and pass to Ollama
             top_msgs = body.get("messages")
             if isinstance(top_msgs, (list, tuple)):
-                # sanitize to {role, content} and drop unknown roles
+                # keep tool roles, tool_calls, tool_call_id, name (handled by new _sanitize_history)
                 msgs = _sanitize_history(top_msgs)
                 kw = body.get("kwargs") or {}
                 kw["messages"] = msgs
+                # pass-through tools / tool_choice if provided by the client
+                if "tools" in body and "tools" not in kw:
+                    kw["tools"] = body["tools"]
+                if "tool_choice" in body and "tool_choice" not in kw:
+                    kw["tool_choice"] = body["tool_choice"]
                 body["kwargs"] = kw
-                body.pop("messages", None)  # ensure only kwargs.messages is used
+                body.pop("messages", None)
+                body.pop("tools", None)
+                body.pop("tool_choice", None)
+
 
             rid = _start_llm(src_addr, body)
             _log("llm.start", f"{src_addr} id={rid} api={api} model={model} stream={stream} (compat/messages={bool(top_msgs)})")

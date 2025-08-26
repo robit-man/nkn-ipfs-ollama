@@ -1305,6 +1305,18 @@
       localStorage.setItem(STORAGE.SEED, hex); return hex;
     }
 
+    // Extra seed for the standby wallet
+    STORAGE.SEED_B = 'CLIENT_SEED_HEX_V2B';
+
+    function getOrCreateBackupSeed() {
+      let hex = localStorage.getItem(STORAGE.SEED_B);
+      if (/^[0-9a-f]{64}$/.test(hex || '')) return hex;
+      const r = new Uint8Array(32); crypto.getRandomValues(r);
+      hex = Array.from(r).map(b => b.toString(16).padStart(2, '0')).join('');
+      localStorage.setItem(STORAGE.SEED_B, hex);
+      return hex;
+    }
+
     // Settings
     const settings = (() => {
       const defaultHub = localStorage.getItem(STORAGE.HUB) || localStorage.getItem(STORAGE.LEGACY_HUB) || '';
@@ -2054,9 +2066,12 @@ ${META_END}`;
 
     /** Read the current number of ready subclients from MultiClient */
     function getPeerCount() {
-      try { return (client && typeof client.readyClientIDs === 'function') ? client.readyClientIDs().length : 0; }
-      catch { return 0; }
+      try {
+        const cl = activeClient();
+        return (cl && typeof cl.readyClientIDs === 'function') ? cl.readyClientIDs().length : 0;
+      } catch { return 0; }
     }
+
 
     /** Kick a 1s ticker to keep #peers updated */
     function startPeersTicker() {
@@ -2254,6 +2269,65 @@ ${META_END}`;
 
     }
 
+    // ─── Dual MultiClient (hot-standby) ────────────────────────────────────
+    let clientA = null;        // primary
+    let clientB = null;        // standby (backup)
+    let myAddrA = null, myAddrB = null;
+
+    let isConnA = false, isConnB = false;
+    let isConnectingA = false, isConnectingB = false;
+
+    let activeRole = 'A';      // 'A' | 'B'
+    function activeClient() { return activeRole === 'A' ? clientA : clientB; }
+
+    function setActiveRole(role) {
+      if (role !== 'A' && role !== 'B') return;
+      activeRole = role;
+      // keep legacy 'client'/'isConnected'/'isConnecting' in sync for existing code
+      client = activeClient();
+      isConnected = (role === 'A') ? isConnA : isConnB;
+      isConnecting = (role === 'A') ? isConnectingA : isConnectingB;
+      myAddr = client ? client.addr : null;
+
+      // UI updates
+      updateChips();                 // shows myAddr (now active)
+      startHeartbeat();              // restarts the 1s ctrl.ping loop for the active client only
+      startPeersTicker();            // peers label reflects active client
+      startPeersPolling();           // hub peers polling via active
+      setLatencyUI(null);            // reset latency smoothing on switch
+
+      // Make sure the hub knows about the "new source address"
+      const s = getSession();
+      if (s) sendSessionOpen(s, /*seed*/true);
+
+      // Re-announce + resume any uploads + flush queued payloads
+      trySend(HUB_ADDR, { event: 'announce' }, { noReply: true, msgHoldingSeconds: 600 });
+      resumeAllUploads();
+      flushOutbox();
+    }
+
+    // promote standby if it’s already connected
+    function promoteStandbyIfHealthy(reason) {
+      if (activeRole === 'B') return;
+      if (clientB && isConnB) {
+        console.warn('[failover] promoting standby (B) due to:', reason || '(unknown)');
+        setActiveRole('B');
+      }
+    }
+
+    // optional: switch back to A when it stabilizes for a while
+    let switchbackTimer = null;
+    function scheduleSwitchback(ms = 15000) {
+      clearTimeout(switchbackTimer);
+      switchbackTimer = setTimeout(() => {
+        if (clientA && isConnA) {
+          console.info('[failover] switching back to primary (A)');
+          setActiveRole('A');
+        }
+      }, ms);
+    }
+
+
     /* ========= Soft logical channels (CTRL vs DATA) with priority & retries ========= */
 
     // Classify events into ctrl/data without changing callsites
@@ -2346,11 +2420,38 @@ ${META_END}`;
 
     // === Replace your existing trySend() with this wrapper (same signature) ===
     function trySend(addr, obj, opts = {}) {
-      if (!addr || !obj) return false;
-      // One unified place to log “send” (keeps your packet console tidy)
-      if (window._PKT?.DEBUG?.ON) logSendPacket(addr, obj, { noReply: true, msgHoldingSeconds: 600, responseTimeout: 15000, ...opts });
-      return MUX.sendAuto(addr, obj, opts);
+      const sendOpts = { noReply: true, msgHoldingSeconds: 600, responseTimeout: 15000, ...opts };
+      const payload = JSON.stringify(obj);
+      const doSend = (cl) => {
+        if (!cl) throw new Error('no client');
+        // log before send
+        (window._PKT && _PKT.DEBUG?.ON) && logSendPacket(addr, obj, sendOpts);
+        const p = cl.send(addr, payload, sendOpts);
+        if (p && typeof p.then === 'function') {
+          p.catch(err => {
+            // async path: we already returned true, but keep observability
+            console.debug('[nkn.send:async]', err?.message || err);
+          });
+        }
+        return true;
+      };
+
+      // First, try the active client; catch *synchronous* DataChannel errors
+      try {
+        if (!activeClient() || !isConnected) throw new Error('inactive');
+        return doSend(activeClient());
+      } catch (err) {
+        console.debug('[nkn.send:primary-immediate-fail]', err?.message || err);
+        // Fallback to standby if available
+        if (clientB && isConnB) {
+          try { return doSend(clientB); }
+          catch (e2) { console.debug('[nkn.send:standby-immediate-fail]', e2?.message || e2); }
+        }
+        // give up; caller’s outbox/heartbeat/reconnect will cover
+        return false;
+      }
     }
+
 
     // Optional helpers if you want to be explicit in a few places:
     const sendCtrl = (addr, obj, opts) => MUX.sendCtrl(addr, obj, opts);
@@ -2867,91 +2968,151 @@ ${META_END}`;
 
     // LTE-proven NKN connect: minimal, robust for 5G/CGNAT
     function connectNKN() {
-      if (isConnecting) return;
+      if (isConnectingA || isConnectingB) return;
       if (!isNknAddr(HUB_ADDR)) { openSettings(); return; }
 
-      isConnecting = true;
-      isConnected = false;
-      updateChips();
-
-
+      // reset legacy flags; active = A by default
+      isConnecting = true; isConnected = false;
+      isConnectingA = true; isConnA = false;
+      isConnectingB = true; isConnB = false;
+      setActiveRole('A');                      // sets client alias & UI placeholders
       setConn(CONNECTING_HTML);
 
-      try { if (client) { try { client.close(); } catch { } } } catch { }
+      // Clean up previous clients if any
+      try { clientA && clientA.close && clientA.close(); } catch { }
+      try { clientB && clientB.close && clientB.close(); } catch { }
+      clientA = clientB = null;
+      myAddrA = myAddrB = null;
 
-      client = new nkn.MultiClient({
+      // ── Primary (A)
+      clientA = new nkn.MultiClient({
         seed: getOrCreateSeed(),
-        identifier: 'web',
-        numSubClients: Math.max(1, Math.min(12, Number(settings.peers) || 4)),  // ← NEW
-        originalClient: true,    // total effective peers ≈ numSubClients + 1
+        identifier: 'web',                      // keep your identifier
+        numSubClients: Math.max(1, Math.min(12, Number(settings.peers) || 4)),
+        originalClient: true,
         responseTimeout: 15000,
         msgHoldingSeconds: 600
       });
 
-      client.onConnect(() => {
-        isConnecting = false;
-        isConnected = true;
-        setPeersUI(getPeerCount());
-        startPeersTicker();
-        setConn(CHECK_HTML);
-        myAddr = client.addr; updateChips();
-        lastPongAt = Date.now();
-        startHeartbeat();
-        startPeersPolling();     // ← NEW
-        setLatencyUI(null);      // reset visible chip on fresh connect
-        setPeersUI(null);
-
-
-        trySend(HUB_ADDR, { event: 'announce' }, { noReply: true, msgHoldingSeconds: 600 });
-
-        const s = getSession();
-        if (s) { setSavedModel(s.model || getSavedModel()); sendSessionOpen(s, /*seed*/true); }
-        resumeAllUploads();                 // NEW
-        flushOutbox();
-
-        // Kick models fetch now that we're definitely connected
-        requestModelsList(true);
-        setTimeout(() => {
-          if (!modelsLoaded && !modelsInFlight) requestModelsList(true);
-        }, 2500);
+      // ── Standby (B) — lighter footprint
+      clientB = new nkn.MultiClient({
+        seed: getOrCreateBackupSeed(),
+        identifier: 'web-b',                    // distinct identifier
+        numSubClients: Math.max(1, Math.min(6, Number(settings.standby_peers || 2))),
+        originalClient: true,
+        responseTimeout: 12000,
+        msgHoldingSeconds: 600
       });
 
-      // One message funnel; onInbound will filter to the configured hub
-      client.on('message', onInbound);
+      // Shared inbound funnel
+      clientA.on('message', onInbound);
+      clientB.on('message', onInbound);
 
-      client.on('willreconnect', () => {
-        isConnecting = false;
-        isConnected = false;
-        setPeersUI(0);        // transiently show 0 while reconnecting
-        stopPeersPolling();
-        setLatencyUI(null);
-        setConn(RECONNECTING_HTML);
+      // ── Primary lifecycle
+      clientA.onConnect(() => {
+        isConnectingA = false; isConnA = true;
+        if (activeRole === 'A') {
+          isConnecting = false; isConnected = true;
+          myAddrA = clientA.addr; myAddr = myAddrA;
+          updateChips();
+          setConn(CHECK_HTML);
+          lastPongAt = Date.now();
+          startHeartbeat();          // only pings via active client
+          startPeersTicker();
+          startPeersPolling();
+          setLatencyUI(null);
+
+          trySend(HUB_ADDR, { event: 'announce' }, { noReply: true, msgHoldingSeconds: 600 });
+          const s = getSession(); if (s) { setSavedModel(s.model || getSavedModel()); sendSessionOpen(s, /*seed*/true); }
+          resumeAllUploads();
+          flushOutbox();
+          requestModelsList(true);
+          setTimeout(() => { if (!modelsLoaded && !modelsInFlight) requestModelsList(true); }, 2500);
+        }
       });
-      client.on('connectFailed', () => {
-        isConnecting = false;
-        isConnected = false;
-        setPeersUI(0);
-        stopPeersTicker();
-        setConn(CONNECTFAIL_HTML);
-        setTimeout(connectNKN, 1200 + Math.random() * 600); // jittered retry
+      clientA.on('willreconnect', () => {
+        if (activeRole === 'A') {
+          isConnected = false;
+          setPeersUI(0);
+          stopPeersPolling();
+          setLatencyUI(null);
+          setConn(RECONNECTING_HTML);
+          promoteStandbyIfHealthy('primary willreconnect');
+        }
       });
-      client.on('close', () => {
-        isConnecting = false;
-        isConnected = false;
-        setPeersUI(0);
-        stopPeersTicker();
-        setConn('red', 'Disconnected');
-        setTimeout(connectNKN, 1200 + Math.random() * 600);
+      clientA.on('connectFailed', () => {
+        isConnectingA = false; isConnA = false;
+        if (activeRole === 'A') {
+          isConnected = false;
+          setPeersUI(0); stopPeersTicker();
+          setConn(CONNECTFAIL_HTML);
+          promoteStandbyIfHealthy('primary connectFailed');
+          setTimeout(connectNKN, 1200 + Math.random() * 600);
+        }
       });
-      client.on('error', () => {
-        isConnecting = false;
-        isConnected = false;
-        setPeersUI(0);
-        setConn('red', 'Error');
-        // Heartbeat loop will attempt reconnect when stale
+      clientA.on('close', () => {
+        isConnectingA = false; isConnA = false;
+        if (activeRole === 'A') {
+          isConnected = false;
+          setPeersUI(0); stopPeersTicker();
+          setConn('red', 'Disconnected');
+          promoteStandbyIfHealthy('primary close');
+          setTimeout(connectNKN, 1200 + Math.random() * 600);
+        }
+      });
+      clientA.on('error', () => {
+        // Don’t spam UI if standby is healthy; just promote
+        isConnA = false;
+        if (activeRole === 'A') {
+          isConnected = false;
+          setPeersUI(0);
+          setConn('red', 'Error');
+          promoteStandbyIfHealthy('primary error');
+        }
       });
 
-      window.addEventListener('beforeunload', () => { try { client && client.close(); } catch { } });
+      // ── Standby lifecycle
+      clientB.onConnect(() => {
+        isConnectingB = false; isConnB = true; myAddrB = clientB.addr;
+        // stay quiet unless we’re active; we won’t start heartbeat for B
+        // (optional) rare keep‑alive to hub: uncomment if your hub path idles out
+        // setInterval(() => { if (activeRole==='B') return; trySend(HUB_ADDR, {event:'ctrl.ping', ts: Date.now(), via:'B'}, {noReply:true}); }, 5000);
+        if (activeRole === 'B') setActiveRole('B'); // refresh UI if we promoted before connect
+      });
+      clientB.on('willreconnect', () => {
+        if (activeRole === 'B') {
+          isConnected = false;
+          setConn(RECONNECTING_HTML);
+        }
+      });
+      clientB.on('connectFailed', () => {
+        isConnectingB = false; isConnB = false;
+        if (activeRole === 'B') {
+          isConnected = false;
+          setConn(CONNECTFAIL_HTML);
+          setTimeout(connectNKN, 1200 + Math.random() * 600);
+        }
+      });
+      clientB.on('close', () => {
+        isConnectingB = false; isConnB = false;
+        if (activeRole === 'B') {
+          isConnected = false; setConn('red', 'Disconnected');
+          setTimeout(connectNKN, 1200 + Math.random() * 600);
+        } else {
+          // we’re on A; schedule standby restart
+          setTimeout(connectNKN, 1500 + Math.random() * 1000);
+        }
+      });
+      clientB.on('error', () => {
+        isConnB = false;
+        // if we’re on B, UI already handles via heartbeat staleness
+        if (activeRole === 'B') setConn('red', 'Error');
+      });
+
+      window.addEventListener('beforeunload', () => {
+        try { clientA && clientA.close(); } catch { }
+        try { clientB && clientB.close(); } catch { }
+      });
     }
 
 
