@@ -2419,43 +2419,100 @@ ${META_END}`;
     }
 
 
-    function startStream(id, onChunk) { streams.set(id, { next: 1, lastAck: 0, buffer: new Map(), onChunk }); }
+// keep default behavior: first expected chunk is 1, baseline lastAck = 0
+function startStream(id, onChunk, baseSeq = 1) {
+  const b = Number(baseSeq) || 1;
+  streams.set(id, { next: b, lastAck: b - 1, buffer: new Map(), onChunk });
+}
     // capture tool calls per stream id
     const toolCallsByStream = new Map(); // id -> [{ name, arguments, raw }]
 
-    function handleChunk(id, seq, data) {
-      if (cancelledStreams.has(id)) return;
-      const st = streams.get(id); if (!st) return;
+function handleChunk(id, seq, data) {
+  if (cancelledStreams.has(id)) return;
 
-      // stash and drain in order, same as before
-      st.buffer.set(seq, data);
-      if (!isStreaming && currentStreamId === null && pendingStreamId === id) { setStopMode(id); }
+  // coerce and validate seq
+  const nseq = Number(seq);
+  if (!Number.isFinite(nseq) || nseq < 0) return;
 
-      // peek for tool_calls in this part (Ollama emits under data.message.tool_calls)
-      try {
-        const msg = data && data.message;
-        if (msg && Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
-          const list = toolCallsByStream.get(id) || [];
-          for (const tc of msg.tool_calls) {
-            const fn = tc && tc.function || {};
-            list.push({
-              name: String(fn.name || ''),
-              arguments: (fn.arguments ?? {}),
-              raw: tc
-            });
-          }
-          toolCallsByStream.set(id, list);
-        }
-      } catch { /* tolerate shape drift */ }
+  // lazy-init if a chunk beats llm.start (or start was dropped)
+  let st = streams.get(id);
+  if (!st) {
+    const route = routeFor(id);
 
-      while (st.buffer.has(st.next)) {
-        const part = st.buffer.get(st.next);
-        st.buffer.delete(st.next);
-        st.onChunk(part);
-        st.next++;
+    if (route && route.sink === 'element') {
+      const elx = resolveEl(route.elId);
+      if (route.lock) lockElement(elx, true);
+      if (route.elId) streamingElements.add(route.elId);
+
+      let first = true;
+      startStream(id, (part) => {
+        const t = extractDelta(part);
+        if (!t) return;
+        writeToElement(elx, t, {
+          mode: first && route.mode === 'replace' ? 'replace' : 'append',
+          format: route.format || 'text',
+          scroll: true, caretToEnd: true
+        });
+        first = false;
+      }, nseq); // align base to first seq we actually saw
+    } else {
+      // default chat sink
+      addStreamingAssistantBubble();
+      const sess = getSession();
+      if (sess) {
+        sess.messages.push({ role: 'assistant', content: '', ts: Date.now() });
+        saveJSON(STORAGE.SESS, sessions);
       }
-      sendAck(id, st.next - 1);
+      let acc = '';
+      startStream(id, (part) => {
+        const t = extractDelta(part);
+        if (t) {
+          acc += t;
+          setStreamingContent(acc);
+          if (sess) updateLastAssistantContent(sess.id, acc);
+        }
+      }, nseq);
     }
+
+    st = streams.get(id);
+    setStopMode(id);
+    pendingStreamId = id;
+
+    // baseline ACK for hubs that gate on it (e.g. seq starts at 1 → ACK(0))
+    if (nseq > 0) sendAck(id, nseq - 1);
+  }
+
+  // normal buffering + drain
+  st.buffer.set(nseq, data);
+
+  if (!isStreaming && currentStreamId === null && (pendingStreamId === id || pendingStreamId == null)) {
+    setStopMode(id);
+    pendingStreamId = id;
+  }
+
+  // capture tool_calls (unchanged)
+  try {
+    const msg = data && data.message;
+    if (msg && Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+      const list = toolCallsByStream.get(id) || [];
+      for (const tc of msg.tool_calls) {
+        const fn = tc && tc.function || {};
+        list.push({ name: String(fn.name || ''), arguments: (fn.arguments ?? {}), raw: tc });
+      }
+      toolCallsByStream.set(id, list);
+    }
+  } catch {}
+
+  while (st.buffer.has(st.next)) {
+    const part = st.buffer.get(st.next);
+    st.buffer.delete(st.next);
+    try { st.onChunk(part); } catch {}
+    st.next++;
+  }
+
+  sendAck(id, st.next - 1);
+}
+
     /* ========= Coalesced ACKs for streams ========= */
     const ACK_FLUSH_MS = 80;  // coalesce within this window
     const _ackBucket = new Map(); // id -> upto
