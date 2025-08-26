@@ -1102,7 +1102,8 @@
   <script>
     // ===== DEBUG / Packet instrumentation (drop-in) ============================
     const LS_KEY = 'DEBUG_PKT';
-    const INIT_DEBUG = (localStorage.getItem(LS_KEY) ?? '1') !== '0';
+    const INIT_DEBUG = (localStorage.getItem(LS_KEY) ?? '0') !== '0'; // default OFF; use window.togglePkt(true) to enable
+
 
     const DEBUG = {
       ON: INIT_DEBUG,           // toggle with window.togglePkt(true|false)
@@ -1170,6 +1171,14 @@
     function logRecvPacket(src, raw, body) {
       if (!DEBUG.ON) return;
       const ev = body?.event || '—';
+
+      // Gate verbose logs during streaming: log every Nth llm.chunk only
+      if (ev === 'llm.chunk') {
+        const seq = Number(body?.seq || 0);
+        const N = Math.max(1, Number(DEBUG.LOG_STREAM_EVERY_N) || 1); // set N=5 to sample every 5th
+        if (seq % N !== 0) return;
+      }
+
       let bytes = 0;
       try {
         if (typeof raw === 'string') bytes = byteLenOfString(raw);
@@ -1177,6 +1186,7 @@
         else if (raw && typeof raw === 'object' && typeof raw.payload === 'string') bytes = byteLenOfString(raw.payload);
         else if (raw && raw.data && typeof raw.data === 'string') bytes = byteLenOfString(raw.data);
       } catch { }
+
       STATS.recvs++; STATS.recvBytes += bytes; STATS.maxRecv = Math.max(STATS.maxRecv, bytes);
       console.groupCollapsed(
         `%c[RECV] %c${ev} %c← ${shortAddr(src || '')} %c${humanBytes(bytes)}`,
@@ -1187,6 +1197,7 @@
       if (DEBUG.LOG_CONTENT) console.log('body', body);
       console.groupEnd();
     }
+
 
     function warnIfLargeFrame(obj, where = '') {
       const bytes = byteLenOfJSON(obj);
@@ -2785,58 +2796,65 @@ ${META_END}`;
     }
     function sendSessionReset(sid) { if (!sid || !HUB_ADDR) return; trySend(HUB_ADDR, { event: 'session.reset', sid }); }
 
-    // Heartbeat / reconnect
-    const HEARTBEAT_MS = 1000;              // was 5000
-    const STALE_MS = HEARTBEAT_MS * 3; // 3s without pong => soft reconnect
-    const HARD_STALE_MS = HEARTBEAT_MS * 8; // 8s => rebuild client hard
+    // Back off: let the SDK handle path rotation & reconnects.
+    // We only intervene if we miss multiple pongs *and* all subclients are 0 for a while.
+    const HEARTBEAT_MS = 6000;                // ping every 6s (tolerant of timer clamping)
+    const MISSED_PONG_LIMIT = 4;              // ~24s of missed pongs before we consider action
+    const PEERS_ZERO_GRACE_MS = 12000;        // require peers==0 for at least 12s too
     let hbTimer = null;
     let lastPongAt = 0;
+    let missedPongs = 0;
+    let peersZeroSince = 0;
 
     function startHeartbeat() {
       if (hbTimer) clearInterval(hbTimer);
 
-      // Prime one ping immediately
+      // Prime one ping immediately on start
       try {
         lastPingSentAt = Date.now();
-        trySend(HUB_ADDR, { event: 'ctrl.ping', ts: lastPingSentAt }, { noReply: true, maxHoldingSeconds: 120 });
+        sendCtrl(HUB_ADDR, { event: 'ctrl.ping', ts: lastPingSentAt }, { noReply: true, maxHoldingSeconds: 120 });
       } catch { }
 
       hbTimer = setInterval(() => {
         if (!HUB_ADDR) return;
 
-        // If we don't even have a client, try to connect
+        // If we don't have a client, build one.
         if (!client && !isConnecting) {
           setConn(RECONNECTING_HTML);
           connectNKN();
           return;
         }
 
-        // Send ping (once per second)
+        // Send ping on the CTRL lane
         try {
           lastPingSentAt = Date.now();
-          trySend(HUB_ADDR, { event: 'ctrl.ping', ts: lastPingSentAt }, { noReply: true, maxHoldingSeconds: 120 });
+          sendCtrl(HUB_ADDR, { event: 'ctrl.ping', ts: lastPingSentAt }, { noReply: true, maxHoldingSeconds: 120 });
         } catch { }
 
-        // Detect stale link and escalate faster than default NKN backoff
         const now = Date.now();
         const sincePong = now - (lastPongAt || 0);
-        if (sincePong > HARD_STALE_MS && !isConnecting) {
-          // Nukes the MultiClient and rebuilds it (hard)
+
+        // Track missed pongs & peers==0 window
+        if (sincePong > HEARTBEAT_MS * 2) missedPongs++; else missedPongs = 0;
+
+        const peersNow = getPeerCount();
+        if (peersNow === 0) {
+          if (!peersZeroSince) peersZeroSince = now;
+        } else {
+          peersZeroSince = 0;
+        }
+
+        // Only do a hard rebuild if the link truly looks wedged.
+        if (!isConnecting && missedPongs >= MISSED_PONG_LIMIT && peersZeroSince && (now - peersZeroSince) >= PEERS_ZERO_GRACE_MS) {
           try { client && client.close && client.close(); } catch { }
           client = null;
           isConnected = false;
           setConn(RECONNECTING_HTML);
-          connectNKN();
-        } else if (sincePong > STALE_MS && !isConnecting) {
-          // Soft reconnect (let MultiClient try new paths quickly)
-          setConn(RECONNECTING_HTML);
-          try { client && client.close && client.close(); } catch { }
-          client = null;
-          isConnected = false;
           connectNKN();
         }
       }, HEARTBEAT_MS);
     }
+
 
     document.addEventListener('dblclick', function (e) {
       e.preventDefault();
@@ -2859,11 +2877,12 @@ ${META_END}`;
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
-        const stale = (Date.now() - lastPongAt) > HEARTBEAT_MS * 3;
+        const stale = missedPongs >= MISSED_PONG_LIMIT;  // align with the new policy
         if ((!client || stale) && !isConnecting) connectNKN();
         else if (isConnected && !modelsLoaded && !modelsInFlight) requestModelsList(true);
       }
     });
+
 
     // LTE-proven NKN connect: minimal, robust for 5G/CGNAT
     function connectNKN() {
@@ -2882,11 +2901,20 @@ ${META_END}`;
       client = new nkn.MultiClient({
         seed: getOrCreateSeed(),
         identifier: 'web',
-        numSubClients: Math.max(1, Math.min(12, Number(settings.peers) || 4)),  // ← NEW
-        originalClient: true,    // total effective peers ≈ numSubClients + 1
+        numSubClients: Math.max(1, Math.min(12, Number(settings.peers) || 4)),
+        originalClient: true,
         responseTimeout: 15000,
-        msgHoldingSeconds: 600
+        msgHoldingSeconds: 600,
+
+        // Tolerate mobile timer clamping & transient WS flaps on the browser side
+        wsConnHeartbeatTimeout: 120000,  // 120s (mirrors your hub)
+        reconnectIntervalMin: 1000,
+        reconnectIntervalMax: 10000,
+        connectTimeout: 15000,
+        // Optionally: pin to WS seed nodes you trust
+        // seedWsAddr: ['wss://<seed-1>', 'wss://<seed-2>'],
       });
+
 
       client.onConnect(() => {
         isConnecting = false;
@@ -2922,11 +2950,12 @@ ${META_END}`;
       client.on('willreconnect', () => {
         isConnecting = false;
         isConnected = false;
-        setPeersUI(0);        // transiently show 0 while reconnecting
+        // Keep the previous peers display; MultiClient will repopulate shortly.
         stopPeersPolling();
         setLatencyUI(null);
         setConn(RECONNECTING_HTML);
       });
+
       client.on('connectFailed', () => {
         isConnecting = false;
         isConnected = false;
@@ -3369,7 +3398,7 @@ ${META_END}`;
         // optional: flash the stop button or show a toast here
         return;
       }
-      
+
       const s = getSession(); if (!s) { alert('Choose a model first.'); return; }
       const text = el('prompt').value;
       if (!text.trim() && pendingImages.length === 0) return;
