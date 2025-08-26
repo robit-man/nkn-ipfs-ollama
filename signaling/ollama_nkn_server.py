@@ -1393,6 +1393,53 @@ def _cancel_llm(body: dict):
     stream = _llm_streams.get(sid)
     if stream: stream.cancel()
 
+
+# Advertised control-ops this node supports
+CTRL_CAPS = {"models", "info", "peers", "caps"}  # add/remove here as you grow
+
+def _send_ctrl_caps(dst: str):
+    """Advertise supported control-plane operations."""
+    _dm(dst, {
+        "event": "ctrl.caps",
+        "ts": _now_ms(),
+        "version": 1,               # bump if you change ctrl semantics
+        "supports": sorted(CTRL_CAPS)
+    })
+
+def _send_ctrl_peers(dst: str, detail: str = "count"):
+    """
+    Return information about connected peers.
+    detail: 'count' | 'addrs' | 'geo'
+    - count: just the total number of connected clients
+    - addrs: the list of client addresses
+    - geo:   address + last known (lat, lon, ts) if you use join/state
+    """
+    try:
+        c = len(clients)  # 'clients' appears in your globe section
+    except Exception:
+        c = 0
+
+    payload = {"event": "ctrl.peers", "ts": _now_ms(), "count": c}
+
+    detail = (detail or "count").lower()
+    if detail == "addrs":
+        try:
+            payload["addrs"] = list(clients)
+        except Exception:
+            payload["addrs"] = []
+    elif detail == "geo":
+        rows = []
+        try:
+            for addr in list(clients):
+                p = peers_by_addr.get(addr, None) or {"lat": 0.0, "lon": 0.0, "ts": 0}
+                rows.append({"addr": addr, "lat": p["lat"], "lon": p["lon"], "ts": p["ts"]})
+        except Exception:
+            pass
+        payload["peers"] = rows
+
+    _dm(dst, payload)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # IX. DM handler (control + sessions + LLM + legacy globe)
 # ──────────────────────────────────────────────────────────────────────
@@ -1418,15 +1465,39 @@ def _handle_dm(src_addr: str, body: dict):
     # Control
     if ev == "ctrl.request":
         op = (body.get("op") or "").strip().lower()
+
         if op == "models":
             _send_models_list(src_addr)
+
         elif op == "info":
-            _dm(src_addr, {"event":"ctrl.info","ts":_now_ms(),
-                           "nknAddress": state["nkn_address"], "topicPrefix": state["topic_prefix"],
-                           "ollamaHost": OLLAMA_HOST})
+            _dm(src_addr, {
+                "event": "ctrl.info",
+                "ts": _now_ms(),
+                "nknAddress": state.get("nkn_address"),
+                "topicPrefix": state.get("topic_prefix"),
+                "ollamaHost": OLLAMA_HOST
+            })
+
+        elif op in ("caps", "hello", "capabilities"):
+            # let clients discover what ops are safe to call
+            _send_ctrl_caps(src_addr)
+
+        elif op == "peers":
+            # optional: frontend may pass {"detail":"count"|"addrs"|"geo"}
+            detail = (body.get("detail") or body.get("include") or "count")
+            _send_ctrl_peers(src_addr, detail=detail)
+
         else:
-            _dm(src_addr, {"event":"ctrl.error","ts":_now_ms(),"op":op,"message":"unknown op"})
+            # Keep the error for unknown ops, but make it self-describing
+            _dm(src_addr, {
+                "event": "ctrl.error",
+                "ts": _now_ms(),
+                "op": op,
+                "message": "unknown op",
+                "supports": sorted(CTRL_CAPS)  # helps older clients downgrade gracefully
+            })
         return
+
 
     # ─────────────────────────────────────────────────────
     # BLOB multi-part ingest (client → hub)
