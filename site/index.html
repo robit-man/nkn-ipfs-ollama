@@ -584,6 +584,30 @@
 
     }
 
+    /* jump-to-bottom button */
+    #scrollToBottomBtn {
+      position: absolute;
+      right: 16px;
+      bottom: 88px;
+      /* sits above the composer */
+      display: none;
+      background: #0a0a0a;
+      border: 1px solid #2a2a2a;
+      border-radius: 999px;
+      padding: 10px;
+      box-shadow: var(--shadow);
+      cursor: pointer;
+      z-index: 12;
+    }
+
+    #scrollToBottomBtn:hover {
+      transform: translateY(-1px);
+    }
+
+    #scrollToBottomBtn:active {
+      transform: translateY(0);
+    }
+
     #modelCaps {
       margin-right: auto;
       display: none;
@@ -1757,34 +1781,161 @@
     }
 
 
+    // ── Sticky autoscroll manager ───────────────────────────────────────────────
+    const StickyScroll = (() => {
+      const BOTTOM_STICK_THRESHOLD = 80; // px user must be within to count as "at bottom"
+
+      let chatEl = null;
+      let btn = null;
+      let isSticky = true;       // "stick to bottom" only while generating
+      let isGenerating = false;
+
+      const arrowSvg = `
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+         xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M12 5v12m0 0l-5-5m5 5l5-5" stroke="#ffffff"
+            stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`;
+
+      function distToBottom() {
+        if (!chatEl) return 0;
+        return Math.max(0, chatEl.scrollHeight - (chatEl.scrollTop + chatEl.clientHeight));
+      }
+      function atBottom() { return distToBottom() <= BOTTOM_STICK_THRESHOLD; }
+
+      function scrollToBottom(smooth = true) {
+        if (!chatEl) return;
+        const top = chatEl.scrollHeight;
+        chatEl.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' });
+      }
+
+      function setBtnVisible(show) {
+        if (!btn) return;
+        btn.style.display = show ? 'flex' : 'none';
+      }
+
+      function updateBtn() {
+        // show only when: generating, not sticky, and there’s content below
+        setBtnVisible(isGenerating && !isSticky && distToBottom() > BOTTOM_STICK_THRESHOLD);
+      }
+
+      function onScroll() {
+        if (!chatEl) return;
+
+        // Only manage stickiness during generation
+        if (!isGenerating) { updateBtn(); return; }
+
+        if (atBottom()) {
+          // user intentionally scrolled to bottom → re-stick
+          if (!isSticky) { isSticky = true; updateBtn(); }
+        } else {
+          // user pulled away while generating → unstick and show caret
+          if (isSticky) { isSticky = false; updateBtn(); }
+        }
+      }
+
+      function onContentAppended() {
+        if (!chatEl) return;
+        if (isGenerating && isSticky) {
+          // keep pace with the stream with an immediate jump (no jitter)
+          chatEl.scrollTop = chatEl.scrollHeight;
+        } else {
+          updateBtn();
+        }
+      }
+
+      function setGenerating(flag) {
+        isGenerating = !!flag;
+        // (re-)compute stickiness at the moment generation starts
+        if (isGenerating) {
+          isSticky = atBottom(); // only stick if user is already near bottom
+        }
+        updateBtn();
+      }
+
+      function init(elChat) {
+        if (!elChat || chatEl) return;
+        chatEl = elChat;
+
+        // floating button lives in the same positioned container as chat
+        btn = document.createElement('button');
+        btn.id = 'scrollToBottomBtn';
+        btn.className = 'btn btnSq';
+        btn.type = 'button';
+        btn.title = 'Jump to latest';
+        btn.innerHTML = arrowSvg;
+        (chatEl.parentElement || document.body).appendChild(btn);
+
+        btn.addEventListener('click', () => { isSticky = true; scrollToBottom(true); updateBtn(); });
+        chatEl.addEventListener('scroll', onScroll, { passive: true });
+
+        // initial state
+        isSticky = true; isGenerating = false; updateBtn();
+      }
+
+      // expose a tiny API
+      return { init, setGenerating, onContentAppended, scrollToBottom };
+    })();
+
+
     function renderChat() {
-      //console.log("RENDERING CHAT----------------------------------------------------------------")
-      const s = getSession(); const box = el('chat'); box.innerHTML = '';
-      //console.log(s)
-      if (!s) { box.innerHTML = `<div class="muted" style="text-align:center;margin-top:30px">Choose a model above to create a session.</div>`; return; }
+      const s = getSession();
+      const box = el('chat');
+      if (!box) return;
+
+      // one-time setup for sticky autoscroll manager
+      if (!window.__stickyReady) {
+        StickyScroll.init(box);
+        window.__stickyReady = true;
+      }
+
+      // clear and (re)render
+      box.innerHTML = '';
+
+      if (!s) {
+        box.innerHTML = `<div class="muted" style="text-align:center;margin-top:30px">
+      Choose a model above to create a session.
+    </div>`;
+        StickyScroll.onContentAppended();
+        return;
+      }
+
+      // render efficiently via a fragment to minimize layout thrash
+      const frag = document.createDocumentFragment();
 
       s.messages.forEach(m => {
         const w = document.createElement('div');
         w.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
-        //console.log(w)
 
         const contentHtml = messageHtml(m.role, m.content);
         const whoLabel = (m.role === 'user') ? 'user' : (m.agent || s.model || 'assistant');
 
         let imagesHtml = '';
         if (Array.isArray(m.images) && m.images.length) {
-          imagesHtml = `<div class="row" style="margin-top:6px;flex-wrap:wrap;gap:6px;">` +
-            m.images.map(src => `<img src="${src}" alt="" style="width:140px;height:140px;object-fit:cover;border-radius:8px;border:1px solid #2a2a2a;">`).join('') +
-            `</div>`;
+          imagesHtml = `<div class="row" style="margin-top:6px;flex-wrap:wrap;gap:6px;">${m.images.map(src =>
+            `<img src="${src}" alt="" style="width:140px;height:140px;object-fit:cover;border-radius:8px;border:1px solid #2a2a2a;">`
+          ).join('')
+            }</div>`;
         }
 
-        w.innerHTML = `<div class="meta">${whoLabel} • ${new Date(m.ts).toLocaleTimeString()}</div>
-                      <div class="content">${contentHtml}</div>${imagesHtml}`;
-        box.appendChild(w);
-        highlightIn(w);
+        w.innerHTML = `
+      <div class="meta">${whoLabel} • ${new Date(m.ts).toLocaleTimeString()}</div>
+      <div class="content">${contentHtml}</div>
+      ${imagesHtml}
+    `;
+
+        frag.appendChild(w);
       });
-      box.scrollTop = box.scrollHeight;
+
+      box.appendChild(frag);
+
+      // run syntax highlight once after batch insert
+      try { highlightIn(box); } catch { }
+
+      // let the sticky manager decide whether to follow the bottom
+      StickyScroll.onContentAppended();
     }
+
 
 
     function addStreamingAssistantBubble() {
@@ -2213,7 +2364,7 @@ ${META_END}`;
       catch { return (JSON.stringify(obj) || '').length; }
     }
 
-    
+
     // ─────────── Outbox queue (send while connecting -> queue; flush on reconnect)
     const outbox = []; // [{ payload, route }]
     let isConnected = false, isConnecting = false;

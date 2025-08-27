@@ -1531,7 +1531,6 @@ class _LLMStream:
         elif api == "show":
             raw = self.client.show(self.model)
             conditioned = _slim_show_payload_keep_modelfile_no_license(raw)
-            print(conditioned)
             return conditioned
         elif api == "list":
             return self.client.list()
