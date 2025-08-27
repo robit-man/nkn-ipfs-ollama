@@ -355,7 +355,7 @@ bridge_env["NKN_HEAP_SOFT_MB"]  = os.environ.get("NKN_HEAP_SOFT_MB", "640") # at
 bridge_env["NKN_HEAP_HARD_MB"]  = os.environ.get("NKN_HEAP_HARD_MB", "896") # exit → watchdog restarts
 # Make crashes predictable & fast; expose GC so bridge can try to recover before restart
 node_opts = bridge_env.get("NODE_OPTIONS", "")
-extra = "--unhandled-rejections=strict --heapsnapshot-signal=SIGUSR2 --expose-gc --max-old-space-size=1024"
+extra = "--unhandled-rejections=strict --heapsnapshot-signal=SIGUSR2 --max-old-space-size=1024"
 bridge_env["NODE_OPTIONS"] = (node_opts + " " + extra).strip()
 
 def _spawn_bridge() -> Popen:
