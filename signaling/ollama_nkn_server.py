@@ -152,6 +152,22 @@ function log(...args){ console.error('[bridge]', ...args); }
 
 let READY = false;
 let queue = []; // {to, data, isPub, topic}
+const MAX_QUEUE = parseInt(process.env.NKN_MAX_QUEUE || '4000', 10);
+const HEAP_SOFT = parseInt(process.env.NKN_HEAP_SOFT_MB || '640', 10);
+const HEAP_HARD = parseInt(process.env.NKN_HEAP_HARD_MB || '896', 10);
+
+function heapMB() {
+  const m = process.memoryUsage();
+  return Math.round(((m.rss || 0) / 1024 / 1024));
+}
+function enqueue(item) {
+  if (queue.length >= MAX_QUEUE) {
+    const drop = queue.splice(0, Math.ceil(MAX_QUEUE * 0.10)); // drop oldest 10%
+    try { sendToPy({ type: 'queue.drop', drop: drop.length, q: queue.length }); } catch {}
+  }
+  queue.push(item);
+}
+
 const SEND_OPTS = { noReply: true, maxHoldingSeconds: 120 };
 
 // Suspend window to pause drain on transient WS closures
@@ -184,11 +200,12 @@ const client = new nkn.MultiClient({
   connectTimeout: 15000,
 });
 
-  client.on('connect', () => {
-    READY = true;
-    sendToPy({ type: 'ready', address: client.addr, topicPrefix: TOPIC_NS, ts: Date.now() });
-    log('ready at', client.addr);
-  });
+client.on('connect', () => {
+  if (READY) return;                 // ← prevent duplicate ready spam
+  READY = true;
+  sendToPy({ type: 'ready', address: client.addr, topicPrefix: TOPIC_NS, ts: Date.now() });
+  log('ready at', client.addr);
+});
 
   client.on('error', e => {
     const msg = (e && e.message) || String(e || '');
@@ -255,26 +272,49 @@ if (msg.includes('WebSocket unexpectedly closed') || msg.includes('VERIFY SIGNAT
   setInterval(drain, 300);
 
   // Heartbeat to Python watchdog
-  setInterval(() => {
-    try { sendToPy({ type: 'hb', ts: Date.now(), ready: READY }); } catch {}
-  }, 5000);
+// Heap guard: soft trim, then hard exit (Python watchdog restarts us)
+setInterval(() => {
+  const mb = heapMB();
+  if (mb >= HEAP_SOFT) {
+    try { if (global.gc) global.gc(); } catch {}
+    if (queue.length > Math.floor(MAX_QUEUE * 0.6)) {
+      const drop = queue.splice(0, Math.max(1, queue.length - Math.floor(MAX_QUEUE * 0.6)));
+      try { sendToPy({ type: 'queue.trim', drop: drop.length, q: queue.length, mb }); } catch {}
+    }
+  }
+  if (mb >= HEAP_HARD) {
+    try { sendToPy({ type: 'crit.heap', mb, q: queue.length }); } catch {}
+    process.exitCode = 137;
+    setTimeout(() => process.exit(137), 10);
+  }
+}, 2000);
+
+// ✅ Add this (separate) heartbeat back:
+setInterval(() => {
+  try { sendToPy({ type: 'hb', ts: Date.now(), ready: READY, q: queue.length, mb: heapMB() }); } catch {}
+}, 5000);
+
+// Fail fast on unexpected errors
+process.on('uncaughtException', (e) => { try { sendToPy({ type: 'crit.uncaught', msg: String(e&&e.message||e) }); } catch {}; process.exit(1); });
+process.on('unhandledRejection', (e) => { try { sendToPy({ type: 'crit.unhandled', msg: String(e&&e.message||e) }); } catch {}; process.exit(1); });
+
 
   const rl = readline.createInterface({ input: process.stdin });
   rl.on('line', async line => {
     if (!line) return;
     let cmd; try { cmd = JSON.parse(line); } catch { return; }
     if (cmd.type === 'dm' && cmd.to && cmd.data) {
-      if (!READY) queue.push({to: cmd.to, data: cmd.data});
-      else {
+    if (!READY) enqueue({to: cmd.to, data: cmd.data});
+    else {
         const ok = await safeSendDM(cmd.to, cmd.data);
-        if (!ok) queue.unshift({to: cmd.to, data: cmd.data}); // retry later
-      }
+        if (!ok) enqueue({to: cmd.to, data: cmd.data});   // ← was it.*
+    }
     } else if (cmd.type === 'pub' && cmd.topic && cmd.data) {
-      if (!READY) queue.push({isPub:true, topic: cmd.topic, data: cmd.data});
-      else {
+    if (!READY) enqueue({isPub:true, topic: cmd.topic, data: cmd.data});
+    else {
         const ok = await safePub(cmd.topic, cmd.data);
-        if (!ok) queue.unshift({isPub:true, topic: cmd.topic, data: cmd.data}); // retry later
-      }
+        if (!ok) enqueue({isPub:true, topic: cmd.topic, data: cmd.data}); // ← was it.*
+    }
     }
   });
 })();
@@ -295,13 +335,28 @@ _ready_at = 0.0
 _bridge_starts = 0
 _bridge_lock = threading.Lock()
 _bridge_write_lock = threading.Lock()  # ← serialize writes to child stdin
-
+_last_restart_ts = 0.0
+_FORCE_RESTART = False
+_CRIT_ERR_PATTERNS = (
+    "FATAL ERROR: Ineffective mark-compacts",
+    "JavaScript heap out of memory",
+    "FatalProcessOutOfMemory",
+    "node::Abort()",
+    "v8::internal::V8::FatalProcessOutOfMemory",
+)
 # Track websocket flap storms (repeated 'wsclosed' events) so we can restart proactively
 _ws_flap_times: List[float] = []
 _ws_flap_lock = threading.Lock()
 WS_FLAP_WINDOW = 60.0   # seconds to look back
 WS_FLAP_MAX = 6         # restart if >= this many wsclosed in window
-
+# ---- memory/backpressure tuning for the Node bridge
+bridge_env["NKN_MAX_QUEUE"]     = os.environ.get("NKN_MAX_QUEUE", "4000")   # max pending sends
+bridge_env["NKN_HEAP_SOFT_MB"]  = os.environ.get("NKN_HEAP_SOFT_MB", "640") # attempt GC, trim queue
+bridge_env["NKN_HEAP_HARD_MB"]  = os.environ.get("NKN_HEAP_HARD_MB", "896") # exit → watchdog restarts
+# Make crashes predictable & fast; expose GC so bridge can try to recover before restart
+node_opts = bridge_env.get("NODE_OPTIONS", "")
+extra = "--unhandled-rejections=strict --heapsnapshot-signal=SIGUSR2 --expose-gc --max-old-space-size=1024"
+bridge_env["NODE_OPTIONS"] = (node_opts + " " + extra).strip()
 
 def _spawn_bridge() -> Popen:
     global _last_hb, _ready_at, _bridge_starts
@@ -345,10 +400,14 @@ def _bridge_reader_stdout():
                 continue
 
             if msg.get("type") == "ready":
-                state["nkn_address"]  = msg.get("address")
+                addr = msg.get("address")
+                if state.get("nkn_address") == addr and _ready_at > 0:
+                    continue  # ← ignore duplicate ready
+                state["nkn_address"]  = addr
                 state["topic_prefix"] = msg.get("topicPrefix") or TOPIC_PREFIX
                 _ready_at = time.time()
                 print(f"→ NKN ready: {state['nkn_address']}  (topics prefix: {state['topic_prefix']})")
+
 
             elif msg.get("type") == "hb":
                 _last_hb = time.time()
@@ -372,6 +431,16 @@ def _bridge_reader_stdout():
                 src = msg.get("src") or ""
                 body = msg.get("msg") or {}
                 _handle_dm(src, body)
+            elif msg.get("type") in ("queue.drop", "queue.trim"):
+                mb = msg.get("mb")
+                if mb is not None:
+                    print(f"⚠️ bridge backpressure: {msg['type']} drop={msg.get('drop')} q={msg.get('q')} mb={mb}")
+                else:
+                    print(f"⚠️ bridge backpressure: {msg['type']} drop={msg.get('drop')} q={msg.get('q')}")
+
+            elif msg.get("type") in ("crit.heap", "crit.uncaught", "crit.unhandled"):
+                print(f"‼️ bridge critical: {msg.get('type')} mb={msg.get('mb')} q={msg.get('q')}")
+                globals()["_FORCE_RESTART"] = True
         except Exception:
             time.sleep(0.2)
 
@@ -380,7 +449,11 @@ def _bridge_reader_stderr():
         try:
             if bridge and bridge.stderr:
                 line = bridge.stderr.readline()
-                if line: sys.stderr.write(line)
+                if line:
+                    sys.stderr.write(line)
+                    low = line.lower()
+                    if any(pat.lower() in low for pat in _CRIT_ERR_PATTERNS):
+                        globals()["_FORCE_RESTART"] = True
                 else:
                     time.sleep(0.1)
             else:
@@ -389,13 +462,29 @@ def _bridge_reader_stderr():
             time.sleep(0.2)
 
 def _restart_bridge_locked():
-    global bridge
+    global bridge, _last_restart_ts
+    now = time.time()
+    # 2s min backoff to avoid hot loops
+    if (now - _last_restart_ts) < 2.0 and bridge:
+        return
+    _last_restart_ts = now
     try:
         if bridge:
-            try: bridge.terminate()
-            except Exception: pass
+            try:
+                bridge.terminate()
+                # wait up to 1.5s, then kill
+                for _ in range(15):
+                    if bridge.poll() is not None:
+                        break
+                    time.sleep(0.1)
+                if bridge.poll() is None:
+                    bridge.kill()
+            except Exception:
+                try: bridge.kill()
+                except Exception: pass
     finally:
         bridge = _spawn_bridge()
+
 
 def _watchdog_loop():
     global bridge, _last_hb, _ready_at
@@ -428,6 +517,11 @@ def _watchdog_loop():
                             need_restart = True
                     except Exception:
                         pass
+
+                if globals().get("_FORCE_RESTART"):
+                    print("↻ restarting NKN bridge (critical stderr pattern) …")
+                    globals()["_FORCE_RESTART"] = False
+                    need_restart = True
 
                 if need_restart:
                     # reset flap counter before restart
@@ -620,6 +714,70 @@ def _send_models_list(to: str, req_id: Optional[str] = None):
         _dm(to, {"event": "ctrl.models", "id": rid, "data": data, "ts": _now_ms()})
         _log("models.sent", f"→ {to} id={rid} count={len((data or {}).get('models', []))}")
 
+import re
+from datetime import datetime
+import base64 as _b64
+
+# if you haven't already, harden _to_jsonable a bit
+def _to_jsonable(x):
+    if isinstance(x, (str, int, float, bool)) or x is None:
+        return x
+    if isinstance(x, datetime):
+        return x.isoformat()
+    if isinstance(x, (bytes, bytearray, memoryview)):
+        try: return _b64.b64encode(bytes(x)).decode("ascii")
+        except Exception: return str(x)
+    if isinstance(x, (set, frozenset)):
+        return [_to_jsonable(i) for i in sorted(list(x), key=lambda t: str(t))]
+    if isinstance(x, (list, tuple)):
+        return [_to_jsonable(i) for i in x]
+    if isinstance(x, dict):
+        return {k: _to_jsonable(v) for k, v in x.items()}
+    if hasattr(x, "model_dump") and callable(getattr(x, "model_dump")):
+        return _to_jsonable(x.model_dump())
+    if hasattr(x, "dict") and callable(getattr(x, "dict")):
+        return _to_jsonable(x.dict())
+    if hasattr(x, "__dict__"):
+        return _to_jsonable({k: v for k, v in x.__dict__.items() if not k.startswith("_")})
+    return str(x)
+
+# strip LICENSE directive inside an Ollama Modelfile, but keep everything else verbatim
+_LICENSE_TRIPLE_DQ = re.compile(r'(?is)^[ \t]*LICENSE[ \t]+"""[\s\S]*?"""[ \t]*\n?', re.MULTILINE)
+_LICENSE_TRIPLE_SQ = re.compile(r"(?is)^[ \t]*LICENSE[ \t]+'''[\s\S]*?'''[ \t]*\n?", re.MULTILINE)
+_LICENSE_SINGLE_DQ = re.compile(r'(?im)^[ \t]*LICENSE[ \t]+"[^"\n]*"[ \t]*\n?', re.MULTILINE)
+_LICENSE_SINGLE_SQ = re.compile(r"(?im)^[ \t]*LICENSE[ \t]+'[^'\n]*'[ \t]*\n?", re.MULTILINE)
+# sometimes Modelfiles or exports contain lowercase assignment like: license="…"
+_LICENSE_ASSIGN     = re.compile(r'(?is)^[ \t]*license[ \t]*=[ \t]*(?:"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"[^"\n]*"|\'[^\n\']*\')[ \t]*\n?', re.MULTILINE)
+
+def _strip_license_from_modelfile(s: str) -> str:
+    if not isinstance(s, str): return s
+    s = _LICENSE_TRIPLE_DQ.sub("", s)
+    s = _LICENSE_TRIPLE_SQ.sub("", s)
+    s = _LICENSE_SINGLE_DQ.sub("", s)
+    s = _LICENSE_SINGLE_SQ.sub("", s)
+    s = _LICENSE_ASSIGN.sub("", s)
+    return s
+
+def _slim_show_payload_keep_modelfile_no_license(raw):
+    """Return the .show() dict, preserving modelfile but removing license text/fields."""
+    d = _to_jsonable(raw)
+    if not isinstance(d, dict):
+        return d
+
+    # drop any explicit license fields
+    for k in ("license", "License", "LICENSE", "license_url", "license_text"):
+        d.pop(k, None)
+    det = d.get("details")
+    if isinstance(det, dict):
+        for k in ("license", "License", "LICENSE", "license_url", "license_text"):
+            det.pop(k, None)
+
+    # scrub license from the modelfile itself
+    mf = d.get("modelfile")
+    if isinstance(mf, str):
+        d["modelfile"] = _strip_license_from_modelfile(mf)
+
+    return d
 
 # ──────────────────────────────────────────────────────────────────────
 # VI. Session store
@@ -639,6 +797,16 @@ class Session:
         self.last_used = time.time()
 
 SESSIONS: Dict[tuple, Session] = {}  # (src_addr, sid) -> Session
+SESSIONS_HARD_CAP = int(os.environ.get("SESSIONS_HARD_CAP", "500"))
+
+def _evict_oldest_sessions_if_needed():
+    if len(SESSIONS) <= SESSIONS_HARD_CAP:
+        return
+    # Evict ~10% oldest by last_used
+    k_sorted = sorted(SESSIONS.items(), key=lambda kv: kv[1].last_used)
+    to_evict = max(1, len(SESSIONS) - int(SESSIONS_HARD_CAP * 0.9))
+    for k, _ in k_sorted[:to_evict]:
+        SESSIONS.pop(k, None)
 
 def _sess_key(src_addr: str, sid: str): return (src_addr, sid or "")
 # allow tool role; preserve tool-related fields
@@ -687,6 +855,7 @@ def _open_session(src_addr:str, sid:str, model:str=None, system:str=None, option
     if not isinstance(sid, str) or not sid:
         raise ValueError("invalid sid")
     with SESSION_LOCK:
+        _evict_oldest_sessions_if_needed()
         key = _sess_key(src_addr, sid)
         s = SESSIONS.get(key)
         if s is None:
@@ -914,6 +1083,10 @@ def _resolve_blob_ref(src_addr: str, ref: str) -> Optional[bytes]:
     except Exception:
         return None
 
+# Global caps to keep memory predictable
+INLINE_IMAGE_MAX_B = int(os.environ.get("INLINE_IMAGE_MAX_B", str(256 * 1024)))   # 256 KiB per inline base64 (non-blob)
+MAX_BLOB_BYTES     = int(os.environ.get("MAX_BLOB_BYTES", str(25 * 1024 * 1024))) # 25 MiB per reassembled image
+
 def _massage_images_in_messages(
     msgs: List[Dict[str, Any]],
     src_addr: Optional[str] = None,
@@ -982,6 +1155,9 @@ def _massage_images_in_messages(
             if isinstance(it, str):
                 b = _decode_b64_to_bytes(it)
                 if b:
+                    if len(b) > INLINE_IMAGE_MAX_B:
+                        _log("vision.drop", f"inline image too large ({len(b)} bytes) — dropped")
+                        continue
                     import hashlib
                     h = hashlib.sha256(b).hexdigest()
                     if h not in seen_hashes:
@@ -1148,6 +1324,8 @@ class _LLMStream:
     WINDOW_LIMIT    = 512
     FINAL_SWEEPS    = 3
     FINAL_GAP_SECS  = 0.12
+    ACK_STALL_SECS   = 25.0     # if no ACK progress for this long while window is big → abort
+    MAX_WINDOW_PKTS  = 1024     # hard cap to avoid runaway RAM
 
     def __init__(self, src_addr: str, req: dict,
                  on_start=None, on_delta=None, on_done=None):
@@ -1161,6 +1339,7 @@ class _LLMStream:
 
         self.seq      = 0
         self.last_acked = 0
+        self._last_ack_change = time.monotonic()
         self.window   = {}
         self.window_order = []
         self.done_sent  = False
@@ -1216,7 +1395,12 @@ class _LLMStream:
                     self.window.pop(oldest, None)
                 else:
                     self.window_order.insert(0, oldest)
+            if len(self.window_order) > self.MAX_WINDOW_PKTS:
+                self._send_error("backpressure: client not ACKing fast enough; aborting stream", kind="backpressure")
+                self.cancelled = True
+                return
             self._dm(pkt)
+            
         try:
             if callable(self.on_delta):
                 delta = _extract_delta_from_part(self.api, data)
@@ -1253,6 +1437,7 @@ class _LLMStream:
         with self._lock:
             if upto > self.last_acked:
                 self.last_acked = upto
+                self._last_ack_change = time.monotonic()
                 for s in [s for s in list(self.window.keys()) if s <= self.last_acked]:
                     self.window.pop(s, None)
                 self.window_order = [s for s in self.window_order if s > self.last_acked]
@@ -1263,6 +1448,15 @@ class _LLMStream:
 
     def _resend_loop(self):
         while True:
+            now = time.monotonic()
+            with self._lock:
+                stalled = (now - self._last_ack_change) > self.ACK_STALL_SECS
+                unacked = self.seq - self.last_acked
+            if stalled and unacked > (self.MAX_WINDOW_PKTS // 2):
+                self._send_error("ack stall: aborting stream to prevent memory pressure", kind="ack_stall")
+                self.cancelled = True
+                return
+
             if self.cancelled:
                 return
             time.sleep(self.RESEND_INTERVAL)
@@ -1335,7 +1529,10 @@ class _LLMStream:
         elif api == "embed":
             return self.client.embed(model=self.model, **self.kwargs)
         elif api == "show":
-            return self.client.show(self.model)
+            raw = self.client.show(self.model)
+            conditioned = _slim_show_payload_keep_modelfile_no_license(raw)
+            print(conditioned)
+            return conditioned
         elif api == "list":
             return self.client.list()
         elif api == "ps":
@@ -1522,6 +1719,12 @@ def _handle_dm(src_addr: str, body: dict):
             name = str(body.get("name") or "")
             mime = str(body.get("mime") or "")
             size = int(body.get("size") or 0)
+            # Optional hard cap on blob size (protect disk & RAM)
+            BLOB_MAX_SIZE = int(os.environ.get("BLOB_MAX_SIZE", str(200 * 1024 * 1024)))  # 200 MiB default
+            if size <= 0 or size > BLOB_MAX_SIZE:
+                _dm(src_addr, {"event": "blob.error", "id": bid, "message": f"invalid size (max {BLOB_MAX_SIZE} bytes)"})
+                return
+
             csz  = int(body.get("chunkSize") or 0)
             total= int(body.get("total") or 0)
             sha  = str(body.get("sha256") or "") or None
@@ -1706,9 +1909,9 @@ def _handle_dm(src_addr: str, body: dict):
         kwargs = body.get("kwargs") or {}
         model  = (body.get("model") or "").strip() or None
 
-        if api == "list" and not stream:
+        if api == "list":
             _send_models_list(src_addr, body.get("id"))
-            _log("llm.list", f"{src_addr} id={body.get('id')} → models sent")
+            _log("llm.list", f"{src_addr} id={body.get('id')} → models sent (stream={stream})")
             return
 
 
@@ -1953,8 +2156,8 @@ def bootstrap():
         "topicPrefix": state.get("topic_prefix"),
         "seeds_ws": seeds,         # existing name
         "seedWsAddr": seeds,       # name used by nkn-sdk-js options
-        "wsOnly": True,            # hint to skip WebRTC entirely in the browser
-        "rtc": _DEFAULT_ICE,       # kept for compatibility; frontend can ignore if wsOnly==True
+        "wsOnly": (policy == "websocket-only"),  # ← use the policy (or just DISABLE_WEBRTC)
+        "rtc": _DEFAULT_ICE,
         "retry": {
             "reconnectIntervalMin": 1000,
             "reconnectIntervalMax": 10000,

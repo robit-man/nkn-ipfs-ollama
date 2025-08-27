@@ -166,7 +166,6 @@
       top: 0;
       z-index: 20;
       border-bottom: 1px solid var(--line);
-      box-shadow: 0px 0px 20px 10px black;
 
     }
 
@@ -319,6 +318,18 @@
       flex-direction: column;
       justify-content: flex-end;
       min-width: 0
+    }
+
+    .col-main::before {
+      content: "";
+      position: absolute;
+      top: 0px;
+      z-index: 10;
+      height: 20%;
+      pointer-events: none;
+      mask: linear-gradient(black, #000a, #0005, transparent, transparent, transparent);
+      backdrop-filter: brightness(0)blur(10px);
+      width: 100%;
     }
 
     .sysedit {
@@ -1662,9 +1673,11 @@
         if (!tryRenderModelInfoFromCache(s.model)) {
           // Only fetch if not cached (avoids repeated round-trips when hopping sessions)
           fetchModelInfo(s.model, (res) => {
-            if (!res?.ok) return;
+            if (!res?.ok) console.log("NOT OK!!!!!!!!!!!!!!!!!!!!!!!!!!!"); return;
             const data = (res.body && (res.body.data || res.body)) || {};
+            console.log(data)
             const info = normalizeModelShow(s.model, data);
+            console.log(info)
             renderModelInfo(info);
             const hasVision = Array.isArray(info.capabilities) && info.capabilities.some(c => String(c).toLowerCase() === 'vision');
             toggleImageAttach(!!hasVision);
@@ -1743,7 +1756,7 @@
       updateSysMetaButtons();
     }
 
-   
+
     function renderChat() {
       //console.log("RENDERING CHAT----------------------------------------------------------------")
       const s = getSession(); const box = el('chat'); box.innerHTML = '';
@@ -1753,7 +1766,7 @@
       s.messages.forEach(m => {
         const w = document.createElement('div');
         w.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
-      //console.log(w)
+        //console.log(w)
 
         const contentHtml = messageHtml(m.role, m.content);
         const whoLabel = (m.role === 'user') ? 'user' : (m.agent || s.model || 'assistant');
@@ -2192,6 +2205,15 @@ ${META_END}`;
     function routeFor(id) { return ROUTES.get(id) || { sink: 'chat' }; }
     function clearRoute(id) { ROUTES.delete(id); }
 
+
+
+
+    function approxBytes(obj) {
+      try { return new Blob([JSON.stringify(obj)]).size; }
+      catch { return (JSON.stringify(obj) || '').length; }
+    }
+
+    
     // ─────────── Outbox queue (send while connecting -> queue; flush on reconnect)
     const outbox = []; // [{ payload, route }]
     let isConnected = false, isConnecting = false;
@@ -2814,7 +2836,7 @@ ${META_END}`;
 
     // Back off: let the SDK handle path rotation & reconnects.
     // We only intervene if we miss multiple pongs *and* all subclients are 0 for a while.
-    const HEARTBEAT_MS = 6000;                // ping every 6s (tolerant of timer clamping)
+    const HEARTBEAT_MS = 1000;                // ping every 6s (tolerant of timer clamping)
     const MISSED_PONG_LIMIT = 4;              // ~24s of missed pongs before we consider action
     const PEERS_ZERO_GRACE_MS = 12000;        // require peers==0 for at least 12s too
     let hbTimer = null;
@@ -3251,14 +3273,42 @@ ${META_END}`;
           return true;
         }
 
-        // Only re-render chat if we are NOT mid-stream
-        const sess = getSession(); if (!sess) { clearRoute(body.id); return true; }
-        if (!isStreaming && !pendingStreamId) renderChat();
+        if (route.sink === 'element') {
+          const elx = resolveEl(route.elId);
+          const text = extractFull(body.data) || '';
+          writeToElement(elx, text, { mode: route.mode || 'replace', format: route.format || 'text' });
+          lockElement(elx, false);
+          if (route.elId) streamingElements.delete(route.elId);
 
+          if (route.elId === 'systemMsg') {
+            const s = getSession();
+            if (s) { s.system = (el('systemMsg').value || ''); saveJSON(STORAGE.SESS, sessions); sendSessionOpen(s, /*seed*/false); }
+            setSysGenBusy(false);
+            sysgenPending.delete(body.id);
+          }
+          isSysGenStreaming = false; sysgenCurrentId = null;
+          clearRoute(body.id);
+          return true;
+        }
+
+        // Non-element (chat) result — keep your capability toggle for show payloads
+        try {
+          if (isLikelyModelShowPayload(body.data)) {
+            const raw = (body.data && body.data.data) ? body.data.data : body.data;
+            const model = getCurrentModel() || '';
+            const info = normalizeModelShow(model, raw);
+            cacheSetModelInfo(model, info);
+            renderModelInfo(info);
+            const hasVision = Array.isArray(info.capabilities) && info.capabilities.some(c => String(c).toLowerCase() === 'vision');
+            toggleImageAttach(hasVision);
+          }
+        } catch (e) { console.debug('[caps-toggle] skipped:', e); }
+
+        const sess = getSession(); if (!sess) { clearRoute(body.id); return true; }
+        renderChat();
         clearRoute(body.id);
         return true;
       }
-
 
       if (ev === 'llm.error') {
         // callback sink
@@ -3307,24 +3357,22 @@ ${META_END}`;
         }
 
         const body = decodePayload(raw);
-        if (!body || typeof body !== 'object') return false;       // ← suppress SDK ACK
+        if (!body || typeof body !== 'object') return;
 
         const ev = body.event || '';
         const srcStr = String(src || '');
 
         try { logRecvPacket(srcStr, raw, body); } catch { }
 
-        if (!_sameHubOrTrusted(ev, srcStr)) return false;           // ← suppress SDK ACK
+        if (!_sameHubOrTrusted(ev, srcStr)) return;
 
-        // If either handler consumed it, suppress SDK ACK.
-        if (onInboundCtrl(ev, body, srcStr)) return false;          // ← was `return;`
-        if (onInboundData(ev, body, srcStr)) return false;          // ← was `return;`
+        // Route to CTRL first; if not handled there, DATA handler gets a chance
+        if (onInboundCtrl(ev, body, srcStr)) return;
+        if (onInboundData(ev, body, srcStr)) return;
 
-        // Unknown/noisy frames: still suppress SDK ACK (we don’t want RTC DC acks at all)
-        return false;
+        // fallthrough: ignore unknown/noisy frames silently
       } catch (err) {
         console.warn('[onInbound] swallowed error', err);
-        return false;                                               // ← suppress SDK ACK on errors too
       }
     }
 
@@ -3361,12 +3409,6 @@ ${META_END}`;
     function formatCapabilitiesLine(d) {
       const caps = extractCapabilitiesOnly(d);
       return 'Capabilities: ' + (caps.length ? caps.join(', ') : '—');
-    }
-
-
-    function approxBytes(obj) {
-      try { return new Blob([JSON.stringify(obj)]).size; }
-      catch { return (JSON.stringify(obj) || '').length; }
     }
 
     function setSendUploading(on) {
