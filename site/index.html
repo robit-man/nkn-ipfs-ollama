@@ -1048,7 +1048,7 @@
         Resets your local NKN seed (32‑byte) and reconnects with a new keypair.
       </div>
     </div>
-    <div class="backdropModal" onclick="closeSettings()"></div>
+    <div class="backdropModal" id="backdropModal"></div>
   </div>
 
   <!-- Copy-to-clipboard helper for code blocks -->
@@ -1537,7 +1537,8 @@
           rtts: [],
           fp,
           acceptWatch: null,
-
+          retryTicker: null,
+          partRetryMs: 0,  // computed from RTTs
           // staged pipeline
           staged: true,
           uploading: false,
@@ -1621,6 +1622,57 @@
         armWatchdog();
 
         setTimeout(() => pumpBlob(id), 0);
+        startBlobRetryWatch(id);
+      }
+
+      async function sendBlobPartBySeq(id, seq) {
+        const up = uploads.get(id); if (!up || up.done || !up.uploading) return;
+        const start = seq * up.chunkSize;
+        const end = Math.min(up.size, start + up.chunkSize);
+        const blob = up.file.slice(start, end);
+        const buf = await blob.arrayBuffer();
+        const b64 = abToBase64(buf);
+
+        up['t' + seq] = Date.now();
+        // we don't re-add to inflight (it’s already there); just resend
+        const wire = { event: 'blob.part', id, seq, data: b64 };
+        const sendOpts = { noReply: true, msgHoldingSeconds: 600, responseTimeout: 15000 };
+        if (window._PKT?.DEBUG?.ON) logSendPacket(HUB_ADDR, wire, sendOpts, { flow: 'blob.retx', seq });
+        try { await client.send(HUB_ADDR, JSON.stringify(wire), sendOpts); } catch { }
+      }
+
+      function startBlobRetryWatch(id) {
+        const up = uploads.get(id); if (!up) return;
+        if (up.retryTicker) { clearInterval(up.retryTicker); up.retryTicker = null; }
+
+
+        up.retryTicker = setInterval(() => {
+          if (!up.uploading || up.done) return;
+
+          // dynamic resend threshold: ~3x smoothed RTT (bounds: 1500..10000ms)
+          const avg = up.rtts.length ? (up.rtts.reduce((a, b) => a + b, 0) / up.rtts.length) : 800;
+          const threshold = up.partRetryMs = Math.max(1500, Math.min(10000, avg * 3));
+
+          const now = Date.now();
+          for (const seq of Array.from(up.inflight)) {
+            const t0 = up['t' + seq] || 0;
+            if (!t0 || (now - t0) > threshold) {
+              // stale → retransmit part
+              sendBlobPartBySeq(id, seq);
+            }
+          }
+
+          // If we have sent all parts and the pipe looks empty, keep nudging 'done'
+          if (up.nextSeq >= up.total && up.inflight.size === 0 && !up.done) {
+            console.info('[BLOB.DONE → announce]', { id });
+            trySend(HUB_ADDR, { event: 'blob.done', id });
+            if (!up.doneTicker) {
+              up.doneTicker = setInterval(() => {
+                if (!up.done) trySend(HUB_ADDR, { event: 'blob.done', id });
+              }, 1500);
+            }
+          }
+        }, 800);
       }
 
       async function pumpBlob(id) {
@@ -3258,26 +3310,32 @@ ${META_END}`;
         if (ev === 'blob.accept') {
           const id = body.id, up = uploads.get(id); if (!up) return true;
           if (up.acceptWatch) { clearTimeout(up.acceptWatch); up.acceptWatch = null; }
-          clearTimeout(up.noAckTimer); up.noAckMode = false; up.inflight.clear();
-
+          clearTimeout(up.noAckTimer);
+          up.noAckMode = false;
+          // ⚠️ Do NOT clear inflight here; acks for pre-accept parts may still arrive
           if (typeof body.resumeFrom === 'number' && body.resumeFrom > 0) {
             up.nextSeq = Math.min(body.resumeFrom, up.total);
-            up.acked = new Set(Array.from({ length: up.nextSeq }, (_, i) => i));
+            // Mark everything before resumeFrom as acked for progress
+            for (let s = 0; s < up.nextSeq; s++) up.acked.add(s);
             setAttachProgress(id, Math.floor((up.nextSeq / up.total) * 100));
           }
           pumpBlob(id);
           return true;
-        }
-        if (ev === 'blob.ack') {
-          const id = body.id, up = uploads.get(id); if (!up) return true;
-          if (up.acceptWatch) { clearTimeout(up.acceptWatch); up.acceptWatch = null; }
-          clearTimeout(up.noAckTimer); up.noAckMode = false;
+        } if (ev === 'blob.ack') {
+          const id = body.id;
+          const up = uploads.get(id);
+          if (!up) return true;
 
+          if (up.acceptWatch) { clearTimeout(up.acceptWatch); up.acceptWatch = null; }
+          clearTimeout(up.noAckTimer);
+          up.noAckMode = false;
+
+          // Per-chunk ACK
           if (typeof body.seq === 'number') {
-            const seq = body.seq;
-            if (seq >= 0 && up.inflight.has(seq)) {
-              up.inflight.delete(seq); up.acked.add(seq);
-              setAttachProgress(id, Math.floor((up.acked.size / up.total) * 100));
+            const seq = body.seq | 0;
+            if (seq >= 0) {
+              if (up.inflight.has(seq)) up.inflight.delete(seq);
+              up.acked.add(seq);                  // always count progress
               const t0 = up['t' + seq];
               if (t0) {
                 const rtt = Date.now() - t0;
@@ -3286,17 +3344,22 @@ ${META_END}`;
                 if (avg < 180 && BLOB_WINDOW < 2) BLOB_WINDOW = 2;
                 else if (avg > 600 && BLOB_WINDOW > 1) BLOB_WINDOW = 1;
               }
+              setAttachProgress(id, Math.floor((up.acked.size / up.total) * 100));
             }
           }
+
+          // Range ACK
           if (typeof body.upto === 'number') {
-            const upto = Math.min(body.upto, up.total - 1);
+            const upto = Math.min(body.upto | 0, up.total - 1);
             for (const s of Array.from(up.inflight)) if (s <= upto) up.inflight.delete(s);
             for (let s = 0; s <= upto; s++) up.acked.add(s);
             setAttachProgress(id, Math.floor(((upto + 1) / up.total) * 100));
           }
+
           pumpBlob(id);
           return true;
         }
+
         if (ev === 'blob.ready' || ev === 'blob.complete' || ev === 'blob.saved' || ev === 'blob.ok') {
           const id = body.id, ref = body.ref || body.url || body.key || body.path, up = uploads.get(id);
           if (up) {
@@ -3910,6 +3973,7 @@ ${META_END}`;
 
         el('settingsBtn').onclick = openSettings;
         el('closeModal').onclick = closeSettings;
+        el('backdropModal').onclick = closeSettings;
         el('saveSettings').onclick = () => { if (saveSettingsFromUI()) { closeSettings(); } };
 
         // NEW: reset local NKN key and reconnect (no full reload needed)
