@@ -325,10 +325,11 @@
       position: absolute;
       top: 0px;
       z-index: 10;
-      height: 20%;
+      height: 10rem;
+      max-height: 10%;
       pointer-events: none;
-      mask: linear-gradient(black, #000a, #0005, transparent, transparent, transparent);
-      backdrop-filter: brightness(0)blur(10px);
+      mask: linear-gradient(black, #000e, #000a, #0005, transparent, transparent, transparent);
+      backdrop-filter: blur(10px);
       width: 100%;
     }
 
@@ -1277,9 +1278,23 @@
       const isNknAddr = s => /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/.test((s || '').trim());
       const debounce = (fn, ms = 300) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
-      // Markdown + code highlighting setup
+      // Markdown + code highlighting setup (safer: no raw HTML, safe links)
       marked.setOptions({ gfm: true, breaks: true, headerIds: false, mangle: false });
+      marked.use({
+        // drop any raw HTML tokens entirely
+        renderer: {
+          html() { return ''; },
+          link(href, title, text) {
+            // allow only http(s) and mailto; everything else becomes a harmless "#"
+            const safe = /^(https?:|mailto:)/i.test(href || '') ? href : '#';
+            const esc = (s = '') => String(s).replace(/"/g, '&quot;');
+            const t = title ? ` title="${esc(title)}"` : '';
+            return `<a href="${esc(safe)}"${t} rel="nofollow noopener noreferrer" target="_blank">${text}</a>`;
+          }
+        }
+      });
       function mdToHtml(s) { try { return marked.parse(String(s || '')); } catch { return String(s || ''); } }
+
       function highlightIn(node) { try { node.querySelectorAll('pre code').forEach(block => { try { hljs.highlightElement(block); } catch { } }); } catch { } }
 
       const STORAGE = {
@@ -1760,7 +1775,7 @@
           if (!tryRenderModelInfoFromCache(s.model)) {
             // Only fetch if not cached (avoids repeated round-trips when hopping sessions)
             fetchModelInfo(s.model, (res) => {
-              if (!res?.ok) console.log("NOT OK!!!!!!!!!!!!!!!!!!!!!!!!!!!"); return;
+              if (!res?.ok) return;
               const data = (res.body && (res.body.data || res.body)) || {};
               console.log(data)
               const info = normalizeModelShow(s.model, data);
@@ -1775,10 +1790,18 @@
         renderSessions(); renderSystemEditor(); renderChat();
         if (s) sendSessionOpen(s, /*seed*/true);
       }
-
       function appendMessage(sessId, role, content) {
-        const s = getSession(sessId); if (!s) return; s.messages.push({ role, content, ts: Date.now() }); saveJSON(STORAGE.SESS, sessions);
+        const s = getSession(sessId); if (!s) return;
+        s.messages.push({ role, content, ts: Date.now() });
+
+        // soft cap: keep most recent ~400 messages per session
+        const MAX_LOCAL_MSGS = 400;
+        if (s.messages.length > MAX_LOCAL_MSGS) {
+          s.messages.splice(0, s.messages.length - MAX_LOCAL_MSGS);
+        }
+        saveJSON(STORAGE.SESS, sessions);
       }
+
       function updateLastAssistantContent(sessId, content) {
         const s = getSession(sessId); if (!s) return;
         for (let i = s.messages.length - 1; i >= 0; i--) {
@@ -1963,10 +1986,21 @@
           return;
         }
 
+        // identify the most recent assistant message (the one being streamed)
+        let lastAssistantIdx = -1;
+        for (let i = s.messages.length - 1; i >= 0; i--) {
+          if (s.messages[i].role === 'assistant') { lastAssistantIdx = i; break; }
+        }
+
+        // live stream id & stats (set by setStopMode/onInbound handlers)
+        const liveStreamId = currentStreamId || pendingStreamId || null;
+        const liveStats = liveStreamId ? statsByStream.get(liveStreamId) : null;
+        const liveTps = (liveStats && Number.isFinite(liveStats.tps) && liveStats.tps > 0) ? liveStats.tps : null;
+
         // render efficiently via a fragment to minimize layout thrash
         const frag = document.createDocumentFragment();
 
-        s.messages.forEach(m => {
+        s.messages.forEach((m, idx) => {
           const w = document.createElement('div');
           w.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
 
@@ -1975,14 +2009,20 @@
 
           let imagesHtml = '';
           if (Array.isArray(m.images) && m.images.length) {
-            imagesHtml = `<div class="row" style="margin-top:6px;flex-wrap:wrap;gap:6px;">${m.images.map(src =>
-              `<img src="${src}" alt="" style="width:140px;height:140px;object-fit:cover;border-radius:8px;border:1px solid #2a2a2a;">`
-            ).join('')
+            imagesHtml = `<div class="row" style="margin-top:6px;flex-wrap:wrap;gap:6px;">${m.images.map(src => `<img src="${src}" alt="" style="width:140px;height:140px;object-fit:cover;border-radius:8px;border:1px solid #2a2a2a;">`).join('')
               }</div>`;
           }
 
+          // Prefer FINAL TPS saved on the message… otherwise show LIVE TPS for the active stream
+          let tpsTxt = '';
+          if (typeof m._tps === 'number' && isFinite(m._tps)) {
+            tpsTxt = ` • ${m._tps.toFixed(1)} tok/s${m._tpsIsApprox ? ' (est)' : ''}`;
+          } else if (idx === lastAssistantIdx && liveTps != null) {
+            tpsTxt = ` • ${liveTps.toFixed(1)} tok/s`; // live
+          }
+
           w.innerHTML = `
-      <div class="meta">${whoLabel} • ${new Date(m.ts).toLocaleTimeString()}</div>
+      <div class="meta">${whoLabel} • ${new Date(m.ts).toLocaleTimeString()}${tpsTxt}</div>
       <div class="content">${contentHtml}</div>
       ${imagesHtml}
     `;
@@ -2001,36 +2041,47 @@
 
 
 
-      function addStreamingAssistantBubble() {
+
+      function addStreamingAssistantBubble(id) {
         const s = getSession(); if (!s) return;
-        const w = document.createElement('div'); w.className = 'msg assistant'; w.dataset.stream = '1';
-        w.innerHTML = `<div class="meta">` + s.model + ` • streaming…</div><div class="content" id="streamContent"></div>`;
-        el('chat').appendChild(w); el('chat').scrollTop = el('chat').scrollHeight;
+        const w = document.createElement('div');
+        w.className = 'msg assistant';
+        w.dataset.stream = '1';
+        w.dataset.streamId = id; // ← NEW: let us find this bubble later
+        w.innerHTML =
+          `<div class="meta" id="meta-${id}">${s.model} • streaming…</div>` +
+          `<div class="content" id="streamContent"></div>`;
+        el('chat').appendChild(w);
+        el('chat').scrollTop = el('chat').scrollHeight;
       }
-      function setStreamingContent(text) {
-        let c = el('streamContent');
-        if (!c) {                      // bubble was wiped by a re-render → re-add it
-          addStreamingAssistantBubble();
-          c = el('streamContent');
+
+      function setStreamingContent(id, text) {
+        let w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`);
+        let c = w && w.querySelector('#streamContent');
+        if (!c) {
+          addStreamingAssistantBubble(id);
+          w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`);
+          c = w && w.querySelector('#streamContent');
         }
-        if (c) {
-          requestAnimationFrame(() => {
-            c.innerHTML = mdToHtml(text || '');
-            try { highlightIn(c); } catch { }
-            const container = c.closest('.chat') || c.parentElement;
-            if (container && typeof container.scrollTop === 'number') {
-              container.scrollTop = container.scrollHeight;
-            }
-          });
+        if (!c) return;
+        requestAnimationFrame(() => {
+          c.innerHTML = mdToHtml(text || '');
+          try { highlightIn(c); } catch { }
+          const container = c.closest('.chat') || c.parentElement;
+          if (container && typeof container.scrollTop === 'number') container.scrollTop = container.scrollHeight;
+        });
+      }
+
+      function finishStreamingBubble(id) {
+        const c = el('streamContent'); if (c) { c.removeAttribute('id'); }
+        const w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`) ||
+          document.querySelector('.msg.assistant[data-stream="1"]');
+        if (w) {
+          w.dataset.stream = '0';
+          _setStreamMeta(id, 'done'); // ← includes final TPS if we have it
         }
       }
 
-      function finishStreamingBubble() {
-        const c = el('streamContent'); if (c) { c.removeAttribute('id'); }
-        const s = getSession();
-        const m = document.querySelector('.msg.assistant[data-stream="1"] .meta'); if (m) m.textContent = s.model + ' • done';
-        const w = document.querySelector('.msg.assistant[data-stream="1"]'); if (w) w.dataset.stream = '0';
-      }
 
       // --- System Message helpers/state ---
       const SYSTEM_GEN_PROMPT =
@@ -2290,11 +2341,9 @@ ${META_END}`;
       // ───────────────────── NKN peers UI (count of ready subclients) ─────────────────────
       let peersTicker = null;
 
-      /** Write "N peers" into #peers (create it if missing) */
       function setPeersUI(n) {
         let slot = document.getElementById('peers');
         if (!slot) {
-          // create a small muted label next to the status row
           const host = document.getElementById('statusRow') || document.querySelector('header');
           slot = document.createElement('span');
           slot.id = 'peers';
@@ -2302,7 +2351,9 @@ ${META_END}`;
           slot.style.marginLeft = '8px';
           if (host) host.appendChild(slot);
         }
-        slot.textContent = `${Math.max(0, Number(n) || 0)} peer${n === 1 ? '' : 's'}`;
+        if (n == null) { slot.textContent = ''; return; }   // ← NEW: hide when unknown
+        const num = Math.max(0, Number(n) || 0);
+        slot.textContent = `${num} peer${num === 1 ? '' : 's'}`;
       }
 
       /** Read the current number of ready subclients from MultiClient */
@@ -2425,6 +2476,98 @@ ${META_END}`;
       function approxBytes(obj) {
         try { return new Blob([JSON.stringify(obj)]).size; }
         catch { return (JSON.stringify(obj) || '').length; }
+      }
+      // ── TPS helpers ──────────────────────────────────────────────────────────────
+      function _num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
+      function _pick(...vals) { for (const v of vals) if (v != null) return v; return null; }
+
+      // Accepts either a flat shape or nested {ollama|approx|stats|metrics:{...}}
+      function extractTPSAndTokens(any) {
+        if (!any || typeof any !== 'object') return null;
+
+        // unwrap common wrappers
+        const layers = [
+          any,
+          any.data,
+          any.stats,
+          any.metrics,
+          any.ollama,
+          any.approx
+        ].filter(o => o && typeof o === 'object');
+
+        let tps = null, tokens = null, approx = false;
+
+        for (const o of layers) {
+          // tokens/sec
+          tps = _pick(_num(o.tps), _num(o.tokens_per_sec), _num(o.tok_per_sec), _num(o.tokps), tps);
+          // token count
+          tokens = _pick(_num(o.tokens), _num(o.eval_count), _num(o.output_tokens), tokens);
+          if (o === any.approx) approx = true;
+        }
+
+        // Also handle Ollama's nanosecond durations if present (more reliable, final)
+        // eval_count / (eval_duration_ns / 1e9)
+        const evalCnt = _pick(layers[0]?.eval_count, layers[1]?.eval_count, any?.ollama?.eval_count);
+        const evalDurNs = _pick(layers[0]?.eval_duration, layers[1]?.eval_duration, any?.ollama?.eval_duration);
+        if (tps == null && _num(evalCnt) != null && _num(evalDurNs) != null && evalDurNs > 0) {
+          tps = Number(evalCnt) / (Number(evalDurNs) / 1e9);
+          approx = false; // this is authoritative
+        }
+
+        if (tps == null && tokens == null) return null;
+        return { tps, tokens, approx };
+      }
+      // Pull TPS/tokens from many possible shapes
+      function extractTPSAndTokens(src) {
+        if (!src || typeof src !== 'object') return null;
+        const tryNums = (...vals) => {
+          for (const v of vals) {
+            const n = Number(v);
+            if (Number.isFinite(n)) return n;
+          }
+          return null;
+        };
+        const tps = tryNums(
+          src.tps, src.tokens_per_sec, src.tok_per_sec, src.tokps,
+          src.metrics && src.metrics.tps
+        );
+        const tokens = tryNums(
+          src.tokens, src.eval_count, src.output_tokens,
+          src.metrics && src.metrics.tokens
+        );
+        return (tps != null || tokens != null) ? { tps, tokens } : null;
+      }
+
+      // Apply stats to the in-memory record + update streaming bubble + (re)render
+      function applyStreamStats(id, payload) {
+        if (!id) return;
+        const rec = statsByStream.get(id) || {};
+        const ext =
+          extractTPSAndTokens(payload) ||
+          extractTPSAndTokens(payload && payload.data) ||
+          extractTPSAndTokens(payload && payload.ollama);
+
+        if (ext) {
+          if (ext.tps != null) { rec.tps = ext.tps; rec.approx = false; }
+          if (ext.tokens != null) rec.tokens = ext.tokens;
+        } else if (rec.startAt && rec.approxTokens > 0) {
+          // fallback: keep the running estimate if no explicit stats came
+          const elapsed = Math.max(0.25, (Date.now() - rec.startAt) / 1000);
+          rec.tps = rec.approxTokens / elapsed;
+          rec.approx = true;
+        }
+
+        rec.updatedAt = Date.now();
+        statsByStream.set(id, rec);
+
+        _setStreamMeta(id, 'streaming…'); // updates bubble meta with live TPS
+        renderChat();                     // <- make it visible in the message meta too
+      }
+
+      // VERY rough chars→tokens converter for live fallback between stats frames
+      function estimateTokensFromText(t) {
+        const len = (t || '').length;
+        return Math.max(0, Math.round(len / 4)); // ~4 chars per token (tunable)
       }
 
 
@@ -2627,6 +2770,19 @@ ${META_END}`;
       let pendingStreamId = null;
       let isStreaming = false;
       const cancelledStreams = new Set();
+      // ── Per-stream live metrics (TPS, tokens) ─────────────────────────────
+      const statsByStream = new Map(); // id -> { tps, tokens, updatedAt }
+      function _setStreamMeta(id, phase /* 'streaming…' | 'done' */) {
+        const s = getSession() || {};
+        const meta =
+          document.getElementById(`meta-${id}`) ||
+          document.querySelector(`.msg.assistant[data-stream-id="${id}"] .meta`);
+        if (!meta) return;
+        const st = statsByStream.get(id);
+        const tpsTxt = (st && Number.isFinite(st.tps)) ? ` • ${st.tps.toFixed(1)} tok/s${st.approx ? ' (est)' : ''}` : '';
+        meta.textContent = `${s.model || 'assistant'} • ${phase}${tpsTxt}`;
+      }
+
 
       // ── Image attachments (pending for the next user message) ────────────
       let pendingImages = []; // [{ name, size, type, dataURL }]
@@ -2713,6 +2869,20 @@ ${META_END}`;
         while (st.buffer.has(st.next)) {
           const part = st.buffer.get(st.next);
           st.buffer.delete(st.next);
+
+          const txt = extractDelta(part) || '';
+          if (txt) {
+            const rec = statsByStream.get(id) || { startAt: Date.now(), approxTokens: 0, approx: true };
+            rec.approxTokens = (rec.approxTokens || 0) + estimateTokensFromText(txt);
+            const elapsed = Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
+            rec.tps = rec.approxTokens > 0 ? (rec.approxTokens / elapsed) : rec.tps;
+            rec.tokens = Math.max(rec.tokens || 0, rec.approxTokens || 0);
+            rec.updatedAt = Date.now();
+            statsByStream.set(id, rec);
+            _setStreamMeta(id, 'streaming…'); // updates bubble header immediately
+          }
+
+
           st.onChunk(part);
           st.next++;
         }
@@ -2800,14 +2970,16 @@ ${META_END}`;
 
       function requestModelsList(force = false) {
         if (!HUB_ADDR || !client || !isConnected) return;
+        if (modelsInFlight && !force) return;  // ← short-circuit duplicates
+        modelsInFlight = true;                 // ← set early
 
         const nonce = Date.now();
         lastModelsReqId = `models:${nonce}`;
-
-        // Fire both forms; hubs differ
         trySend(HUB_ADDR, { event: 'llm.request', id: lastModelsReqId, api: 'list', stream: false });
         trySend(HUB_ADDR, { event: 'ctrl.request', op: 'models', id: lastModelsReqId });
       }
+
+
 
       function populateModels(modelsLike) {
         const sel = el('modelSelect'); if (!sel) return;
@@ -2891,7 +3063,7 @@ ${META_END}`;
       }
 
       // ── Model "show" helpers ─────────────────────────────────────────────
-      function normalizeModelShow(model, raw) {
+      function /*seed*/normalizeModelShow(model, raw) {
         const data = raw || {};
         const det = data.details || {};
         const mi = data.modelinfo || {};
@@ -3027,11 +3199,26 @@ ${META_END}`;
 
       // Build history for seeding (exclude 'system'; it's sent separately)
       function buildHistoryForSession(sess) {
-        return (sess?.messages || []).map(m => {
+        const HISTORY_SEED_LIMIT = 16;         // max messages to seed
+        const HISTORY_CHAR_BUDGET = 24 * 1024; // ~24 KB of text total
+
+        const src = (sess?.messages || []);
+        const out = [];
+        let used = 0;
+
+        // walk from newest to oldest, then unshift to keep order
+        for (let i = src.length - 1; i >= 0 && out.length < HISTORY_SEED_LIMIT; i--) {
+          const m = src[i];
           const role = (m.role === 'user' || m.role === 'assistant' || m.role === 'system') ? m.role : 'assistant';
-          return { role, content: m.content };
-        });
+          const content = String(m.content || '');
+          // images are never seeded; content only
+          if (used + content.length > HISTORY_CHAR_BUDGET) break;
+          used += content.length;
+          out.unshift({ role, content });
+        }
+        return out;
       }
+
       // Session control → hub
       function currentOptions() { return { temperature: settings.temperature, top_p: settings.top_p, seed: settings.seed, num_ctx: settings.num_ctx }; }
       function sendSessionOpen(s, seed) {
@@ -3050,7 +3237,7 @@ ${META_END}`;
 
       // Back off: let the SDK handle path rotation & reconnects.
       // We only intervene if we miss multiple pongs *and* all subclients are 0 for a while.
-      const HEARTBEAT_MS = 6000;                // ping every 6s (tolerant of timer clamping)
+      const HEARTBEAT_MS = 2000;                // ping every 6s (tolerant of timer clamping)
       const MISSED_PONG_LIMIT = 4;              // ~24s of missed pongs before we consider action
       const PEERS_ZERO_GRACE_MS = 12000;        // require peers==0 for at least 12s too
       let hbTimer = null;
@@ -3185,7 +3372,7 @@ ${META_END}`;
           trySend(HUB_ADDR, { event: 'announce' }, { noReply: true, msgHoldingSeconds: 600 });
 
           const s = getSession();
-          if (s) { setSavedModel(s.model || getSavedModel()); sendSessionOpen(s, /*seed*/true); }
+          if (s) { setSavedModel(s.model || getSavedModel()); sendSessionOpen(s, /*seed*/false); }
           resumeAllUploads();                 // NEW
           flushOutbox();
 
@@ -3363,6 +3550,13 @@ ${META_END}`;
           return true;
         }
 
+        // Accept stats on control plane too (if backend emits `ctrl.stats` or `session.stats`)
+        if (ev === 'llm.stats' || ev === 'ctrl.stats' || ev === 'session.stats') {
+          const id = body.id;
+          if (id) applyStreamStats(id, body);  // <- updates store + re-renders
+          return true;
+        }
+
         if (ev === 'blob.ready' || ev === 'blob.complete' || ev === 'blob.saved' || ev === 'blob.ok') {
           const id = body.id, ref = body.ref || body.url || body.key || body.path, up = uploads.get(id);
           if (up) {
@@ -3411,8 +3605,24 @@ ${META_END}`;
         }
 
         // Informational / errors
-        if (ev === 'session.ready' || ev === 'session.info' || ev === 'ctrl.info') return true;
-        if (ev === 'ctrl.error') { console.warn('[ctrl.error]', body); return true; }
+        if (ev === 'session.ready' || ev === 'session.info') {
+          const s = getSession();
+          // if hub indicates a cold/missing session, seed once with history
+          if (s && (body?.cold || body?.need_seed || body?.empty || body?.replace)) {
+            sendSessionOpen(s, /*seed*/true);
+          } else if (s) {
+            // remember that remote side is warm (persisting is fine; it’s just a small flag)
+            s._remoteReady = true; saveJSON(STORAGE.SESS, sessions);
+          }
+          return true;
+        }
+        if (ev === 'ctrl.error') {
+          console.warn('[ctrl.error]', body);
+          if (/\bsession\b/i.test(String(body?.message || ''))) {
+            const s = getSession(); if (s) sendSessionOpen(s, /*seed*/true);
+          }
+          return true;
+        }
 
         // Not handled here
         return false;
@@ -3425,7 +3635,15 @@ ${META_END}`;
         if (ev === 'llm.start') {
           const { id, stream } = body;
           console.info('[llm.start]', { id, stream });
-
+          // init record for this stream (add timing fields for fallback estimates)
+          statsByStream.set(id, {
+            tps: null,
+            tokens: 0,
+            updatedAt: Date.now(),
+            startAt: Date.now(),   // <— for live TPS estimate
+            approxTokens: 0,       // <— running token est (chars→tokens)
+            approx: true
+          });
           if (route.sink === 'element') {
             const elx = resolveEl(route.elId);
             if (route.lock) lockElement(elx, true);
@@ -3450,48 +3668,67 @@ ${META_END}`;
 
           if (stream) {
             pendingStreamId = id;
-            addStreamingAssistantBubble();
+            addStreamingAssistantBubble(id);
             const sess = getSession(); if (!sess) return true;
             sess.messages.push({ role: 'assistant', content: '', ts: Date.now() });
             saveJSON(STORAGE.SESS, sessions);
             let acc = '';
             startStream(id, (part) => {
               const text = extractDelta(part);
-              if (text) { acc += text; setStreamingContent(acc); updateLastAssistantContent(sess.id, acc); }
+              if (text) { acc += text; setStreamingContent(id, acc); updateLastAssistantContent(sess.id, acc); }
             });
+
           }
+          return true;
+        }
+
+        if (ev === 'llm.stats') {
+          applyStreamStats(body.id, body);   // same sink
           return true;
         }
 
         if (ev === 'llm.chunk') { handleChunk(body.id, body.seq, body.data); return true; }
-
         if (ev === 'llm.done') {
           sendAck(body.id, body.last_seq);
           endStream(body.id);
-          console.info('[llm.done]', { id: body.id, last_seq: body.last_seq });
 
-          if (route.sink === 'element') {
-            const elx = resolveEl(route.elId);
-            lockElement(elx, false);
-            if (route.elId) streamingElements.delete(route.elId);
+          // fold in any stats that arrived on the final envelope
+          applyStreamStats(body.id, body);
 
-            if (route.elId === 'systemMsg') {
-              const s = getSession();
-              if (s) { s.system = (el('systemMsg').value || ''); saveJSON(STORAGE.SESS, sessions); sendSessionOpen(s, /*seed*/false); }
-              setSysGenBusy(false);
-              isSysGenStreaming = false; sysgenCurrentId = null;
-              sysgenPending.delete(body.id);
+          // guarantee a non-zero final TPS if we have tokens & timing
+          const rec = statsByStream.get(body.id);
+          if (rec && (!Number.isFinite(rec.tps) || rec.tps <= 0)) {
+            const elapsed = Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
+            if (Number.isFinite(rec.tokens) && rec.tokens > 0) {
+              rec.tps = rec.tokens / elapsed;
+              rec.approx = true;
+              statsByStream.set(body.id, rec);
             }
-            setSendMode();
-            clearRoute(body.id);
-            return true;
           }
 
-          finishStreamingBubble();
+          // persist TPS onto the last assistant message
+          const sess = getSession();
+          if (sess) {
+            for (let i = sess.messages.length - 1; i >= 0; i--) {
+              if (sess.messages[i].role === 'assistant') {
+                const st = statsByStream.get(body.id);
+                if (st && Number.isFinite(st.tps)) {
+                  sess.messages[i]._tps = st.tps;
+                  sess.messages[i]._tpsIsApprox = !!st.approx;
+                }
+                break;
+              }
+            }
+            saveJSON(STORAGE.SESS, sessions);
+          }
+
+          finishStreamingBubble(body.id);
+          renderChat();
           setSendMode();
           clearRoute(body.id);
           return true;
         }
+
 
         if (ev === 'llm.result') {
           // callback sink (e.g., model.show)
@@ -3715,7 +3952,8 @@ ${META_END}`;
         // Append to UI, queue/send to hub
         appendMessage(s.id, 'user', text.trim());
         const last = s.messages[s.messages.length - 1];
-        last.images = pendingImages.map(p => p.dataURL);
+        // store only tiny inline images; skip large previews to keep storage lean
+        last.images = pendingImages.filter(p => !p.big).map(p => p.dataURL);
         saveJSON(STORAGE.SESS, sessions);
         renderChat();
         el('prompt').value = '';

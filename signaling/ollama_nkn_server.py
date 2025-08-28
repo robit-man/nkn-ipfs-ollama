@@ -155,6 +155,10 @@ let queue = []; // {to, data, isPub, topic}
 const MAX_QUEUE = parseInt(process.env.NKN_MAX_QUEUE || '4000', 10);
 const HEAP_SOFT = parseInt(process.env.NKN_HEAP_SOFT_MB || '640', 10);
 const HEAP_HARD = parseInt(process.env.NKN_HEAP_HARD_MB || '896', 10);
+const DRAIN_BASE_BATCH   = parseInt(process.env.NKN_DRAIN_BASE || '64', 10);
+const DRAIN_MAX_BATCH    = parseInt(process.env.NKN_DRAIN_MAX_BATCH || '512', 10);
+const CATCHUP_AGE_MS     = parseInt(process.env.NKN_CATCHUP_AGE_MS || '800', 10); // oldest packet age
+const SEND_CONCURRENCY   = parseInt(process.env.NKN_SEND_CONC || '6', 10);
 
 function heapMB() {
   const m = process.memoryUsage();
@@ -258,18 +262,37 @@ if (msg.includes('WebSocket unexpectedly closed') || msg.includes('VERIFY SIGNAT
       return false;
     }
   }
-
   async function drain(){
-    if (!READY || Date.now() < suspendUntil || queue.length===0) return;
-    const batch = queue.splice(0, Math.min(queue.length, 64));
-    for(const it of batch){
-      const ok = it.isPub ? await safePub(it.topic, it.data)
-                          : await safeSendDM(it.to, it.data);
-      // Re-queue on failure so the "last message" is retried post-reconnect
-      if (!ok) queue.unshift(it);
+    if (!READY || Date.now() < suspendUntil || queue.length === 0) return;
+
+    const now = Date.now();
+    const firstTs = (queue[0] && queue[0].data && queue[0].data.ts) || now; // ts comes from Python
+    const age = Math.max(0, now - firstTs); // "delta between generated and (about to be) sent"
+    const backlog = queue.length;
+
+    // Scale the take size based on backlog & age; stay bounded.
+    let take = DRAIN_BASE_BATCH;
+    if (backlog > 256 || age > CATCHUP_AGE_MS) take = Math.min(DRAIN_MAX_BATCH, DRAIN_BASE_BATCH * 2);
+    if (backlog > 512 || age > 2 * CATCHUP_AGE_MS) take = Math.min(DRAIN_MAX_BATCH, Math.floor(DRAIN_BASE_BATCH * 3));
+    if (backlog > 1024 || age > 3 * CATCHUP_AGE_MS) take = DRAIN_MAX_BATCH;
+
+    const batch = queue.splice(0, Math.min(backlog, take));
+
+    // Limited parallelism for throughput, without overwhelming the socket
+    let idx = 0;
+    const workers = Math.max(1, Math.min(SEND_CONCURRENCY, Math.floor(batch.length / 32) || 1));
+    async function worker(){
+      while (true) {
+        const i = idx++; if (i >= batch.length) break;
+        const it = batch[i];
+        const ok = it.isPub ? await safePub(it.topic, it.data)
+                            : await safeSendDM(it.to, it.data);
+        if (!ok) queue.unshift(it); // retry soon after transient WS flap
+      }
     }
+    await Promise.all(new Array(workers).fill(0).map(worker));
   }
-  setInterval(drain, 300);
+
 
   // Heartbeat to Python watchdog
 // Heap guard: soft trim, then hard exit (Python watchdog restarts us)
@@ -597,6 +620,18 @@ def _blob_gc_loop():
                 _BLOBS.pop(k, None)
 threading.Thread(target=_blob_gc_loop, daemon=True).start()
 
+def _dur_to_seconds(v) -> float:
+    """Coerce Ollama duration to seconds. Handles ns/ms/s."""
+    try:
+        x = float(v)
+    except Exception:
+        return 0.0
+    # Heuristic: Ollama usually reports *_duration in nanoseconds.
+    if x > 3_000_000:   # >3ms → probably ns
+        return x / 1_000_000_000.0
+    if x > 3_000:       # >3s if ms, or 3k seconds; assume ms
+        return x / 1_000.0
+    return x
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -1326,7 +1361,10 @@ class _LLMStream:
     FINAL_GAP_SECS  = 0.12
     ACK_STALL_SECS   = 25.0     # if no ACK progress for this long while window is big → abort
     MAX_WINDOW_PKTS  = 1024     # hard cap to avoid runaway RAM
-
+    BULK_UNACK_THRESHOLD = 256   # start coalescing when unacked > this
+    BULK_MAX_MS          = 120   # max time to wait before flushing a bulk (ms)
+    BULK_MAX_PARTS       = 16    # max parts to merge per bulk flush
+    STATS_INTERVAL_SECS = 0.5      # emit live stats at most twice per second
     def __init__(self, src_addr: str, req: dict,
                  on_start=None, on_delta=None, on_done=None):
         self.src_addr = src_addr
@@ -1351,7 +1389,15 @@ class _LLMStream:
         self.on_start = on_start
         self.on_delta = on_delta
         self.on_done  = on_done
-
+        self.sid     = self.client_cfg.get("sid") or self.kwargs.get("sid") or req.get("sid")
+        self._stats = {
+            "t0": None,            # first seen output (monotonic)
+            "tlast": None,         # last seen output (monotonic)
+            "chars": 0,            # chars observed so far (proxy)
+            "eval_count": None,    # tokens from Ollama (if/when provided)
+            "eval_duration_s": None,
+        }
+        self._last_stats_emit = 0.0
         host = self.client_cfg.get("host") or OLLAMA_HOST
         headers = self.client_cfg.get("headers") or {}
         try:
@@ -1374,6 +1420,21 @@ class _LLMStream:
         self._dm({"event":"llm.error","id":self.id,"message":str(message),"kind":kind,"ts":_now_ms()})
 
     def _send_result(self, data: dict):
+        # update stats from final result if it has eval_* fields
+        try:
+            if isinstance(data, dict):
+                if "eval_count" in data:
+                    self._stats["eval_count"] = int(data["eval_count"])
+                if "eval_duration" in data:
+                    self._stats["eval_duration_s"] = _dur_to_seconds(data["eval_duration"])
+            # fabricate elapsed from now if we produced any content via on_done
+            now = time.monotonic()
+            if self._stats["t0"] is None:
+                self._stats["t0"] = now
+            self._stats["tlast"] = now
+        except Exception:
+            pass
+
         self._dm({"event":"llm.result","id":self.id,"data":_to_jsonable(data),"ts":_now_ms()})
         try:
             if callable(self.on_done):
@@ -1382,31 +1443,80 @@ class _LLMStream:
         except Exception as e:
             _log("llm.on_done.err", str(e))
 
+        # Emit final stats for non-stream flows
+        try: self._emit_stats("nonstream")
+        except Exception: pass
+
+
     def _send_chunk(self, data: dict):
+        """
+        Ship one streamed chunk to the client, track resend window,
+        and periodically emit live TPS stats via `llm.stats`.
+
+        Requires on the class:
+        - self._stats dict (t0, tlast, chars, eval_count, eval_duration_s)
+        - self._last_stats_emit (float)
+        - STATS_INTERVAL_SECS (class constant)
+        - helpers: _update_stats_from_part(part), _emit_stats(phase)
+        """
         with self._lock:
             self.seq += 1
             seq = self.seq
-            pkt = {"event":"llm.chunk","id":self.id,"seq":seq,"data":_to_jsonable(data),"ts":_now_ms()}
+            pkt = {
+                "event": "llm.chunk",
+                "id": self.id,
+                "seq": seq,
+                "data": _to_jsonable(data),
+                "ts": _now_ms(),
+            }
+            # track in resend window
             self.window[seq] = pkt
             self.window_order.append(seq)
+
+            # soft window trimming (keep only <= WINDOW_LIMIT ahead of last_acked)
             if len(self.window_order) > self.WINDOW_LIMIT:
                 oldest = self.window_order.pop(0)
                 if oldest <= self.last_acked:
                     self.window.pop(oldest, None)
                 else:
+                    # can't drop unacked; put it back and rely on MAX_WINDOW_PKTS guard
                     self.window_order.insert(0, oldest)
+
+            # hard cap to avoid runaway RAM if client isn't ACKing
             if len(self.window_order) > self.MAX_WINDOW_PKTS:
-                self._send_error("backpressure: client not ACKing fast enough; aborting stream", kind="backpressure")
+                self._send_error(
+                    "backpressure: client not ACKing fast enough; aborting stream",
+                    kind="backpressure",
+                )
                 self.cancelled = True
                 return
+
+            # send the chunk
             self._dm(pkt)
-            
+
+        # ── Live stats (approximate) ───────────────────────────────────────
+        # Update running counters from this part, and emit at most
+        # once per STATS_INTERVAL_SECS while streaming.
+        try:
+            # update internal counters (chars seen, eval_* if present on this part)
+            self._update_stats_from_part(data)
+            now = time.monotonic()
+            if (now - self._last_stats_emit) >= self.STATS_INTERVAL_SECS:
+                self._emit_stats("stream")
+                self._last_stats_emit = now
+        except Exception:
+            # never let telemetry affect streaming
+            pass
+
+        # ── Session transcript append callback ─────────────────────────────
         try:
             if callable(self.on_delta):
                 delta = _extract_delta_from_part(self.api, data)
-                if delta: self.on_delta(delta)
+                if delta:
+                    self.on_delta(delta)
         except Exception as e:
             _log("llm.on_delta.err", str(e))
+
 
     def _sweep_resend_unacked(self):
         """One quick pass of re-sending any not-yet-acked chunks up to current seq."""
@@ -1471,6 +1581,92 @@ class _LLMStream:
                 if self.done_sent and self.last_acked >= self.done_seq:
                     return
 
+    def _send_coalesced_text(self, text: str):
+        if not text:
+            return
+        if self.api == "chat":
+            data = {"message": {"content": text}}
+        else:  # "generate"
+            data = {"response": text}
+        self._send_chunk(data)
+
+    # 1) Beef up _update_stats_from_part to capture more fields / fallbacks
+    def _update_stats_from_part(self, part: dict):
+        now = time.monotonic()
+
+        # text delta (for live throughput)
+        delta = _extract_delta_from_part(self.api, part)
+        if delta:
+            if self._stats["t0"] is None:
+                self._stats["t0"] = now
+            self._stats["tlast"] = now
+            self._stats["chars"] += len(delta)
+
+        # final metrics (present on last frame)
+        try:
+            if isinstance(part, dict):
+                if "eval_count" in part:
+                    self._stats["eval_count"] = int(part["eval_count"])
+                if "eval_duration" in part:
+                    self._stats["eval_duration_s"] = _dur_to_seconds(part["eval_duration"])
+
+                # Fallback: sometimes only total_duration is populated
+                if (not self._stats["eval_duration_s"]) and ("total_duration" in part):
+                    self._stats["eval_duration_s"] = _dur_to_seconds(part["total_duration"])
+
+                # Optional: record prompt metrics if you want to display them later
+                if "prompt_eval_count" in part:
+                    self._stats["prompt_eval_count"] = int(part["prompt_eval_count"])
+                if "prompt_eval_duration" in part:
+                    self._stats["prompt_eval_duration_s"] = _dur_to_seconds(part["prompt_eval_duration"])
+        except Exception:
+            pass
+
+
+    # 2) Always include an approximate tokens/sec in _emit_stats
+    def _emit_stats(self, phase: str = "stream"):
+        t0 = self._stats["t0"]; tlast = self._stats["tlast"]
+        elapsed_s = max(0.0, (tlast - t0)) if (t0 is not None and tlast is not None) else 0.0
+        cps = (self._stats["chars"] / elapsed_s) if elapsed_s > 0 else 0.0
+
+        # Real TPS from Ollama (final frame), else None
+        tps_real = None
+        if (self._stats.get("eval_count") is not None) and (self._stats.get("eval_duration_s") not in (None, 0.0)):
+            tps_real = float(self._stats["eval_count"]) / float(self._stats["eval_duration_s"])
+
+        # Live approximation: tokens ≈ chars/4
+        approx_tokens = int(self._stats["chars"] / 4.0) if self._stats["chars"] else 0
+        approx_tps = (approx_tokens / elapsed_s) if elapsed_s > 0 else None
+
+        payload = {
+            "event": "llm.stats",
+            "id": self.id,
+            "sid": self.sid,
+            "model": self.model,
+            "phase": phase,  # "stream" | "final" | "nonstream"
+            "ts": _now_ms(),
+            "elapsed_ms": int(elapsed_s * 1000.0) if elapsed_s else 0,
+            "approx": {
+                "chars": self._stats["chars"],
+                "chars_per_sec": cps,
+                "tokens": approx_tokens,
+                "tokens_per_sec": approx_tps,   # ← live & always present when there’s output
+            },
+            "ollama": {
+                "eval_count": self._stats.get("eval_count"),
+                "eval_duration_ms": int((self._stats.get("eval_duration_s") or 0.0) * 1000.0) or None,
+                "tokens_per_sec": tps_real,     # ← precise, appears on the final frame
+            },
+            "net": {
+                "last_acked": self.last_acked,
+                "last_seq": self.seq,
+                "unacked": max(0, self.seq - self.last_acked),
+            },
+        }
+        self._dm(payload)
+
+
+
     def run(self):
         if self.client is None:
             return
@@ -1492,20 +1688,61 @@ class _LLMStream:
                 return
 
             gen, meta = self._invoke_stream(self.api)
-            for part in gen:
-                if self.cancelled: break
-                self._send_chunk(part)
 
-            # >>> Critical reliability change: do quick final sweeps BEFORE done.
+            bulk_buf: list[str] = []
+            last_flush = time.monotonic()
+
+            def _bulk_flush():
+                nonlocal bulk_buf, last_flush
+                if bulk_buf:
+                    self._send_coalesced_text("".join(bulk_buf))
+                    bulk_buf = []
+                    last_flush = time.monotonic()
+
+            for part in gen:
+                if self.cancelled: 
+                    break
+
+                # Determine whether we're "behind"
+                now = time.monotonic()
+                with self._lock:
+                    unacked = self.seq - self.last_acked
+                    ack_stale = (now - self._last_ack_change) > 0.8  # ~800ms without ACK movement
+                bulk_mode = (unacked >= self.BULK_UNACK_THRESHOLD) or ack_stale
+
+                if bulk_mode:
+                    # Collect only the text deltas; send as a single bigger chunk
+                    delta = _extract_delta_from_part(self.api, part)
+                    if delta:
+                        bulk_buf.append(delta)
+                        too_many = len(bulk_buf) >= self.BULK_MAX_PARTS
+                        too_old  = (now - last_flush) * 1000.0 >= self.BULK_MAX_MS
+                        if too_many or too_old:
+                            _bulk_flush()
+                        continue  # don't emit the tiny chunk
+                    else:
+                        # Non-text bit (rare) — flush what we have and pass this through
+                        _bulk_flush()
+                        self._send_chunk(part)
+                else:
+                    # If we were bulk-ing, flush as soon as we're healthy again
+                    _bulk_flush()
+                    self._send_chunk(part)
+
+            # Final sweep before done: make sure any buffered text is sent
+            if not self.cancelled:
+                _bulk_flush()
+
+            # existing final sweeps + done stay the same
             for _ in range(self.FINAL_SWEEPS):
                 if self.cancelled: break
                 self._sweep_resend_unacked()
-                # If client already caught up, we can break early
                 with self._lock:
-                    if self.last_acked >= self.seq:
-                        break
+                    if self.last_acked >= self.seq: break
                 time.sleep(self.FINAL_GAP_SECS)
 
+            # (final sweeps…)
+            self._emit_stats("final")   # ← final packet
             self._send_done(meta or {"mode":"stream","api":self.api})
 
         except OllamaResponseError as e:
@@ -1986,7 +2223,8 @@ def _handle_dm(src_addr: str, body: dict):
                 "model": s.model,
                 "stream": stream,
                 "kwargs": call_kwargs,
-                "id": body.get("id")
+                "id": body.get("id"),
+                "sid": sid,
             }
             sid_started = _start_llm(src_addr, req_body,
                                      on_start=on_start,
