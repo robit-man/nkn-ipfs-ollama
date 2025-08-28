@@ -434,7 +434,14 @@ def _bridge_reader_stdout():
 
             elif msg.get("type") == "hb":
                 _last_hb = time.time()
-
+                # NEW: remember bridge backlog & mem so LLM stream can react
+                try:
+                    state["bridge_ready"] = bool(msg.get("ready"))
+                    state["bridge_q"]     = int(msg.get("q") or 0)     # ← pending DM queue in Node
+                    state["bridge_mb"]    = int(msg.get("mb") or 0)    # ← RSS (rough)
+                    state["bridge_hb_ts"] = int(msg.get("ts") or _now_ms())
+                except Exception:
+                    pass
             elif msg.get("type") == "wsclosed":
                 # Transient: bridge will auto-reconnect; keep process alive and pause sends.
                 print("⚠️ bridge reported wsclosed — pausing sends until reconnect …")
