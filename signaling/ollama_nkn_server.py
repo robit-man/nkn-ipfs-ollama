@@ -195,10 +195,11 @@ function enqueue(item){
 
 function rateLimit(fn, ms){ let last=0; return (...args)=>{ const t=Date.now(); if(t-last>ms){ last=t; fn(...args); } }; }
 const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
+const DYNAMIC_COALESCE_LAT_MS = parseInt(process.env.NKN_COALESCE_LAT_MS || '5000', 10);
 
 /* ── Optional: coalesce many small llm.chunk at the queue head into one llm.bulk ── */
-function tryCoalesceHead(){
-  if (!COALESCE_HEAD) return null;
+function tryCoalesceHead(force = false){
+  if (!(COALESCE_HEAD || force)) return null;
   if (queue.length < 2) return null;
 
   const first = queue[0];
@@ -291,21 +292,26 @@ async function drain(client){
   const age = Math.max(0, now - firstTs);
   const backlog = queue.length;
 
+  const severe = age >= DYNAMIC_COALESCE_LAT_MS;
+
   // adaptive take size
   let take = DRAIN_BASE_BATCH;
   if (backlog > 256 || age > CATCHUP_AGE_MS) take = Math.min(DRAIN_MAX_BATCH, DRAIN_BASE_BATCH * 2);
   if (backlog > 512 || age > 2*CATCHUP_AGE_MS) take = Math.min(DRAIN_MAX_BATCH, Math.floor(DRAIN_BASE_BATCH * 3));
   if (backlog > 1024 || age > 3*CATCHUP_AGE_MS) take = DRAIN_MAX_BATCH;
 
+  if (severe) take = DRAIN_MAX_BATCH; // ★ go wide immediately
+
   const batch = [];
   while (batch.length < take && queue.length > 0) {
-    const merged = tryCoalesceHead();
+    const merged = tryCoalesceHead(severe);  // ★ force merge head chunks when severe
     if (merged) { batch.push(merged); continue; }
     batch.push(queue.shift());
   }
 
-  // higher parallelism when batch is big
-  const workers = Math.min(SEND_CONCURRENCY, Math.max(1, Math.ceil(batch.length / 8)));
+  // ★ higher parallelism while catching up hard
+  const workers = severe ? SEND_CONCURRENCY
+                         : Math.min(SEND_CONCURRENCY, Math.max(1, Math.ceil(batch.length / 8)));
   let idx = 0;
 
   async function worker(){
@@ -326,17 +332,20 @@ async function kickDrain(){
   try {
     while (queue.length > 0 && READY && Date.now() >= suspendUntil) {
       await drain(clientRef);
-      // micro backoff only when small backlog
       const q = queue.length;
       const wait = q > 1500 ? 0 : q > 300 ? 1 : 3;
-      if (wait > 0) await new Promise(r => setTimeout(r, wait));
-      // if wait==0, let the event loop breathe:
-      if (wait === 0) await new Promise(r => setImmediate(r));
+      // ★ if head is very old, don't wait at all
+      const head = queue[0];
+      const headAge = head && head.data ? (Date.now() - (head.data.gen_ts || head.data.ts || Date.now())) : 0;
+      const severe = headAge >= DYNAMIC_COALESCE_LAT_MS;
+      if (!severe && wait > 0) await new Promise(r => setTimeout(r, wait));
+      if (severe || wait === 0) await new Promise(r => setImmediate(r));
     }
   } finally {
     draining = false;
   }
 }
+
 
 /* ── Client bootstrap ────────────────────────────────────────────────── */
 let clientRef = null;
