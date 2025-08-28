@@ -992,6 +992,7 @@ def _finish_assistant(src_addr:str, sid:str):
     s.touch()
 
 def _prune_session(s: Session):
+    return
     max_msgs = max(2*SESSION_MAX_TURNS, 2)
     if len(s.messages) > max_msgs:
         s.messages = s.messages[-max_msgs:]

@@ -325,7 +325,8 @@
       display: flex;
       flex-direction: column;
       justify-content: flex-end;
-      min-width: 0
+      min-width: 0;
+      width:100%;
     }
 
     .col-main::before {
@@ -708,11 +709,16 @@
     .overlay {
       position: fixed;
       inset: 0;
-      display: none;
+      width: 0px;
+      height: 0px;
+      overflow: hidden;
+      pointer-events: none;
+      display: flex;
       align-items: center;
       justify-content: center;
       z-index: 50;
       backdrop-filter: blur(10px);
+      filter: blur(100px);
     }
 
     .overlaySys {
@@ -725,6 +731,10 @@
       backdrop-filter: blur(10px);
     }
 
+    #netStats2 {
+      margin: unset !important;
+    }
+
     .modal {
       width: min(560px, 92vw);
       background: #0a0a0a;
@@ -735,7 +745,7 @@
     }
 
     .modal h3 {
-      margin: .2rem 0 .8rem 0
+      margin: auto 0 .8rem 0
     }
 
     .modal>.row {
@@ -900,6 +910,7 @@
       .settings-data-row {
         display: flex;
         flex-flow: row;
+        justify-content: space-between;
         margin-bottom: 0.5rem;
         gap: 0.5rem;
       }
@@ -1063,12 +1074,12 @@
   <!-- Settings Modal -->
   <div id="overlay" class="overlay">
     <div class="modal">
-      <h3>Settings</h3>
 
       <div class="settings-data-row">
-        <div id="netStats" class="row" style="gap:8px;">
-          <div id="peers" class="chip" title="Active clients the hub reports">Peers</div>
-          <div id="latent" class="chip" title="Round‑trip latency to the hub">Latency</div>
+        <h3>Settings</h3>
+        <div id="netStats2" class="row" style="gap:8px;">
+          <div id="peers2" class="chip" title="Active clients the hub reports">Peers</div>
+          <div id="latent2" class="chip" title="Round‑trip latency to the hub">Latency</div>
         </div>
 
         <div id="modelCaps" class="row"></div>
@@ -2553,6 +2564,7 @@ ${META_END}`;
 
       function setPeersUI(n) {
         let slot = document.getElementById('peers');
+        let slot2 = document.getElementById('peers2');
         if (!slot) {
           const host = document.getElementById('statusRow') || document.querySelector('header');
           slot = document.createElement('span');
@@ -2564,6 +2576,7 @@ ${META_END}`;
         if (n == null) { slot.textContent = ''; return; }   // ← NEW: hide when unknown
         const num = Math.max(0, Number(n) || 0);
         slot.textContent = `${num} peer${num === 1 ? '' : 's'}`;
+        slot2.textContent = `${num} peer${num === 1 ? '' : 's'}`;
       }
 
 
@@ -2651,12 +2664,16 @@ ${META_END}`;
       // === Replace your existing setLatencyUI with this version ===
       function setLatencyUI(ms) {
         const chip = el('latent');
-        if (!chip) return;
+        const chip2 = el('latent2');
 
         if (!Number.isFinite(ms)) {
           chip.textContent = 'Latency';
           chip.style.borderColor = '#2a2a2a';
           chip.style.color = '';
+
+          chip2.textContent = 'Latency';
+          chip2.style.borderColor = '#2a2a2a';
+          chip2.style.color = '';
           // expose neutral state
           window.LatencyViz.lastMs = null;
           window.LatencyViz.ewmaMs = null;
@@ -2680,6 +2697,10 @@ ${META_END}`;
         chip.textContent = `${shown} ms`;
         chip.style.borderColor = color;
         chip.style.color = color;
+
+        chip2.textContent = `${shown} ms`;
+        chip2.style.borderColor = color;
+        chip2.style.color = color;
 
         // Expose to global (for threejs)
         window.LatencyViz.lastMs = ms;
@@ -4467,8 +4488,8 @@ ${META_END}`;
       }, 250));
 
       // Settings modal
-      function openSettings() { updateSettingsUI(); el('overlay').style.display = 'flex'; }
-      function closeSettings() { el('overlay').style.display = 'none'; }
+      function openSettings() { updateSettingsUI(); el('overlay').style.width = '100vw'; el('overlay').style.height = '100vh'; el('overlay').style.pointerEvents = 'all'; el('overlay').style.filter = 'blur(0px)'; }
+      function closeSettings() { el('overlay').style.width = '0vw'; el('overlay').style.height = '0vh'; el('overlay').style.pointerEvents = 'none'; el('overlay').style.filter = 'blur(100px)'; }
 
       // Sidebar Toggle Mobile
       function toggleSidebar() {
