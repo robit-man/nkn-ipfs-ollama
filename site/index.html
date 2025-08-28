@@ -1215,6 +1215,61 @@
         console.groupEnd();
       }
 
+// ---- Mid-stream ACK coalescer ----------------------------------------
+const ACK_STEP = 48;       // send immediately if seq jumps by this many
+const ACK_DELAY_MS = 40;   // otherwise coalesce within this window
+
+const _ackState = new Map(); // id -> {max: number, sent: number, t: number|null}
+
+function _ackSchedule(id) {
+  const st = _ackState.get(id);
+  if (!st) return;
+  if (st.t != null) return; // already scheduled
+  st.t = window.setTimeout(() => {
+    st.t = null;
+    if (st.max > st.sent) {
+      sendAck(id, st.max);   // <-- your existing function that sends {event:'llm.ack', id, upto}
+      st.sent = st.max;
+    }
+  }, ACK_DELAY_MS);
+}
+
+function ackNote(id, seq) {
+  if (!id || !Number.isFinite(seq)) return;
+  let st = _ackState.get(id);
+  if (!st) { st = { max: 0, sent: 0, t: null }; _ackState.set(id, st); }
+  if (seq > st.max) st.max = seq;
+
+  // fast path: if we've drifted far ahead, ACK immediately
+  if ((st.max - st.sent) >= ACK_STEP) {
+    if (st.t != null) { clearTimeout(st.t); st.t = null; }
+    sendAck(id, st.max);
+    st.sent = st.max;
+    return;
+  }
+  _ackSchedule(id);
+}
+
+function ackInit(id) {
+  if (!id) return;
+  const prev = _ackState.get(id);
+  if (prev && prev.t != null) clearTimeout(prev.t);
+  _ackState.set(id, { max: 0, sent: 0, t: null });
+}
+
+function ackFlushAndClear(id, upto) {
+  const st = _ackState.get(id);
+  if (st) {
+    if (st.t != null) { clearTimeout(st.t); st.t = null; }
+    const finalUpto = Math.max(st.max, st.sent, Number(upto) || 0);
+    if (finalUpto > st.sent) sendAck(id, finalUpto);
+    _ackState.delete(id);
+  } else if (Number.isFinite(upto) && upto > 0) {
+    sendAck(id, upto);
+  }
+}
+
+
       function logRecvPacket(src, raw, body) {
         if (!DEBUG.ON) return;
         const ev = body?.event || '—';
@@ -3809,6 +3864,7 @@ ${META_END}`;
 
         if (ev === 'llm.start') {
           const { id, stream } = body;
+          ackInit(id);
           console.info('[llm.start]', { id, stream });
           // init record for this stream (add timing fields for fallback estimates)
           statsByStream.set(id, {
@@ -3877,11 +3933,13 @@ ${META_END}`;
             updateLatencyFromStatsEnvelope(body);
             updateLatencyFromStatsEnvelope(body.data || {});
           }
+          ackNote(body.id, body.seq);    // <-- NEW
           handleChunk(body.id, body.seq, body.data);
           return true;
         }
         if (ev === 'llm.done') {
           sendAck(body.id, body.last_seq);
+          ackFlushAndClear(body.id, body.last_seq); // <-- ensure no leftover pending ACK
           endStream(body.id);
 
           statsLatencyActive = false;   // ← NEW: stop stats mode so pings resume
@@ -3976,6 +4034,7 @@ ${META_END}`;
         }
 
         if (ev === 'llm.error') {
+          ackFlushAndClear(body.id, 0);
           // callback sink
           if (route.sink === 'callback' && typeof route.cb === 'function') {
             try { route.cb({ ok: false, body }); } catch { }
