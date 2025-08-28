@@ -834,7 +834,7 @@
 
       .col-left {
         display: flex;
-        position: absolute;
+        position: fixed;
         width: 50%;
         z-index: 21;
         left: -50%;
@@ -862,7 +862,7 @@
 <body>
   <div class="app">
     <header>
-      <button class="gear" id="toggleSidebar" onclick="toggleSidebar()">
+      <button class="gear" id="toggleSidebar">
         <!-- (icon unchanged) -->
         <svg width="16px" height="16px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
           <path
@@ -922,7 +922,7 @@
           </svg></button>
       </div>
       <div id="sessions" class="sessions"></div>
-      <div id="backdrop" class="backdrop" onclick="toggleSidebar()"></div>
+      <div id="backdrop" class="backdrop"></div>
     </aside>
 
     <main class="col-main">
@@ -3787,6 +3787,8 @@ ${META_END}`;
         elx.style.left = (curLeft === '0px' || curLeft === '0%') ? '-50%' : '0%';
         elxb.style.left = (curLeft === '0px' || curLeft === '0%') ? '-100%' : '0%';
       }
+        el('backdrop').onclick = toggleSidebar;
+        el('toggleSidebar').onclick = toggleSidebar;
 
       // Boot
       function boot() {

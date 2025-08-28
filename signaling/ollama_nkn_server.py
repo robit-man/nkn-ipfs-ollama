@@ -1645,8 +1645,9 @@ def _handle_dm(src_addr: str, body: dict):
     if ev == "ctrl.ping":
         _dm(src_addr, {
             "event": "ctrl.pong",
+            "id": body.get("id"),           # ← echo id so client can match
+            "sent": body.get("ts") or body.get("sent"),
             "ts": _now_ms(),
-            # optional debug fields:
             "nknAddress": state.get("nkn_address"),
             "topicPrefix": state.get("topic_prefix"),
             "llmActive": len(_llm_streams),
@@ -1661,38 +1662,45 @@ def _handle_dm(src_addr: str, body: dict):
     # Control
     if ev == "ctrl.request":
         op = (body.get("op") or "").strip().lower()
+        req_id = body.get("id")  # ← echo this back on every reply
 
         if op == "models":
-            _send_models_list(src_addr)
+            _send_models_list(src_addr, req_id)  # ← will set id on llm.models / llm.result / ctrl.models
+            return
 
         elif op == "info":
             _dm(src_addr, {
                 "event": "ctrl.info",
+                "id": req_id,
                 "ts": _now_ms(),
                 "nknAddress": state.get("nkn_address"),
                 "topicPrefix": state.get("topic_prefix"),
                 "ollamaHost": OLLAMA_HOST
             })
+            return
 
         elif op in ("caps", "hello", "capabilities"):
-            # let clients discover what ops are safe to call
-            _send_ctrl_caps(src_addr)
+            _send_ctrl_caps(src_addr, req_id)  # ← now includes id
+            return
 
         elif op == "peers":
             # optional: frontend may pass {"detail":"count"|"addrs"|"geo"}
             detail = (body.get("detail") or body.get("include") or "count")
-            _send_ctrl_peers(src_addr, detail=detail)
+            _send_ctrl_peers(src_addr, detail=detail, req_id=req_id)  # ← now includes id
+            return
 
         else:
             # Keep the error for unknown ops, but make it self-describing
             _dm(src_addr, {
                 "event": "ctrl.error",
+                "id": req_id,
                 "ts": _now_ms(),
                 "op": op,
                 "message": "unknown op",
                 "supports": sorted(CTRL_CAPS)  # helps older clients downgrade gracefully
             })
-        return
+            return
+
 
 
     # ─────────────────────────────────────────────────────

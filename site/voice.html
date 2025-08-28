@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>NKN Voice (RAW PCM16)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { color-scheme: dark }
+  body{margin:0;font:14px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0b0b;color:#eee}
+  header,.wrap{max-width:880px;margin:0 auto;padding:14px 16px}
+  header{display:flex;justify-content:space-between;align-items:center;gap:12px;border-bottom:1px solid #222}
+  .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .pill{border:1px solid #2a2a2a;padding:6px 10px;border-radius:999px}
+  code.copy{background:#121212;border:1px solid #222;padding:2px 6px;border-radius:6px;cursor:copy}
+  input[type=text]{background:#121212;border:1px solid #2a2a2a;color:#e9e9e9;padding:8px 10px;border-radius:8px;min-width:280px}
+  button{background:#1a1a1a;border:1px solid #2a2a2a;color:#e9e9e9;padding:8px 12px;border-radius:8px;cursor:pointer}
+  button:disabled{opacity:.6;cursor:not-allowed}
+  .muted{color:#9aa}
+  ul#peerList{list-style:none;margin:8px 0 0;padding:0;display:flex;gap:6px;flex-wrap:wrap}
+  ul#peerList li{border:1px solid #2a2a2a;border-radius:999px;padding:4px 8px;display:flex;gap:8px;align-items:center}
+  .dot{width:10px;height:10px;border-radius:50%;border:1px solid #333}
+  .gray{background:#4b5563}.amber{background:#f59e0b}.green{background:#22c55e}
+  footer{opacity:.7;font-size:12px;text-align:center;padding:16px}
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <div class="pill">My NKN: <code id="me" class="copy" title="Click to copy">—</code></div>
+    <div class="pill">Status: <span id="status" class="muted">loading sdk…</span></div>
+  </div>
+  <div class="row">
+    <button id="startBtn" disabled>🎙️ Start Mic</button>
+    <button id="stopBtn" disabled>⏹ Stop</button>
+    <button id="enableSpkBtn" title="Unlock speaker playback" disabled>🔊 Enable Speaker</button>
+    <button id="beepBtn" title="Send test beep to all peers" disabled>🔔 Send Test Beep</button><!-- ★ beep -->
+    <label class="row"><input id="muteIncoming" type="checkbox" /> Mute incoming</label>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="row">
+    <input id="peerInput" type="text" placeholder="Add peer NKN address (name.<64hex>)" />
+    <button id="addPeer">＋</button>
+    <button id="clearPeers" title="Remove all peers">Clear</button>
+  </div>
+  <ul id="peerList"></ul>
+  <div id="log" class="muted" style="margin-top:10px;"></div>
+</div>
+
+<footer>RAW PCM16 only (48kHz mono). Click “Enable Speaker” once to allow playback. Handshake: gray=none, amber=partial, green=mutual. The test beep travels over NKN like mic audio.</footer>
+
+<script>
+(async () => {
+  // --- silence wallet fetch BEFORE SDK loads (prevents CORS/429 noise) ---
+  (function silenceWalletFetch(){
+    const OF = window.fetch;
+    window.fetch = function(input, init){
+      try{
+        const url = typeof input === 'string' ? input : (input?.url ?? '');
+        if (/nkn\.org\/.*\/api\/wallet/i.test(url)) {
+          return Promise.resolve(new Response('{"ok":true}', {
+            status: 200,
+            headers: { "access-control-allow-origin":"*", "content-type":"application/json" }
+          }));
+        }
+      }catch{}
+      return OF(input, init);
+    };
+  })();
+
+  // --- robust loader: try multiple CDNs/versions until window.nkn appears ---
+  async function loadNKN() {
+    if (window.nkn && window.nkn.MultiClient) return true;
+    const SOURCES = [
+      'https://cdn.jsdelivr.net/npm/nkn-sdk@1.3.5/dist/nkn.min.js',
+      'https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js',
+      'https://cdn.jsdelivr.net/npm/nkn-sdk@1.3.7/dist/nkn.min.js'
+    ];
+    for (const src of SOURCES) {
+      try {
+        await new Promise((res, rej) => {
+          const s = document.createElement('script');
+          s.src = src; s.async = true; s.onload = res; s.onerror = rej;
+          document.head.appendChild(s);
+        });
+        if (window.nkn && window.nkn.MultiClient) return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  const $=s=>document.querySelector(s), el=id=>document.getElementById(id);
+  const setStatus=(t,c)=>{ const s=el('status'); s.className=c||''; s.textContent=t; };
+  setStatus('loading sdk…','muted');
+
+  const ok = await loadNKN();
+  if (!ok) {
+    setStatus('failed to load nkn sdk','err');
+    alert('Could not load NKN SDK from CDNs. Check your network/CSP.');
+    return;
+  }
+  setStatus('sdk loaded, connecting…','muted');
+  el('startBtn').disabled=false; el('enableSpkBtn').disabled=false; el('beepBtn').disabled=false; // ★ beep
+
+  // --- helpers & storage ---
+  const short=s=>(s&&s.length>18)?(s.slice(0,7)+'…'+s.slice(-6)):(s||'—');
+  const isNkn=s=>/^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/.test((s||'').trim());
+  const log=(m,cls='')=>{ const L=el('log'); const p=document.createElement('div'); p.textContent=m; if(cls)p.className=cls; L.prepend(p); };
+  const toHex=buf=>Array.from(buf).map(b=>b.toString(16).padStart(2,'0')).join('');
+  const b64  =ab => {const u8=new Uint8Array(ab); let bin=''; for(let i=0;i<u8.length;i++) bin+=String.fromCharCode(u8[i]); return btoa(bin);};
+  const ub64 =b  => {const bin=atob(b), len=bin.length, u8=new Uint8Array(len); for(let i=0;i<len;i++) u8[i]=bin.charCodeAt(i); return u8.buffer;};
+
+  const SEED_KEY='VOICE_RAW_SEED_HEX', PEERS_KEY='VOICE_RAW_PEERS_V1';
+  function getOrCreateSeed(){
+    let hex=localStorage.getItem(SEED_KEY);
+    if(/^[0-9a-f]{64}$/.test(hex||'')) return hex;
+    const r=new Uint8Array(32); crypto.getRandomValues(r); hex=toHex(r);
+    localStorage.setItem(SEED_KEY, hex); return hex;
+  }
+  const peers=new Set();
+  function loadPeers(){ try{ const a=JSON.parse(localStorage.getItem(PEERS_KEY)||'[]'); if(Array.isArray(a)) a.forEach(x=>isNkn(x)&&peers.add(x)); }catch{} }
+  function savePeers(){ localStorage.setItem(PEERS_KEY, JSON.stringify(Array.from(peers))); }
+
+  const peerState=new Map(); // addr -> {sentHi, gotHi, gotAck, last}
+  const stOf=a=>peerState.get(a)||{sentHi:false, gotHi:false, gotAck:false, last:0};
+  function patchState(a,p){ peerState.set(a, Object.assign(stOf(a), p)); renderPeers(); }
+  function statusClass(a){
+    const st=stOf(a), now=Date.now();
+    const fresh=st.last && (now-st.last<20000);
+    const mutual=(st.sentHi&&st.gotHi)||(st.gotHi&&st.gotAck);
+    if(fresh&&mutual) return 'green';
+    if(fresh&&(st.sentHi||st.gotHi||st.gotAck)) return 'amber';
+    return 'gray';
+  }
+  function renderPeers(){
+    const ul=el('peerList'); ul.innerHTML='';
+    if(!peers.size){ const li=document.createElement('li'); li.className='muted'; li.textContent='No peers yet'; ul.appendChild(li); return; }
+    peers.forEach(addr=>{
+      const li=document.createElement('li');
+      const dot=document.createElement('span'); dot.className='dot '+statusClass(addr); dot.title='Handshake';
+      const b=document.createElement('b'); b.textContent=short(addr); b.title=addr;
+      const rm=document.createElement('button'); rm.textContent='×'; rm.title='Remove';
+      rm.onclick=()=>{ peers.delete(addr); savePeers(); renderPeers(); };
+      li.appendChild(dot); li.appendChild(b); li.appendChild(rm); ul.appendChild(li);
+    });
+  }
+
+  // copy my id
+  el('me').addEventListener('click', async ()=>{
+    const addr=client?.addr||''; if(!addr) return;
+    try{ await navigator.clipboard.writeText(addr); const prev=el('me').textContent; el('me').textContent='copied!'; setTimeout(()=>el('me').textContent=short(addr),900);}catch{}
+  });
+
+  // --- Audio (RAW PCM16 via Worklets) ---
+  const RATE=48000, FRAME=960;
+  let audioCtx=null, speakerUnlocked=false, mediaStream=null, capNode=null;
+  const players=new Map(); // addr -> {node,gain}
+
+  async function ensureAudio(){
+    if(audioCtx) return audioCtx;
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)({ sampleRate: RATE });
+
+    const capCode = `
+      class PCMCapture extends AudioWorkletProcessor{
+        constructor(){ super(); this.buf=new Float32Array(0); }
+        process(inputs){
+          const ch = inputs[0]?.[0]; if(!ch) return true;
+          const acc = new Float32Array(this.buf.length + ch.length);
+          acc.set(this.buf,0); acc.set(ch,this.buf.length);
+          const need=${FRAME}; let off=0;
+          while(acc.length-off>=need){
+            const frame = acc.subarray(off, off+need);
+            this.port.postMessage(frame, [frame.buffer.slice(0)]);
+            off+=need;
+          }
+          this.buf = acc.subarray(off);
+          return true;
+        }
+      }
+      registerProcessor('pcm-cap', PCMCapture);
+    `;
+    const playCode = `
+      class PCMPlay extends AudioWorkletProcessor{
+        constructor(){ super(); this.q=[]; this.port.onmessage=e=>{ const f=new Float32Array(e.data); this.q.push(f); }; }
+        process(inputs, outputs){
+          const out=outputs[0][0]; out.fill(0);
+          if(!this.q.length) return true;
+          let i=0;
+          while(i<out.length && this.q.length){
+            const h=this.q[0]; const take=Math.min(out.length-i, h.length);
+            out.set(h.subarray(0,take), i); i+=take;
+            if(take===h.length) this.q.shift(); else this.q[0]=h.subarray(take);
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm-play', PCMPlay);
+    `;
+    const u = s => URL.createObjectURL(new Blob([s],{type:'text/javascript'}));
+    await audioCtx.audioWorklet.addModule(u(capCode));
+    await audioCtx.audioWorklet.addModule(u(playCode));
+    return audioCtx;
+  }
+
+  async function unlockSpeaker(){
+    await ensureAudio();
+    await audioCtx.resume();
+    const frames=Math.max(1,Math.floor(audioCtx.sampleRate/50));
+    const buf=audioCtx.createBuffer(1,frames,audioCtx.sampleRate);
+    const src=audioCtx.createBufferSource(); src.buffer=buf; src.connect(audioCtx.destination); src.start(0);
+    speakerUnlocked=true; el('enableSpkBtn').textContent='🔊 Speaker Enabled'; el('enableSpkBtn').disabled=true; log('Speaker unlocked','muted');
+  }
+  el('enableSpkBtn').onclick = unlockSpeaker;
+
+  function ensurePlayer(addr){
+    let P=players.get(addr);
+    if(P) return P;
+    const node = new AudioWorkletNode(audioCtx,'pcm-play',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[1]});
+    const gain = audioCtx.createGain(); gain.gain.value = el('muteIncoming').checked ? 0 : 1;
+    node.connect(gain).connect(audioCtx.destination);
+    P={node,gain}; players.set(addr,P); return P;
+  }
+  function destroyPlayers(){ players.forEach(P=>{try{P.node.disconnect();P.gain.disconnect();}catch{}}); players.clear(); }
+  el('muteIncoming').onchange=()=>{ const on=el('muteIncoming').checked; players.forEach(P=>P.gain.gain.value=on?0:1); };
+
+  function floatToPCM16(f32){
+    const i16=new Int16Array(f32.length);
+    for(let i=0;i<f32.length;i++){ let s=f32[i]; if(s>1)s=1; else if(s<-1)s=-1; i16[i]=s<0?s*0x8000:s*0x7FFF; }
+    return i16.buffer;
+  }
+  function pcm16ToFloat(ab){
+    const i16=new Int16Array(ab); const f32=new Float32Array(i16.length);
+    for(let i=0;i<i16.length;i++) f32[i]=Math.max(-1,Math.min(1,i16[i]/32768));
+    return f32;
+  }
+
+  // ★ beep: generate a short sine burst with fade-in/out
+  function genBeepF32(ms=200, freq=880, amp=0.25){
+    const N = Math.max(1, Math.floor((audioCtx?.sampleRate||RATE) * ms / 1000));
+    const f = new Float32Array(N);
+    const sr = audioCtx?.sampleRate || RATE;
+    const fade = Math.min(Math.floor(0.01*sr), Math.floor(N/8)); // 10ms or 1/8 length
+    for(let i=0;i<N;i++){
+      const t = i/sr;
+      let a = amp;
+      if(i<fade) a *= i/fade;
+      else if(i>N-fade) a *= (N-i)/fade;
+      f[i] = a * Math.sin(2*Math.PI*freq*t);
+    }
+    return f;
+  }
+
+  // --- NKN ---
+  let client=null, connected=false;
+  async function connectNKN(){
+    setStatus('connecting…','muted');
+    if(client) try{client.close();}catch{}
+    client = new window.nkn.MultiClient({
+      seed: getOrCreateSeed(),
+      identifier: 'voice-raw',
+      numSubClients: 4,
+      originalClient: true,
+      reconnectIntervalMin: 1000,
+      reconnectIntervalMax: 10000,
+      wsConnHeartbeatTimeout: 60000,
+      responseTimeout: 15000,
+      msgHoldingSeconds: 180,
+    });
+
+    client.onConnect(()=>{ connected=true; el('me').textContent=short(client.addr); el('me').title=client.addr; setStatus('connected',''); log('connected as '+client.addr,'muted'); peers.forEach(a=>{sendHi(a);}); });
+    client.on('willreconnect',()=>setStatus('reconnecting…','muted'));
+    client.on('connectFailed',()=>setStatus('connect failed','err'));
+    client.on('close',()=>{connected=false; setStatus('closed','err');});
+    client.on('error',e=>{setStatus('error','err'); log('nkn error: '+(e?.message||e),'err');});
+
+    client.on('message',(a,b)=>{
+      const src = a && typeof a==='object' && 'payload' in a ? (a.src||'') : (a||'');
+      const raw = a && typeof a==='object' && 'payload' in a ? a.payload : b;
+      handleInbound(src, raw);
+    });
+  }
+
+  function parsePayload(x){
+    try{
+      if(x instanceof Uint8Array) return JSON.parse(new TextDecoder().decode(x));
+      if(x instanceof ArrayBuffer) return JSON.parse(new TextDecoder().decode(new Uint8Array(x)));
+      if(typeof x==='string') return JSON.parse(x);
+      if(x&&typeof x==='object') return x;
+    }catch{}
+    return null;
+  }
+
+  async function sendSafe(addr, obj, opts={noReply:true,msgHoldingSeconds:120}){
+    if(!connected||!client) return false;
+    const json = typeof obj==='string'?obj:JSON.stringify(obj);
+    try{ await client.send(addr,json,opts); return true; }
+    catch(e){
+      const msg=e?.message||'';
+      if(e?.name==='DOMException'||/RTCDataChannel|timeout|ConnectToNodeTimeout/i.test(msg)){
+        await new Promise(r=>setTimeout(r,80));
+        try{ await client.send(addr,json,opts); return true; }catch{}
+      }
+      return false;
+    }
+  }
+
+  function sendHi(addr){ sendSafe(addr,{t:'hi',me:client.addr}).then(()=>patchState(addr,{sentHi:true})); }
+  function sendAck(addr){ sendSafe(addr,{t:'ack',me:client.addr}).catch(()=>{}); }
+
+  async function handleInbound(src, payload){
+    const body=parsePayload(payload); if(!body||typeof body!=='object') return;
+
+    if(body.t==='audio' && typeof body.b64==='string'){
+      await ensureAudio();
+      if(!speakerUnlocked){ try{ await audioCtx.resume(); }catch{} }
+      const f32 = pcm16ToFloat(ub64(body.b64));
+      const P = ensurePlayer(src||'peer'); // default key if src missing
+      P.node.port.postMessage(f32, [f32.buffer]);
+      return;
+    }
+    if(body.t==='hi' && isNkn(src)){ patchState(src,{gotHi:true,last:Date.now()}); sendAck(src); if(!stOf(src).sentHi) sendHi(src); return; }
+    if(body.t==='ack'&& isNkn(src)){ patchState(src,{gotAck:true,last:Date.now()}); return; }
+  }
+
+  setInterval(()=>{ const now=Date.now(); peers.forEach(a=>{ const st=stOf(a); if(!st.last || (now-st.last)>10000) sendHi(a); }); }, 5000);
+
+  // capture & send
+  let seq=1;
+  async function startMic(){
+    if(!connected){ alert('NKN not connected yet.'); return; }
+    await ensureAudio();
+    try{
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}, video:false });
+    }catch{ alert('Microphone permission denied/unavailable.'); return; }
+
+    const src = audioCtx.createMediaStreamSource(mediaStream);
+    capNode = new AudioWorkletNode(audioCtx,'pcm-cap',{numberOfInputs:1,numberOfOutputs:0});
+    capNode.port.onmessage = (e)=>{
+      const f32=new Float32Array(e.data);
+      const ab=floatToPCM16(f32);
+      const msg={t:'audio', ts:Date.now(), seq:seq++, b64:b64(ab)};
+      peers.forEach(a=>sendSafe(a,msg));
+    };
+    src.connect(capNode);
+    await unlockSpeaker();
+
+    el('startBtn').disabled=true; el('stopBtn').disabled=false;
+    log('🎙️ mic started','muted');
+  }
+  function stopMic(){
+    try{ if(capNode){ capNode.disconnect(); capNode=null; } }catch{}
+    if(mediaStream){ try{ mediaStream.getTracks().forEach(t=>t.stop()); }catch{} mediaStream=null; }
+    el('startBtn').disabled=false; el('stopBtn').disabled=true;
+    log('⏹ mic stopped','muted');
+  }
+
+  // ★ beep: send a test tone to all peers (and optional local preview)
+  async function sendBeep(ms=200, freq=880){
+    if(!connected){ alert('NKN not connected yet.'); return; }
+    await ensureAudio();
+    const f32 = genBeepF32(ms, freq, 0.25);
+    const ab = floatToPCM16(f32);
+    const msg = { t:'audio', ts:Date.now(), seq:seq++, kind:'beep', b64:b64(ab), meta:{codec:'pcm16le/48000/1', ms, freq} };
+    let sent=0; peers.forEach(a=>{ sendSafe(a, msg); sent++; });
+    log(`🔔 sent test beep to ${sent} peer${sent===1?'':'s'}`,'muted');
+
+    // local preview (optional, helps confirm your speaker is unlocked)
+    if(speakerUnlocked){
+      const P = ensurePlayer('local');
+      P.node.port.postMessage(f32, [f32.buffer]);
+    }
+  }
+
+  // UI wire-up
+  el('addPeer').onclick=()=>{ const v=el('peerInput').value.trim(); if(!isNkn(v)){ alert('Invalid NKN address'); return; } peers.add(v); el('peerInput').value=''; savePeers(); renderPeers(); sendHi(v); };
+  el('clearPeers').onclick=()=>{ peers.clear(); savePeers(); renderPeers(); };
+  el('startBtn').onclick=startMic; el('stopBtn').onclick=stopMic;
+  el('beepBtn').onclick=()=>sendBeep(200, 880); // ★ beep
+  el('muteIncoming').onchange=()=>{ const on=el('muteIncoming').checked; players.forEach(P=>P.gain.gain.value=on?0:1); };
+
+  // boot
+  loadPeers(); renderPeers(); connectNKN();
+})();
+</script>
+</body>
+</html>
