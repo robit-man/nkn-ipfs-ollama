@@ -2340,6 +2340,87 @@ ${META_END}`;
 
       // ───────────────────── NKN peers UI (count of ready subclients) ─────────────────────
       let peersTicker = null;
+      // --- Latency via stats while streaming ---
+      let useStatsLatency = true;            // prefer stats-based latency during streaming
+      let statsLatencyActive = false;        // toggled on llm.start/llm.done
+      let lastStatsRecvAt = 0;               // when we last updated latency from stats
+      const STATS_STALENESS_MS = 3000;       // if no stats for this long, allow ctrl pings again
+      const LATENCY_UI_MIN_INTERVAL = 120;       // throttle UI updates
+      let _lastLatencyUIAt = 0;
+
+      function _coerceMs(t) {
+        if (!Number.isFinite(t)) return null;
+        // seconds → ms (handles OpenAI-style `created`, etc.)
+        return (t < 1e11) ? (t * 1000) : t;
+      }
+      function _parseRemoteTsLike(obj) {
+        if (!obj || typeof obj !== 'object') return null;
+
+        // common keys seen in llm.stats/llm.chunk/done across backends
+        const candidates = [
+          obj.ts, obj.server_ts, obj.sent_at, obj.time,
+          obj.created, obj.created_ms, obj.created_at, obj.timestamp, obj.server_time
+        ];
+
+        for (const v of candidates) {
+          if (v == null) continue;
+          if (typeof v === 'number') {
+            const t = _coerceMs(v); if (t) return t;
+          }
+          if (typeof v === 'string') {
+            const n = Number(v);
+            if (Number.isFinite(n)) { const t = _coerceMs(n); if (t) return t; }
+            const d = Date.parse(v);
+            if (Number.isFinite(d)) return d;
+          }
+        }
+        return null;
+      }
+
+      // Look in shallow object and a few common nested containers
+      function _findRemoteTsDeep(envelope) {
+        const try1 = _parseRemoteTsLike(envelope);
+        if (try1) return try1;
+        for (const k of ['data', 'message', 'meta', 'ollama']) {
+          const t = _parseRemoteTsLike(envelope?.[k]);
+          if (t) return t;
+        }
+        return null;
+      }
+
+      function updateLatencyFromStatsEnvelope(envelope) {
+        const ts = _findRemoteTsDeep(envelope);
+        if (!ts) return;
+
+        const now = Date.now();
+        const ms = Math.max(0, Math.min(90000, now - ts));
+
+        // UI throttle
+        if (now - _lastLatencyUIAt < LATENCY_UI_MIN_INTERVAL) return;
+        _lastLatencyUIAt = now;
+
+        lastStatsRecvAt = now;
+        setLatencyUI(ms); // uses your EWMA + chip coloring
+      }
+
+      function _parseRemoteTs(o) {
+        // accept common server timestamp keys; seconds or millis
+        let t = Number(
+          o?.ts ?? o?.sent_at ?? o?.server_ts ?? o?.time ??
+          (o?.data && (o.data.ts ?? o.data.sent_at ?? o.data.server_ts ?? o.data.time))
+        );
+        if (!Number.isFinite(t)) return null;
+        if (t < 1e11) t = t * 1000; // seconds → ms
+        return t;
+      }
+      function updateLatencyFromStatsEnvelope(envelope) {
+        const remoteMs = _parseRemoteTs(envelope);
+        if (!remoteMs) return;
+        const ms = Math.max(0, Math.min(90000, Date.now() - remoteMs));
+        lastStatsRecvAt = Date.now();
+        console.log('Latency' + ms)
+        setLatencyUI(ms); // reuse your existing EWMA + coloring
+      }
 
       function setPeersUI(n) {
         let slot = document.getElementById('peers');
@@ -2407,6 +2488,7 @@ ${META_END}`;
         requestHubPeers();
         peersPollTimer = setInterval(requestHubPeers, PEERS_POLL_MS);
       }
+
       function stopPeersPolling() {
         if (peersPollTimer) { clearInterval(peersPollTimer); peersPollTimer = null; }
         setPeersUI(null);
@@ -3237,7 +3319,7 @@ ${META_END}`;
 
       // Back off: let the SDK handle path rotation & reconnects.
       // We only intervene if we miss multiple pongs *and* all subclients are 0 for a while.
-      const HEARTBEAT_MS = 2000;                // ping every 6s (tolerant of timer clamping)
+      const HEARTBEAT_MS = 100;                // ping every 6s (tolerant of timer clamping)
       const MISSED_PONG_LIMIT = 4;              // ~24s of missed pongs before we consider action
       const PEERS_ZERO_GRACE_MS = 12000;        // require peers==0 for at least 12s too
       let hbTimer = null;
@@ -3264,11 +3346,13 @@ ${META_END}`;
             return;
           }
 
-          // Send ping on the CTRL lane
-          try {
+          // Quiet pings while streaming if stats are fresh; fallback if stats go stale.
+          const statsFresh = (useStatsLatency && statsLatencyActive && (Date.now() - lastStatsRecvAt) < STATS_STALENESS_MS);
+          if (!statsFresh) {
             lastPingSentAt = Date.now();
             sendCtrl(HUB_ADDR, { event: 'ctrl.ping', ts: lastPingSentAt }, { noReply: true, maxHoldingSeconds: 120 });
-          } catch { }
+          }
+
 
           const now = Date.now();
           const sincePong = now - (lastPongAt || 0);
@@ -3644,6 +3728,11 @@ ${META_END}`;
             approxTokens: 0,       // <— running token est (chars→tokens)
             approx: true
           });
+
+          statsLatencyActive = true;          // ← NEW
+          lastStatsRecvAt = Date.now();       // ← NEW
+          updateLatencyFromStatsEnvelope(body); // optional prime if server sent a ts
+
           if (route.sink === 'element') {
             const elx = resolveEl(route.elId);
             if (route.lock) lockElement(elx, true);
@@ -3679,18 +3768,38 @@ ${META_END}`;
             });
 
           }
+
           return true;
         }
 
         if (ev === 'llm.stats') {
           applyStreamStats(body.id, body);   // same sink
+          if (useStatsLatency && statsLatencyActive) {
+            updateLatencyFromStatsEnvelope(body);
+            updateLatencyFromStatsEnvelope(body.data || {}); // harmless if absent
+          }
           return true;
         }
 
-        if (ev === 'llm.chunk') { handleChunk(body.id, body.seq, body.data); return true; }
+        if (ev === 'llm.chunk') {
+          if (statsLatencyActive) {
+            updateLatencyFromStatsEnvelope(body);
+            updateLatencyFromStatsEnvelope(body.data || {});
+          }
+          handleChunk(body.id, body.seq, body.data);
+          return true;
+        }
         if (ev === 'llm.done') {
           sendAck(body.id, body.last_seq);
           endStream(body.id);
+
+          statsLatencyActive = false;   // ← NEW: stop stats mode so pings resume
+
+          // Optional: one last latency update from the done envelope if it carries a server ts
+          if (useStatsLatency) {
+            updateLatencyFromStatsEnvelope(body);
+            updateLatencyFromStatsEnvelope(body.data || {});
+          }
 
           // fold in any stats that arrived on the final envelope
           applyStreamStats(body.id, body);
