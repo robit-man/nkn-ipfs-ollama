@@ -2452,22 +2452,114 @@ ${META_END}`;
       function stopPeersTicker() {
         if (peersTicker) { clearInterval(peersTicker); peersTicker = null; }
       }
+
+      // ---- Continuous gradient helpers + public export ---------------------------------
+      const LATENCY_STOPS = [
+        { ms: 0, color: '#22c55e' }, // green
+        { ms: 150, color: '#facc15' }, // yellow
+        { ms: 400, color: '#ef4444' }  // red
+      ];
+
+      function _clamp(n, a, b) { return Math.min(b, Math.max(a, n)); }
+      function _hexToRgb(hex) {
+        const m = /^#?([a-f0-9]{2})([a-f0-9]{2})([a-f0-9]{2})$/i.exec(hex);
+        if (!m) return { r: 255, g: 255, b: 255 };
+        return { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) };
+      }
+      function _rgbToHex(r, g, b) {
+        const h = (x) => x.toString(16).padStart(2, '0');
+        return `#${h(r)}${h(g)}${h(b)}`;
+      }
+      function _lerp(a, b, t) { return a + (b - a) * t; }
+      function _lerpColor(c1, c2, t) {
+        const A = _hexToRgb(c1), B = _hexToRgb(c2);
+        return _rgbToHex(
+          Math.round(_lerp(A.r, B.r, t)),
+          Math.round(_lerp(A.g, B.g, t)),
+          Math.round(_lerp(A.b, B.b, t))
+        );
+      }
+
+      /** Map latency (ms) to a continuous color along the configured stops */
+      function colorForLatency(ms, stops = LATENCY_STOPS) {
+        if (!Number.isFinite(ms)) return '#9ca3af'; // neutral gray
+        const s = stops.slice().sort((a, b) => a.ms - b.ms);
+        if (ms <= s[0].ms) return s[0].color;
+        if (ms >= s[s.length - 1].ms) return s[s.length - 1].color;
+        for (let i = 0; i < s.length - 1; i++) {
+          const a = s[i], b = s[i + 1];
+          if (ms >= a.ms && ms <= b.ms) {
+            const t = (ms - a.ms) / (b.ms - a.ms);
+            return _lerpColor(a.color, b.color, t);
+          }
+        }
+        return s[s.length - 1].color;
+      }
+
+      /** Normalize latency to 0..1 across the first/last stops (for shaders, etc.) */
+      function normalizedLatency(ms, stops = LATENCY_STOPS) {
+        const min = stops[0].ms, max = stops[stops.length - 1].ms;
+        return _clamp((ms - min) / (max - min), 0, 1);
+      }
+
+      // Public object for your threejs component to read/subscribe
+      window.LatencyViz = window.LatencyViz || {
+        lastMs: null,
+        ewmaMs: null,
+        color: '#9ca3af',
+        norm: 0,
+        stops: LATENCY_STOPS,
+        colorFor: (ms) => colorForLatency(ms, LATENCY_STOPS),
+        normalize: (ms) => normalizedLatency(ms, LATENCY_STOPS),
+        // allow live tuning of stops
+        setStops(newStops) { if (Array.isArray(newStops) && newStops.length >= 2) this.stops = newStops; }
+      };
+      // ----------------------------------------------------------------------------------
+
+
+      // === Replace your existing setLatencyUI with this version ===
       function setLatencyUI(ms) {
         const chip = el('latent');
         if (!chip) return;
+
         if (!Number.isFinite(ms)) {
           chip.textContent = 'Latency';
           chip.style.borderColor = '#2a2a2a';
+          chip.style.color = '';
+          // expose neutral state
+          window.LatencyViz.lastMs = null;
+          window.LatencyViz.ewmaMs = null;
+          window.LatencyViz.color = '#9ca3af';
+          window.LatencyViz.norm = 0;
+          window.dispatchEvent(new CustomEvent('latency:update', { detail: { ...window.LatencyViz } }));
           return;
         }
-        // Smooth
-        latencyEwma = (latencyEwma == null) ? ms : (LAT_EWMA_ALPHA * ms + (1 - LAT_EWMA_ALPHA) * latencyEwma);
-        const shown = Math.round(latencyEwma);
-        chip.textContent = `${shown} ms`;
 
-        // color: green <150ms, amber <400ms, red otherwise
-        chip.style.borderColor = (shown < 150) ? '#22c55e' : (shown < 400) ? '#ffaa00' : '#ef4444';
-        chip.style.color = (shown < 150) ? '#22c55e' : (shown < 400) ? '#ffaa00' : '#ef4444';
+        // Smooth EWMA as before
+        latencyEwma = (latencyEwma == null)
+          ? ms
+          : (LAT_EWMA_ALPHA * ms + (1 - LAT_EWMA_ALPHA) * latencyEwma);
+
+        const shown = Math.max(0, Math.round(latencyEwma));
+
+        // Continuous gradient color
+        const color = colorForLatency(shown, window.LatencyViz.stops);
+
+        // UI
+        chip.textContent = `${shown} ms`;
+        chip.style.borderColor = color;
+        chip.style.color = color;
+
+        // Expose to global (for threejs)
+        window.LatencyViz.lastMs = ms;
+        window.LatencyViz.ewmaMs = shown;
+        window.LatencyViz.color = color;
+        window.LatencyViz.norm = normalizedLatency(shown, window.LatencyViz.stops);
+
+        // Notify listeners (your renderer can listen for this)
+        window.dispatchEvent(new CustomEvent('latency:update', {
+          detail: { ...window.LatencyViz }
+        }));
       }
 
       // Ask the hub for its current connected clients count.
@@ -3322,7 +3414,7 @@ ${META_END}`;
       const MISSED_PONG_LIMIT = 4;              // ~24s of missed pongs before we consider action
       const PEERS_ZERO_GRACE_MS = 12000;        // require peers==0 for at least 12s too
       let hbTimer = null;
-      let lastPongAt = 0;https://192.168.1.8/
+      let lastPongAt = 0; 
       let missedPongs = 0;
       let peersZeroSince = 0;
 
