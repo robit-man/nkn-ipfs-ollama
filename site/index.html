@@ -2418,7 +2418,6 @@ ${META_END}`;
         if (!remoteMs) return;
         const ms = Math.max(0, Math.min(90000, Date.now() - remoteMs));
         lastStatsRecvAt = Date.now();
-        console.log('Latency' + ms)
         setLatencyUI(ms); // reuse your existing EWMA + coloring
       }
 
@@ -3323,7 +3322,7 @@ ${META_END}`;
       const MISSED_PONG_LIMIT = 4;              // ~24s of missed pongs before we consider action
       const PEERS_ZERO_GRACE_MS = 12000;        // require peers==0 for at least 12s too
       let hbTimer = null;
-      let lastPongAt = 0;
+      let lastPongAt = 0;https://192.168.1.8/
       let missedPongs = 0;
       let peersZeroSince = 0;
 
