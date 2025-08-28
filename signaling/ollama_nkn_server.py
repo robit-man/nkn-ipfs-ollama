@@ -1314,6 +1314,9 @@ class _LLMStream:
     BULK_MAX_MS          = 120
     BULK_MAX_PARTS       = 16
     STATS_INTERVAL_SECS = 0.5
+    SEVERE_ACK_STALE_SECS = 5.0
+    BULK_PANIC_MS = 850          # flush at most ~1x/sec while lagging badly
+    BULK_PANIC_PARTS = 9999      # effectively “as many as arrive”
     def __init__(self, src_addr: str, req: dict,
                  on_start=None, on_delta=None, on_done=None):
         self.src_addr = src_addr
@@ -1567,15 +1570,37 @@ class _LLMStream:
                     last_flush = time.monotonic()
 
             for part in gen:
-                if self.cancelled: break
+                if self.cancelled:
+                    break
+
                 now = time.monotonic()
                 with self._lock:
                     unacked = self.seq - self.last_acked
-                    ack_stale = (now - self._last_ack_change) > 0.8
+                    ack_stalled_s = (now - self._last_ack_change)
+                ack_stale = ack_stalled_s > 0.8
+                panic = ack_stalled_s >= self.SEVERE_ACK_STALE_SECS
+
+                # Normal bulk heuristic (mild lag) still applies:
                 bulk_mode = (unacked >= self.BULK_UNACK_THRESHOLD) or ack_stale
 
+                # Extract once; we treat non-text parts as boundaries that force a flush
+                delta = _extract_delta_from_part(self.api, part)
+
+                if panic:
+                    # ★ Panic mode: grow the chunk a lot before flushing
+                    if delta:
+                        bulk_buf.append(delta)
+                        too_many = len(bulk_buf) >= self.BULK_PANIC_PARTS
+                        too_old  = (now - last_flush) * 1000.0 >= self.BULK_PANIC_MS
+                        if too_many or too_old:
+                            _bulk_flush()
+                        continue
+                    else:
+                        _bulk_flush()
+                        self._send_chunk(part)
+                    continue
+
                 if bulk_mode:
-                    delta = _extract_delta_from_part(self.api, part)
                     if delta:
                         bulk_buf.append(delta)
                         too_many = len(bulk_buf) >= self.BULK_MAX_PARTS
