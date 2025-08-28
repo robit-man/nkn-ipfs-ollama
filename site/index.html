@@ -153,16 +153,18 @@
     }
 
     header {
-      max-height: 400px;
       grid-area: top;
       display: flex;
       justify-content: flex-start;
       align-items: center;
-      flex-flow: wrap;
-      gap: 10px;
+      flex-flow: row;
+      gap: 0.5rem;
+      height: 4rem;
+      overflow: auto;
+      max-width: 100vw;
       padding: 10px var(--pad);
       background: #000;
-      position: sticky;
+      position: relative;
       top: 0;
       z-index: 20;
       border-bottom: 1px solid var(--line);
@@ -200,14 +202,16 @@
     .chip {
       padding: 8px 10px;
       border: 1px solid #2a2a2a;
+      height: 2.4rem;
       border-radius: 8px;
       color: #eaeaea;
       background: #0a0a0a;
       display: flex;
+      width: max-content;
       gap: 0.5rem;
-      height: 38px;
       font-weight: bold;
       text-transform: capitalize;
+      transition: width 1s ease;
     }
 
     .chip b {
@@ -228,8 +232,8 @@
       display: flex;
       flex-flow: row;
       justify-content: center;
-      min-width: 34px;
-      min-height: 34px;
+      min-width: 2.4rem;
+      min-height: 2.4rem;
       cursor: pointer;
       border: 1px solid #2a2a2a;
       border-radius: 8px;
@@ -238,6 +242,10 @@
       line-height: 1;
       background: #0a0a0a;
       color: white;
+    }
+
+    gear>svg {
+      margin: auto;
     }
 
     .gear:active {
@@ -405,7 +413,7 @@
 
     .meta {
       display: flex;
-      gap: 10px;
+      gap: 0.5rem;
       align-items: center;
       color: #bfbfbf;
       font-size: 12px;
@@ -464,7 +472,7 @@
 
     .composer {
       display: flex;
-      gap: 10px;
+      gap: 0.5rem;
       padding: 12px;
       border-top: 1px solid #141414;
       background: #050505
@@ -475,7 +483,7 @@
       resize: none;
       height: 40px;
       border: unset;
-      background: #000;
+      background: transparent;
       color: var(--fg);
       border-radius: 12px;
       padding: 12px
@@ -527,9 +535,16 @@
 
     #connText {
       display: flex;
-      flex-flow: column;
+      flex-flow: wrap;
       justify-content: center;
-      ;
+      border: 1px solid #2a2a2a;
+      height: 2.4rem;
+      width: 2.4rem;
+      border-radius: 8px;
+    }
+
+    #connText>svg {
+      margin: auto;
     }
 
     @keyframes dotdotdot {
@@ -646,6 +661,19 @@
       cursor: pointer;
     }
 
+    .row-primary {
+      display: flex;
+      flex-flow: row;
+      height: auto;
+      bottom: 0px;
+      left: 0px;
+      width: 100vw;
+      height: calc(100vh - 4rem);
+      position: relative;
+      box-sizing: border-box;
+
+    }
+
     #sendBtn {
       display: flex;
     }
@@ -748,6 +776,18 @@
 
     .modal .row {
       margin-top: 10px
+    }
+
+    .settings-data-row {
+      display: none;
+    }
+
+    .header-data-row {
+      display: flex;
+      flex-flow: row;
+      margin-right: 0.5rem;
+      gap: 0.5rem;
+
     }
 
     /* ── Connection status dot in header ───────────────────────────────────── */
@@ -856,6 +896,17 @@
       #modelCaps {
         display: none !important;
       }
+
+      .settings-data-row {
+        display: flex;
+        flex-flow: row;
+        margin-bottom: 0.5rem;
+        gap: 0.5rem;
+      }
+
+      .header-data-row {
+        display: none;
+      }
     }
   </style>
 </head>
@@ -863,32 +914,16 @@
 <body>
   <div class="app">
     <header>
-      <button class="gear" id="toggleSidebar">
+
+
+      <button id="settingsBtn" class="gear btnSq" aria-label="Settings">
         <!-- (icon unchanged) -->
         <svg width="16px" height="16px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
           <path
-            d="M11 5V19M6 8H8M6 11H8M6 14H8M6.2 19H17.8C18.9201 19 19.4802 19 19.908 18.782C20.2843 18.5903 20.5903 18.2843 20.782 17.908C21 17.4802 21 16.9201 21 15.8V8.2C21 7.0799 21 6.51984 20.782 6.09202C20.5903 5.71569 20.2843 5.40973 19.908 5.21799C19.4802 5 18.9201 5 17.8 5H6.2C5.0799 5 4.51984 5 4.09202 5.21799C3.71569 5.40973 3.40973 5.71569 3.21799 6.09202C3 6.51984 3 7.07989 3 8.2V15.8C3 16.9201 3 17.4802 3.21799 17.908C3.40973 18.2843 3.71569 18.5903 4.09202 18.782C4.51984 19 5.07989 19 6.2 19Z"
-            stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            d="M12 3L14.0357 8.16153C14.2236 8.63799 14.3175 8.87622 14.4614 9.0771C14.5889 9.25516 14.7448 9.41106 14.9229 9.53859C15.1238 9.68245 15.362 9.77641 15.8385 9.96432L21 12L15.8385 14.0357C15.362 14.2236 15.1238 14.3175 14.9229 14.4614C14.7448 14.5889 14.5889 14.7448 14.4614 14.9229C14.3175 15.1238 14.2236 15.362 14.0357 15.8385L12 21L9.96432 15.8385C9.77641 15.362 9.68245 15.1238 9.53859 14.9229C9.41106 14.7448 9.25516 14.5889 9.0771 14.4614C8.87622 14.3175 8.63799 14.2236 8.16153 14.0357L3 12L8.16153 9.96432C8.63799 9.77641 8.87622 9.68245 9.0771 9.53859C9.25516 9.41106 9.41106 9.25516 9.53859 9.0771C9.68245 8.87622 9.77641 8.63799 9.96432 8.16153L12 3Z"
+            stroke="#ffffff" stroke-width="2" stroke-linejoin="round" />
         </svg>
       </button>
-
-      <!-- NEW: connection status (dot + label). The model select will be injected next to this. -->
-      <div id="statusRow" class="row">
-        <span id="connDot" class="conn-dot" aria-hidden="true"></span>
-        <span id="connText" class="muted"></span>
-      </div>
-
-      <!-- The select stays in DOM; we will move it next to #statusRow and hide it until models are ready -->
-      <select id="modelSelect" class="topbar-select" title="Available models" disabled>
-        <option style="text-align:center;">Loading Models</option>
-      </select>
-
-      <div id="modelCaps" class="row"></div>
-
-      <div id="netStats" class="row" style="gap:8px;">
-        <div id="peers" class="chip" title="Active clients the hub reports">Peers</div>
-        <div id="latent" class="chip" title="Round‑trip latency to the hub">Latency</div>
-      </div>
 
       <button id="systemToggleBtn" class="gear btnSq"><svg width="16px" height="16px" viewBox="0 0 24 24" fill="none"
           xmlns="http://www.w3.org/2000/svg">
@@ -901,59 +936,82 @@
         </svg></button>
 
 
-
-      <button id="settingsBtn" class="gear btnSq" aria-label="Settings">
+      <button class="gear" id="toggleSidebar">
         <!-- (icon unchanged) -->
         <svg width="16px" height="16px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
           <path
-            d="M12 3L14.0357 8.16153C14.2236 8.63799 14.3175 8.87622 14.4614 9.0771C14.5889 9.25516 14.7448 9.41106 14.9229 9.53859C15.1238 9.68245 15.362 9.77641 15.8385 9.96432L21 12L15.8385 14.0357C15.362 14.2236 15.1238 14.3175 14.9229 14.4614C14.7448 14.5889 14.5889 14.7448 14.4614 14.9229C14.3175 15.1238 14.2236 15.362 14.0357 15.8385L12 21L9.96432 15.8385C9.77641 15.362 9.68245 15.1238 9.53859 14.9229C9.41106 14.7448 9.25516 14.5889 9.0771 14.4614C8.87622 14.3175 8.63799 14.2236 8.16153 14.0357L3 12L8.16153 9.96432C8.63799 9.77641 8.87622 9.68245 9.0771 9.53859C9.25516 9.41106 9.41106 9.25516 9.53859 9.0771C9.68245 8.87622 9.77641 8.63799 9.96432 8.16153L12 3Z"
-            stroke="#ffffff" stroke-width="2" stroke-linejoin="round" />
+            d="M11 5V19M6 8H8M6 11H8M6 14H8M6.2 19H17.8C18.9201 19 19.4802 19 19.908 18.782C20.2843 18.5903 20.5903 18.2843 20.782 17.908C21 17.4802 21 16.9201 21 15.8V8.2C21 7.0799 21 6.51984 20.782 6.09202C20.5903 5.71569 20.2843 5.40973 19.908 5.21799C19.4802 5 18.9201 5 17.8 5H6.2C5.0799 5 4.51984 5 4.09202 5.21799C3.71569 5.40973 3.40973 5.71569 3.21799 6.09202C3 6.51984 3 7.07989 3 8.2V15.8C3 16.9201 3 17.4802 3.21799 17.908C3.40973 18.2843 3.71569 18.5903 4.09202 18.782C4.51984 19 5.07989 19 6.2 19Z"
+            stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
       </button>
+      <!-- NEW: connection status (dot + label). The model select will be injected next to this. -->
+      <div id="statusRow" class="row">
+        <span id="connDot" class="conn-dot" aria-hidden="true"></span>
+        <span id="connText" class="muted"></span>
+      </div>
+
+      <!-- The select stays in DOM; we will move it next to #statusRow and hide it until models are ready -->
+      <select id="modelSelect" class="topbar-select" title="Available models" disabled>
+        <option style="text-align:center;">Loading Models</option>
+      </select>
+      <div class="header-data-row">
+
+        <div id="netStats" class="row" style="gap:8px;">
+          <div id="peers" class="chip" title="Active clients the hub reports">Peers</div>
+          <div id="latent" class="chip" title="Round‑trip latency to the hub">Latency</div>
+        </div>
+
+        <div id="modelCaps" class="row"></div>
+
+      </div>
+
+
+
     </header>
+    <div class="row-primary">
+      <aside id="sidebar" class="col-left">
+        <div class="left-head row">
+          <div style="font-weight:600">Sessions</div>
+          <div class="spacer"></div>
+          <button id="newSessionBtn" class="btn btnSq"><svg width="16px" height="16px" viewBox="0 0 24 24" fill="none"
+              xmlns="http://www.w3.org/2000/svg">
+              <path d="M6 12H18M12 6V18" stroke="#ffffff" stroke-width="2" stroke-linecap="round"
+                stroke-linejoin="round" />
+            </svg></button>
+        </div>
+        <div id="sessions" class="sessions"></div>
+        <div id="backdrop" class="backdrop"></div>
+      </aside>
 
-    <aside id="sidebar" class="col-left">
-      <div class="left-head row">
-        <div style="font-weight:600">Sessions</div>
-        <div class="spacer"></div>
-        <button id="newSessionBtn" class="btn btnSq"><svg width="16px" height="16px" viewBox="0 0 24 24" fill="none"
-            xmlns="http://www.w3.org/2000/svg">
-            <path d="M6 12H18M12 6V18" stroke="#ffffff" stroke-width="2" stroke-linecap="round"
-              stroke-linejoin="round" />
-          </svg></button>
-      </div>
-      <div id="sessions" class="sessions"></div>
-      <div id="backdrop" class="backdrop"></div>
-    </aside>
+      <main class="col-main">
 
-    <main class="col-main">
+        <div id="chat" class="chat"></div>
 
-      <div id="chat" class="chat"></div>
+        <div class="composer">
+          <!-- NEW: attachments preview row -->
+          <div id="attachPreview" class="row" style="align-items:center; flex-wrap:wrap;"></div>
 
-      <div class="composer">
-        <!-- NEW: attachments preview row -->
-        <div id="attachPreview" class="row" style="align-items:center; flex-wrap:wrap;"></div>
+          <!-- existing -->
+          <textarea id="prompt" class="input" placeholder="Message... (Shift+Enter = newline)"></textarea>
 
-        <!-- existing -->
-        <textarea id="prompt" class="input" placeholder="Message... (Shift+Enter = newline)"></textarea>
+          <!-- NEW: attach button and hidden input -->
+          <button id="attachBtn" class="sendButton" title="Attach images" style="display:none;"><svg width="24px"
+              height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path
+                d="M14.2639 15.9375L12.5958 14.2834C11.7909 13.4851 11.3884 13.086 10.9266 12.9401C10.5204 12.8118 10.0838 12.8165 9.68048 12.9536C9.22188 13.1095 8.82814 13.5172 8.04068 14.3326L4.04409 18.2801M14.2639 15.9375L14.6053 15.599C15.4112 14.7998 15.8141 14.4002 16.2765 14.2543C16.6831 14.126 17.12 14.1311 17.5236 14.2687C17.9824 14.4251 18.3761 14.8339 19.1634 15.6514L20 16.4934M14.2639 15.9375L18.275 19.9565M18.275 19.9565C17.9176 20 17.4543 20 16.8 20H7.2C6.07989 20 5.51984 20 5.09202 19.782C4.71569 19.5903 4.40973 19.2843 4.21799 18.908C4.12796 18.7313 4.07512 18.5321 4.04409 18.2801M18.275 19.9565C18.5293 19.9256 18.7301 19.8727 18.908 19.782C19.2843 19.5903 19.5903 19.2843 19.782 18.908C20 18.4802 20 17.9201 20 16.8V16.4934M4.04409 18.2801C4 17.9221 4 17.4575 4 16.8V7.2C4 6.0799 4 5.51984 4.21799 5.09202C4.40973 4.71569 4.71569 4.40973 5.09202 4.21799C5.51984 4 6.07989 4 7.2 4H16.8C17.9201 4 18.4802 4 18.908 4.21799C19.2843 4.40973 19.5903 4.71569 19.782 5.09202C20 5.51984 20 6.0799 20 7.2V16.4934M17 8.99989C17 10.1045 16.1046 10.9999 15 10.9999C13.8954 10.9999 13 10.1045 13 8.99989C13 7.89532 13.8954 6.99989 15 6.99989C16.1046 6.99989 17 7.89532 17 8.99989Z"
+                stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg></button>
+          <input id="fileInput" type="file" accept="image/*" multiple class="hide" />
 
-        <!-- NEW: attach button and hidden input -->
-        <button id="attachBtn" class="sendButton" title="Attach images" style="display:none;"><svg width="24px"
-            height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path
-              d="M14.2639 15.9375L12.5958 14.2834C11.7909 13.4851 11.3884 13.086 10.9266 12.9401C10.5204 12.8118 10.0838 12.8165 9.68048 12.9536C9.22188 13.1095 8.82814 13.5172 8.04068 14.3326L4.04409 18.2801M14.2639 15.9375L14.6053 15.599C15.4112 14.7998 15.8141 14.4002 16.2765 14.2543C16.6831 14.126 17.12 14.1311 17.5236 14.2687C17.9824 14.4251 18.3761 14.8339 19.1634 15.6514L20 16.4934M14.2639 15.9375L18.275 19.9565M18.275 19.9565C17.9176 20 17.4543 20 16.8 20H7.2C6.07989 20 5.51984 20 5.09202 19.782C4.71569 19.5903 4.40973 19.2843 4.21799 18.908C4.12796 18.7313 4.07512 18.5321 4.04409 18.2801M18.275 19.9565C18.5293 19.9256 18.7301 19.8727 18.908 19.782C19.2843 19.5903 19.5903 19.2843 19.782 18.908C20 18.4802 20 17.9201 20 16.8V16.4934M4.04409 18.2801C4 17.9221 4 17.4575 4 16.8V7.2C4 6.0799 4 5.51984 4.21799 5.09202C4.40973 4.71569 4.71569 4.40973 5.09202 4.21799C5.51984 4 6.07989 4 7.2 4H16.8C17.9201 4 18.4802 4 18.908 4.21799C19.2843 4.40973 19.5903 4.71569 19.782 5.09202C20 5.51984 20 6.0799 20 7.2V16.4934M17 8.99989C17 10.1045 16.1046 10.9999 15 10.9999C13.8954 10.9999 13 10.1045 13 8.99989C13 7.89532 13.8954 6.99989 15 6.99989C16.1046 6.99989 17 7.89532 17 8.99989Z"
-              stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-          </svg></button>
-        <input id="fileInput" type="file" accept="image/*" multiple class="hide" />
-
-        <button id="sendBtn" class="sendButton"><svg width="24px" height="24px" viewBox="0 0 24 24" fill="none"
-            xmlns="http://www.w3.org/2000/svg">
-            <path
-              d="M16.6582 9.28638C18.098 10.1862 18.8178 10.6361 19.0647 11.2122C19.2803 11.7152 19.2803 12.2847 19.0647 12.7878C18.8178 13.3638 18.098 13.8137 16.6582 14.7136L9.896 18.94C8.29805 19.9387 7.49907 20.4381 6.83973 20.385C6.26501 20.3388 5.73818 20.0469 5.3944 19.584C5 19.053 5 18.1108 5 16.2264V7.77357C5 5.88919 5 4.94701 5.3944 4.41598C5.73818 3.9531 6.26501 3.66111 6.83973 3.6149C7.49907 3.5619 8.29805 4.06126 9.896 5.05998L16.6582 9.28638Z"
-              stroke="#ffffff" stroke-width="2" stroke-linejoin="round" />
-          </svg></button>
-      </div>
-    </main>
+          <button id="sendBtn" class="sendButton"><svg width="24px" height="24px" viewBox="0 0 24 24" fill="none"
+              xmlns="http://www.w3.org/2000/svg">
+              <path
+                d="M16.6582 9.28638C18.098 10.1862 18.8178 10.6361 19.0647 11.2122C19.2803 11.7152 19.2803 12.2847 19.0647 12.7878C18.8178 13.3638 18.098 13.8137 16.6582 14.7136L9.896 18.94C8.29805 19.9387 7.49907 20.4381 6.83973 20.385C6.26501 20.3388 5.73818 20.0469 5.3944 19.584C5 19.053 5 18.1108 5 16.2264V7.77357C5 5.88919 5 4.94701 5.3944 4.41598C5.73818 3.9531 6.26501 3.66111 6.83973 3.6149C7.49907 3.5619 8.29805 4.06126 9.896 5.05998L16.6582 9.28638Z"
+                stroke="#ffffff" stroke-width="2" stroke-linejoin="round" />
+            </svg></button>
+        </div>
+      </main>
+    </div>
   </div>
 
   <div class="overlaySys hide" id="systemEditorWrap">
@@ -1006,6 +1064,16 @@
   <div id="overlay" class="overlay">
     <div class="modal">
       <h3>Settings</h3>
+
+      <div class="settings-data-row">
+        <div id="netStats" class="row" style="gap:8px;">
+          <div id="peers" class="chip" title="Active clients the hub reports">Peers</div>
+          <div id="latent" class="chip" title="Round‑trip latency to the hub">Latency</div>
+        </div>
+
+        <div id="modelCaps" class="row"></div>
+      </div>
+
       <div class="field">
         <label>Hub address (signaling server) <span class="muted">(identifier.publicKeyHex64)</span></label>
         <input id="hubInput" class="text" placeholder="e.g. hub.0123abcd…64hex" spellcheck="false" />
@@ -1215,59 +1283,59 @@
         console.groupEnd();
       }
 
-// ---- Mid-stream ACK coalescer ----------------------------------------
-const ACK_STEP = 48;       // send immediately if seq jumps by this many
-const ACK_DELAY_MS = 40;   // otherwise coalesce within this window
+      // ---- Mid-stream ACK coalescer ----------------------------------------
+      const ACK_STEP = 48;       // send immediately if seq jumps by this many
+      const ACK_DELAY_MS = 40;   // otherwise coalesce within this window
 
-const _ackState = new Map(); // id -> {max: number, sent: number, t: number|null}
+      const _ackState = new Map(); // id -> {max: number, sent: number, t: number|null}
 
-function _ackSchedule(id) {
-  const st = _ackState.get(id);
-  if (!st) return;
-  if (st.t != null) return; // already scheduled
-  st.t = window.setTimeout(() => {
-    st.t = null;
-    if (st.max > st.sent) {
-      sendAck(id, st.max);   // <-- your existing function that sends {event:'llm.ack', id, upto}
-      st.sent = st.max;
-    }
-  }, ACK_DELAY_MS);
-}
+      function _ackSchedule(id) {
+        const st = _ackState.get(id);
+        if (!st) return;
+        if (st.t != null) return; // already scheduled
+        st.t = window.setTimeout(() => {
+          st.t = null;
+          if (st.max > st.sent) {
+            sendAck(id, st.max);   // <-- your existing function that sends {event:'llm.ack', id, upto}
+            st.sent = st.max;
+          }
+        }, ACK_DELAY_MS);
+      }
 
-function ackNote(id, seq) {
-  if (!id || !Number.isFinite(seq)) return;
-  let st = _ackState.get(id);
-  if (!st) { st = { max: 0, sent: 0, t: null }; _ackState.set(id, st); }
-  if (seq > st.max) st.max = seq;
+      function ackNote(id, seq) {
+        if (!id || !Number.isFinite(seq)) return;
+        let st = _ackState.get(id);
+        if (!st) { st = { max: 0, sent: 0, t: null }; _ackState.set(id, st); }
+        if (seq > st.max) st.max = seq;
 
-  // fast path: if we've drifted far ahead, ACK immediately
-  if ((st.max - st.sent) >= ACK_STEP) {
-    if (st.t != null) { clearTimeout(st.t); st.t = null; }
-    sendAck(id, st.max);
-    st.sent = st.max;
-    return;
-  }
-  _ackSchedule(id);
-}
+        // fast path: if we've drifted far ahead, ACK immediately
+        if ((st.max - st.sent) >= ACK_STEP) {
+          if (st.t != null) { clearTimeout(st.t); st.t = null; }
+          sendAck(id, st.max);
+          st.sent = st.max;
+          return;
+        }
+        _ackSchedule(id);
+      }
 
-function ackInit(id) {
-  if (!id) return;
-  const prev = _ackState.get(id);
-  if (prev && prev.t != null) clearTimeout(prev.t);
-  _ackState.set(id, { max: 0, sent: 0, t: null });
-}
+      function ackInit(id) {
+        if (!id) return;
+        const prev = _ackState.get(id);
+        if (prev && prev.t != null) clearTimeout(prev.t);
+        _ackState.set(id, { max: 0, sent: 0, t: null });
+      }
 
-function ackFlushAndClear(id, upto) {
-  const st = _ackState.get(id);
-  if (st) {
-    if (st.t != null) { clearTimeout(st.t); st.t = null; }
-    const finalUpto = Math.max(st.max, st.sent, Number(upto) || 0);
-    if (finalUpto > st.sent) sendAck(id, finalUpto);
-    _ackState.delete(id);
-  } else if (Number.isFinite(upto) && upto > 0) {
-    sendAck(id, upto);
-  }
-}
+      function ackFlushAndClear(id, upto) {
+        const st = _ackState.get(id);
+        if (st) {
+          if (st.t != null) { clearTimeout(st.t); st.t = null; }
+          const finalUpto = Math.max(st.max, st.sent, Number(upto) || 0);
+          if (finalUpto > st.sent) sendAck(id, finalUpto);
+          _ackState.delete(id);
+        } else if (Number.isFinite(upto) && upto > 0) {
+          sendAck(id, upto);
+        }
+      }
 
 
       function logRecvPacket(src, raw, body) {
@@ -1333,6 +1401,7 @@ function ackFlushAndClear(id, upto) {
       const isNknAddr = s => /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/.test((s || '').trim());
       const debounce = (fn, ms = 300) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
+      // Markdown + code highlighting setup (safer: no raw HTML, safe links)
       // Markdown + code highlighting setup (safer: no raw HTML, safe links)
       marked.setOptions({ gfm: true, breaks: true, headerIds: false, mangle: false });
       marked.use({
@@ -2111,9 +2180,14 @@ function ackFlushAndClear(id, upto) {
       }
 
       function setStreamingContent(id, text) {
+        // If the stream has been ended, ignore late writes entirely
+        if (!streams.has(id) && currentStreamId !== id && pendingStreamId !== id) return;
+
         let w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`);
         let c = w && w.querySelector('#streamContent');
         if (!c) {
+          // Only create a bubble if the stream is still active/pending
+          if (!streams.has(id) && pendingStreamId !== id) return;
           addStreamingAssistantBubble(id);
           w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`);
           c = w && w.querySelector('#streamContent');
@@ -2126,6 +2200,7 @@ function ackFlushAndClear(id, upto) {
           if (container && typeof container.scrollTop === 'number') container.scrollTop = container.scrollHeight;
         });
       }
+
 
       function finishStreamingBubble(id) {
         const c = el('streamContent'); if (c) { c.removeAttribute('id'); }
@@ -2490,6 +2565,7 @@ ${META_END}`;
         const num = Math.max(0, Number(n) || 0);
         slot.textContent = `${num} peer${num === 1 ? '' : 's'}`;
       }
+
 
       /** Read the current number of ready subclients from MultiClient */
       function getPeerCount() {
@@ -3469,7 +3545,7 @@ ${META_END}`;
       const MISSED_PONG_LIMIT = 4;              // ~24s of missed pongs before we consider action
       const PEERS_ZERO_GRACE_MS = 12000;        // require peers==0 for at least 12s too
       let hbTimer = null;
-      let lastPongAt = 0; 
+      let lastPongAt = 0;
       let missedPongs = 0;
       let peersZeroSince = 0;
 
@@ -3479,7 +3555,7 @@ ${META_END}`;
         // Prime one ping immediately on start
         try {
           lastPingSentAt = Date.now();
-          sendCtrl(HUB_ADDR, { event: 'ctrl.ping', ts: lastPingSentAt }, { noReply: true, maxHoldingSeconds: 120 });
+          sendCtrl(HUB_ADDR, { event: 'ctrl.ping', ts: lastPingSentAt }, { noReply: true, msgHoldingSeconds: 120 });
         } catch { }
 
         hbTimer = setInterval(() => {
@@ -3496,7 +3572,7 @@ ${META_END}`;
           const statsFresh = (useStatsLatency && statsLatencyActive && (Date.now() - lastStatsRecvAt) < STATS_STALENESS_MS);
           if (!statsFresh) {
             lastPingSentAt = Date.now();
-            sendCtrl(HUB_ADDR, { event: 'ctrl.ping', ts: lastPingSentAt }, { noReply: true, maxHoldingSeconds: 120 });
+            sendCtrl(HUB_ADDR, { event: 'ctrl.ping', ts: lastPingSentAt }, { noReply: true, msgHoldingSeconds: 120 });
           }
 
 
@@ -3715,6 +3791,7 @@ ${META_END}`;
         }
         return true;
       }
+
 
 
       function isModelsPayload(ev, body) {
@@ -3938,22 +4015,50 @@ ${META_END}`;
           return true;
         }
         if (ev === 'llm.done') {
+          // ── 1) Merge any "tail" text carried on the done envelope (various backends) ──
+          const tail = (() => {
+            const d = body && body.data;
+            if (!d) return '';
+            if (d.message && typeof d.message.content === 'string') return d.message.content;
+            if (typeof d.response === 'string') return d.response;
+            if (typeof d.delta === 'string') return d.delta;
+            if (typeof d.text === 'string') return d.text;
+            const ch = Array.isArray(d.choices) && d.choices[0];
+            if (ch && ch.delta && typeof ch.delta.content === 'string') return ch.delta.content;
+            if (ch && ch.message && typeof ch.message.content === 'string') return ch.message.content;
+            return '';
+          })();
+
+          if (tail) {
+            const sess = getSession();
+            if (sess && Array.isArray(sess.messages) && sess.messages.length) {
+              // Append to the most recent assistant turn (the one that just streamed)
+              for (let i = sess.messages.length - 1; i >= 0; i--) {
+                const m = sess.messages[i];
+                if (m.role === 'assistant') {
+                  m.content = (m.content || '') + tail;
+                  break;
+                }
+              }
+              saveJSON(STORAGE.SESS, sessions);
+            }
+          }
+
+          // ── 2) Finalize stream + ACKs (after we've merged the tail) ───────────────────
           sendAck(body.id, body.last_seq);
-          ackFlushAndClear(body.id, body.last_seq); // <-- ensure no leftover pending ACK
+          ackFlushAndClear(body.id, body.last_seq); // ensure no leftover pending ACK
           endStream(body.id);
 
-          statsLatencyActive = false;   // ← NEW: stop stats mode so pings resume
-
-          // Optional: one last latency update from the done envelope if it carries a server ts
+          // ── 3) Stop stats-based latency mode; optionally capture a last server TS ─────
+          statsLatencyActive = false;
           if (useStatsLatency) {
             updateLatencyFromStatsEnvelope(body);
             updateLatencyFromStatsEnvelope(body.data || {});
           }
 
-          // fold in any stats that arrived on the final envelope
+          // ── 4) Fold in any final stats + guarantee non-zero final TPS if possible ─────
           applyStreamStats(body.id, body);
 
-          // guarantee a non-zero final TPS if we have tokens & timing
           const rec = statsByStream.get(body.id);
           if (rec && (!Number.isFinite(rec.tps) || rec.tps <= 0)) {
             const elapsed = Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
@@ -3964,22 +4069,25 @@ ${META_END}`;
             }
           }
 
-          // persist TPS onto the last assistant message
-          const sess = getSession();
-          if (sess) {
-            for (let i = sess.messages.length - 1; i >= 0; i--) {
-              if (sess.messages[i].role === 'assistant') {
-                const st = statsByStream.get(body.id);
-                if (st && Number.isFinite(st.tps)) {
-                  sess.messages[i]._tps = st.tps;
-                  sess.messages[i]._tpsIsApprox = !!st.approx;
+          // ── 5) Persist TPS onto the last assistant message for display/debug ──────────
+          {
+            const sess = getSession();
+            if (sess && Array.isArray(sess.messages)) {
+              for (let i = sess.messages.length - 1; i >= 0; i--) {
+                if (sess.messages[i].role === 'assistant') {
+                  const st = statsByStream.get(body.id);
+                  if (st && Number.isFinite(st.tps)) {
+                    sess.messages[i]._tps = st.tps;
+                    sess.messages[i]._tpsIsApprox = !!st.approx;
+                  }
+                  break;
                 }
-                break;
               }
+              saveJSON(STORAGE.SESS, sessions);
             }
-            saveJSON(STORAGE.SESS, sessions);
           }
 
+          // ── 6) Tidy up the UI exactly once (no resurrected bubbles) ───────────────────
           finishStreamingBubble(body.id);
           renderChat();
           setSendMode();
@@ -3987,25 +4095,32 @@ ${META_END}`;
           return true;
         }
 
-
         if (ev === 'llm.result') {
-          // callback sink (e.g., model.show)
+          // ── 1) Callback sink (e.g., model.show programmatic callers) ────────────────
           if (route && route.sink === 'callback' && typeof route.cb === 'function') {
-            try { route.cb({ ok: true, body }); } catch { }
+            try { route.cb({ ok: true, body }); } catch { /* no-op */ }
             clearRoute(body.id);
             return true;
           }
 
+          // ── 2) Element sink (e.g., system prompt generator textarea) ────────────────
           if (route.sink === 'element') {
             const elx = resolveEl(route.elId);
             const text = extractFull(body.data) || '';
-            writeToElement(elx, text, { mode: route.mode || 'replace', format: route.format || 'text' });
+            writeToElement(elx, text, {
+              mode: route.mode || 'replace',
+              format: route.format || 'text'
+            });
             lockElement(elx, false);
             if (route.elId) streamingElements.delete(route.elId);
 
             if (route.elId === 'systemMsg') {
               const s = getSession();
-              if (s) { s.system = (el('systemMsg').value || ''); saveJSON(STORAGE.SESS, sessions); sendSessionOpen(s, /*seed*/false); }
+              if (s) {
+                s.system = (el('systemMsg').value || '');
+                saveJSON(STORAGE.SESS, sessions);
+                sendSessionOpen(s, /*seed*/false);
+              }
               setSysGenBusy(false);
               sysgenPending.delete(body.id);
             }
@@ -4014,7 +4129,7 @@ ${META_END}`;
             return true;
           }
 
-          // Non-element (chat) result — keep your capability toggle for show payloads
+          // ── 3) Non-element results: model "show" payloads should not create chat msgs ─
           try {
             if (isLikelyModelShowPayload(body.data)) {
               const raw = (body.data && body.data.data) ? body.data.data : body.data;
@@ -4022,13 +4137,77 @@ ${META_END}`;
               const info = normalizeModelShow(model, raw);
               cacheSetModelInfo(model, info);
               renderModelInfo(info);
-              const hasVision = Array.isArray(info.capabilities) && info.capabilities.some(c => String(c).toLowerCase() === 'vision');
+              const hasVision = Array.isArray(info.capabilities) &&
+                info.capabilities.some(c => String(c).toLowerCase() === 'vision');
               toggleImageAttach(hasVision);
+              // No chat bubble for "show" responses.
+              clearRoute(body.id);
+              return true;
             }
-          } catch (e) { console.debug('[caps-toggle] skipped:', e); }
+          } catch (e) {
+            console.debug('[caps-toggle] skipped:', e);
+          }
 
-          const sess = getSession(); if (!sess) { clearRoute(body.id); return true; }
+          // ── 4) Chat-style results (non-streamed, or "final full" echo after streaming) ─
+          const sess = getSession();
+          if (!sess) { clearRoute(body.id); return true; }
+
+          // Pull best-effort full text from various common shapes
+          const finalText = (() => {
+            const d = body && body.data;
+            if (!d) return '';
+            // prefer full content if present
+            if (d.message && typeof d.message.content === 'string') return d.message.content;
+            if (typeof d.response === 'string') return d.response;
+            if (typeof d.text === 'string') return d.text;
+            const ch = Array.isArray(d.choices) && d.choices[0];
+            if (ch && ch.message && typeof ch.message.content === 'string') return ch.message.content;
+            // last-resort: whatever extractFull would return
+            return extractFull(d) || '';
+          })();
+
+          // Nothing meaningful to add
+          if (!finalText) {
+            renderChat();
+            clearRoute(body.id);
+            return true;
+          }
+
+          // Heuristic de-dup merge into the most recent assistant turn (avoids tail blob)
+          const mergeText = (prev, add) => {
+            const A = String(prev || '');
+            const B = String(add || '');
+            if (!A) return B;
+            if (!B) return A;
+            if (B.startsWith(A)) return B;   // final includes streamed prefix → replace with final
+            if (A.endsWith(B)) return A;     // streamed already contains final tail → keep streamed
+            return A + B;                    // fallback: concatenate (rare drift)
+          };
+
+          let merged = false;
+          for (let i = sess.messages.length - 1; i >= 0; i--) {
+            const m = sess.messages[i];
+            if (m.role === 'assistant') {
+              m.content = mergeText(m.content, finalText);
+              merged = true;
+              // If we have stats for this id, persist TPS on this message (optional)
+              const st = statsByStream.get(body.id);
+              if (st && Number.isFinite(st.tps)) {
+                m._tps = st.tps;
+                m._tpsIsApprox = !!st.approx;
+              }
+              break;
+            }
+          }
+
+          // If there was no assistant turn to merge into (pure non-stream), create one
+          if (!merged) {
+            sess.messages.push({ role: 'assistant', content: finalText, ts: Date.now() });
+          }
+
+          saveJSON(STORAGE.SESS, sessions);
           renderChat();
+
           clearRoute(body.id);
           return true;
         }
@@ -4106,15 +4285,24 @@ ${META_END}`;
 
 
       function extractDelta(part) {
-        if (part?.message?.content) return part.message.content;
-        if (typeof part?.response === 'string') return part.response;
+        if (!part) return '';
+        if (part.message && typeof part.message.content === 'string') return part.message.content;
+        if (typeof part.delta === 'string') return part.delta;
+        if (typeof part.text === 'string') return part.text;
+        const ch = part.choices?.[0];
+        if (typeof ch?.delta?.content === 'string') return ch.delta.content;
         return '';
       }
-      function extractFull(obj) {
-        if (obj?.message?.content) return obj.message.content;
-        if (typeof obj?.response === 'string') return obj.response;
-        try { return JSON.stringify(obj); } catch { return String(obj); }
+      function extractFull(data) {
+        if (!data) return '';
+        if (data.message && typeof data.message.content === 'string') return data.message.content;
+        if (typeof data.response === 'string') return data.response;
+        if (typeof data.text === 'string') return data.text;
+        const ch = data.choices?.[0];
+        if (typeof ch?.message?.content === 'string') return ch.message.content;
+        return '';
       }
+
 
       // Heuristic: does this look like an `ollama.show()` payload?
       function isLikelyModelShowPayload(d) {
