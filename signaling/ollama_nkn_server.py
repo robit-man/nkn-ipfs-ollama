@@ -1320,7 +1320,7 @@ def _massage_images_in_messages(
 
 
 class _LLMStream:
-    RESEND_INTERVAL = 0.6
+    RESEND_INTERVAL = 1
     WINDOW_LIMIT    = 512
     FINAL_SWEEPS    = 3
     FINAL_GAP_SECS  = 0.12

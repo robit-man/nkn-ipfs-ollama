@@ -1135,7 +1135,7 @@
 
 
   <script>
-    ; (() => {
+    (() => {
       // ---- Singleton guard (unique key for your app) --------------------------
       const SINGLETON_KEY = '__NKN_CHAT_APP__';
       if (window[SINGLETON_KEY]?.alive) {
@@ -3050,7 +3050,7 @@ ${META_END}`;
 
       // Back off: let the SDK handle path rotation & reconnects.
       // We only intervene if we miss multiple pongs *and* all subclients are 0 for a while.
-      const HEARTBEAT_MS = 1000;                // ping every 6s (tolerant of timer clamping)
+      const HEARTBEAT_MS = 6000;                // ping every 6s (tolerant of timer clamping)
       const MISSED_PONG_LIMIT = 4;              // ~24s of missed pongs before we consider action
       const PEERS_ZERO_GRACE_MS = 12000;        // require peers==0 for at least 12s too
       let hbTimer = null;
@@ -3286,16 +3286,19 @@ ${META_END}`;
       // Trust gate helper (same rule you had, kept intact)
       function _sameHubOrTrusted(ev, srcStr) {
         const fromKey = (String(srcStr || '').split('.')[1] || '').toLowerCase();
-        const isTrustedFamily = /^ctrl\.|^llm\.|^session\.|^blob\./.test(ev || '');
-        if (HUB_KEY && fromKey && fromKey !== HUB_KEY && isTrustedFamily) {
-          if (!_sameHubOrTrusted._lastKeyWarnAt || Date.now() - _sameHubOrTrusted._lastKeyWarnAt > 60000) {
-            console.warn('[inbound] src key mismatch; accepting due to trusted event family', { ev, src: srcStr, expectedKey: HUB_KEY });
-            _sameHubOrTrusted._lastKeyWarnAt = Date.now();
+        if (HUB_KEY && fromKey && fromKey !== HUB_KEY) {
+          if (DEBUG.ON) {
+            if (!_sameHubOrTrusted._lastKeyWarnAt || Date.now() - _sameHubOrTrusted._lastKeyWarnAt > 60000) {
+              console.warn('[inbound] src key mismatch (debug mode, accepting)', { ev, src: srcStr, expectedKey: HUB_KEY });
+              _sameHubOrTrusted._lastKeyWarnAt = Date.now();
+            }
+            return true;
           }
-          return true;
+          return false; // production: drop mismatched hub frames
         }
-        return !HUB_KEY || !fromKey || fromKey === HUB_KEY;
+        return true;
       }
+
 
       function isModelsPayload(ev, body) {
         return ev === 'llm.models' || ev === 'ctrl.models' || ev === 'models' ||
@@ -3746,17 +3749,21 @@ ${META_END}`;
         const btn = el('sendBtn');
         currentStreamId = id;
         isStreaming = true;
-        btn.innerHTML = stopSign;  // use innerHTML to render the SVG
+        StickyScroll.setGenerating(true);   // ← NEW
+        btn.innerHTML = stopSign;
         btn.onclick = stopGeneration;
       }
+
       function setSendMode() {
         const btn = el('sendBtn');
         isStreaming = false;
         pendingStreamId = null;
         currentStreamId = null;
+        StickyScroll.setGenerating(false);  // ← NEW
         btn.innerHTML = playSign;
         btn.onclick = sendPrompt;
       }
+
       function stopGeneration() {
         if (!currentStreamId || !HUB_ADDR) { setSendMode(); return; }
         cancelledStreams.add(currentStreamId);
@@ -3787,8 +3794,8 @@ ${META_END}`;
         elx.style.left = (curLeft === '0px' || curLeft === '0%') ? '-50%' : '0%';
         elxb.style.left = (curLeft === '0px' || curLeft === '0%') ? '-100%' : '0%';
       }
-        el('backdrop').onclick = toggleSidebar;
-        el('toggleSidebar').onclick = toggleSidebar;
+      el('backdrop').onclick = toggleSidebar;
+      el('toggleSidebar').onclick = toggleSidebar;
 
       // Boot
       function boot() {
@@ -4024,13 +4031,11 @@ ${META_END}`;
         connectNKN();
       }
       // Boot exactly once
-      if (!window[__APP_KEY__ = '__NKN_CHAT_APP__'], !window[__APP_KEY__].booted) {
+      if (!window[SINGLETON_KEY].booted) {
         boot();
-        window[__APP_KEY__].booted = true;
+        window[SINGLETON_KEY].booted = true;
       }
-
-      // Optional: expose a minimal API for diagnostics/ops (read-only)
-      window.__NKN_CHAT_APP__.api = Object.freeze({
+      window[SINGLETON_KEY].api = Object.freeze({
         connectNKN,
         sendPrompt,
         stopGeneration,
@@ -4038,7 +4043,6 @@ ${META_END}`;
         setActiveSession
       });
     })();
-
   </script>
 
 
