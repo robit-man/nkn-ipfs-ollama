@@ -1615,36 +1615,21 @@
           currentAddr() { return (api.current() && api.current().addr) || ''; },
 
           load() {
-            this.list = loadJSON(HUBS_LS_KEY, []);
+            const get = (k, d) => loadJSON(k, d);
+            this.list = get(HUBS_LS_KEY, []);
             this.currentId = loadJSON(CURR_HUB_LS_KEY, null);
 
-            // Hard drop any old 'hub-default' from prior builds
-            if (this.list.some(h => h.id === 'hub-default')) {
-              this.list = this.list.filter(h => h.id !== 'hub-default');
-              saveJSON(HUBS_LS_KEY, this.list);
-              if (this.currentId === 'hub-default') { this.currentId = null; saveJSON(CURR_HUB_LS_KEY, this.currentId); }
-            }
+            // Remove stale/placeholder/empty entries right away
+            this.sanitizePlaceholders();
 
-            // Optionally import legacy hub (WITHOUT auto-creating a "Default")
-            if (!this.list.length) {
-              const legacy = (localStorage.getItem(STORAGE.HUB) || localStorage.getItem(STORAGE.LEGACY_HUB) || '').trim();
-              if (legacy && isNknAddr(legacy)) {
-                const id = `hub-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-                this.list = [{ id, name: 'Imported', addr: legacy, addedAt: Date.now(), lastUsedAt: Date.now() }];
-                this.currentId = id;
-                saveJSON(HUBS_LS_KEY, this.list);
-                saveJSON(CURR_HUB_LS_KEY, this.currentId);
-              }
-            }
-
-            // Ensure currentId valid (allow "no hub" state)
+            // If currentId is invalid, pick the first one
             if (!this.list.some(h => h.id === this.currentId)) {
-              this.currentId = null;
+              this.currentId = this.list[0]?.id || null;
               saveJSON(CURR_HUB_LS_KEY, this.currentId);
             }
 
-            // Seed globals even before applyToRuntime()
-            HUB_ADDR = this.current() ? this.current().addr : '';
+            // Seed globals for compatibility
+            HUB_ADDR = this.currentAddr() || '';
             HUB_KEY = (HUB_ADDR.split('.')[1] || '').toLowerCase();
             window.HUB_ADDR = HUB_ADDR;
           },
@@ -1656,22 +1641,42 @@
 
           add(addr, name) {
             addr = String(addr || '').trim();
-            name = String(name || '').trim() || addr || `Hub ${api.list.length + 1}`;
-            if (!addr || !isNknAddr(addr)) return { ok: false, reason: 'invalid' };
-            const exists = api.list.find(h => h.addr === addr);
-            if (exists) {
-              api.select(exists.id);
-              return { ok: true, id: exists.id, existed: true };
+            if (!isNknAddr(addr)) return { ok: false, reason: 'invalid' };
+
+            // Already known? Select it.
+            const existing = this.list.find(h => h.addr === addr);
+            if (existing) {
+              this.currentId = existing.id;
+              existing.lastUsedAt = Date.now();
+              this.save();
+              this.applyToRuntime();
+              this.loadSessionsIntoMemory();
+              HubUI.renderAll();
+              return { ok: true, id: existing.id, existed: true };
             }
-            const id = `hub-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-            api.list.push({ id, name, addr, addedAt: Date.now(), lastUsedAt: Date.now() });
-            api.currentId = id;
-            api.save();
-            api.applyToRuntime();
-            api.loadSessionsIntoMemory();
+
+            // Deterministic-ish id from pubkey portion (avoid placeholders)
+            const pub = (addr.split('.')[1] || '').toLowerCase();
+            let id = `hub-${pub.slice(0, 12)}`;
+            if (this.list.some(h => h.id === id)) {
+              id = `hub-${pub.slice(0, 8)}-${Math.random().toString(36).slice(2, 5)}`;
+            }
+
+            // If a name is provided but it's a placeholder, ignore it and use the address.
+            const badName = /^(default|imported|url\s*hub)$/i;
+            const nm = (String(name || '').trim() && !badName.test(String(name || '').trim()))
+              ? String(name || '').trim()
+              : addr;
+
+            this.list.push({ id, name: nm, addr, addedAt: Date.now(), lastUsedAt: Date.now() });
+            this.currentId = id;
+            this.save();
+            this.applyToRuntime();
+            this.loadSessionsIntoMemory();
             HubUI.renderAll();
             return { ok: true, id };
-          },
+          }
+          ,
 
           remove(id) {
             if (api.list.length <= 1) return false;
@@ -1696,6 +1701,32 @@
             HubUI.renderAll();
             return true;
           },
+
+          sanitizePlaceholders() {
+            let changed = false;
+            const bad = /^(default|imported|url\s*hub)$/i;
+
+            // Rename placeholders to their actual address
+            this.list.forEach(h => {
+              if (!h) return;
+              const nm = String(h.name || '').trim();
+              if (!nm || bad.test(nm) || nm === h.id) {
+                if (h.addr) { h.name = h.addr; changed = true; }
+              }
+            });
+
+            // Drop entries without a valid address and dedupe by address
+            const seen = new Set();
+            this.list = this.list.filter(h => {
+              const key = (h && isNknAddr(h.addr) && h.addr.toLowerCase()) || '';
+              if (!key) { changed = true; return false; }
+              if (seen.has(key)) { changed = true; return false; }
+              seen.add(key); return true;
+            });
+
+            if (changed) this.save();
+          },
+
 
           applyToRuntime() {
             const addr = this.current() ? this.current().addr : '';
@@ -1792,17 +1823,23 @@
         return (v || '').trim();
       }
       function applyHubFromUrl() {
-        const h = getUrlHubParam();
-        if (h && isNknAddr(h)) {
-          // add/select into hubs rather than mutating settings directly
-          HubManager.add(h, 'URL hub');
-          try {
-            const url = new URL(location.href);
-            ['hub', 'nkn', 'signaling', 'signal'].forEach(k => url.searchParams.delete(k));
-            history.replaceState(null, '', url.toString());
-          } catch { }
-        }
+        const addr = getUrlHubParam();
+        if (!addr || !isNknAddr(addr)) return;
+
+        // Use the address as the display name (pass empty name so add() falls back to addr)
+        const res = HubManager.add(addr, '');
+
+        // Clean up any legacy placeholder entries after adding
+        try { HubManager.sanitizePlaceholders(); } catch { }
+
+        // Remove the hub param from the URL
+        try {
+          const url = new URL(location.href);
+          ['hub', 'nkn', 'signaling', 'signal'].forEach(k => url.searchParams.delete(k));
+          history.replaceState(null, '', url.toString());
+        } catch { }
       }
+
 
       function updateSettingsUI() {
         // show current hub in the input as a convenience for adding/editing
