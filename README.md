@@ -2,8 +2,6 @@
 
 **A simple demonstration of streaming responses between a frontend hosted via IPFS and a backend running on Ollama, facilitated by New Kind of Network (NKN).**
 
-[![Build Status](https://github.com/robit-man/nkn-ipfs-ollama/actions/workflows/main.yml/badge.svg)](https://github.com/robit-man/nkn-ipfs-ollama/actions)
-[![License: MIT](https://img.shields.io/github/license/robit-man/nkn-ipfs-ollama)](https://github.com/robit-man/nkn-ipfs-ollama/blob/main/LICENSE)
 
 ## Overview
 
@@ -40,8 +38,9 @@ The application consists of two main components:
     *   Run the frontend server: `python serve.py`  This will start a local HTTPS server with SSL.  You can then access the frontend in your browser at the address provided in the console output (usually `https://localhost:443`).
 
 3.  **Run the Signaling Server:**
-    *   Navigate to the root directory: `cd ..`
-    *   Run the signaling server: `python serve.py` This will start the NKN signaling server.
+    *   Navigate to the signaling directory: `cd .. && cd signaling` (assuming you were in site from the above instruction)
+    *   Run the signaling server: `python ollama_nkn_server.py` This will start the NKN signaling server.
+    *   This script will set up a nodejs sidecar in a folder called bridge-node (automatically created) which facilitates the NKN connection
 
 4.  **Interact:**
     *   Open the frontend in your browser (as described above).
@@ -51,7 +50,7 @@ The application consists of two main components:
 
 *   `site/index.html`: The HTML file for the frontend application.
 *   `site/serve.py`:  Python script to bootstrap the frontend environment and launch the HTTPS server.
-*   `ollama_nkn_server.py`: Python script for the NKN signaling server.
+*   `signaling/ollama_nkn_server.py`: Python script for the NKN signaling server.
 
 ## Deployment
 
