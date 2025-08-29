@@ -1219,6 +1219,7 @@
 
 
   <script>
+
     (() => {
       // ---- Singleton guard (unique key for your app) --------------------------
       const SINGLETON_KEY = '__NKN_CHAT_APP__';
@@ -1391,6 +1392,7 @@
         }
       }
 
+
       // expose for quick toggling / stats in console
       window._PKT = { DEBUG, STATS, helpers: { humanBytes, byteLenOfJSON, approxB64ToBinLen } };
       window.togglePkt = (on) => { DEBUG.ON = !!on; localStorage.setItem(LS_KEY, DEBUG.ON ? '1' : '0'); console.log('[debug-pkt]', DEBUG.ON ? 'ON' : 'OFF'); };
@@ -1401,7 +1403,9 @@
           maxSend: STATS.maxSend, maxRecv: STATS.maxRecv
         });
       };
-
+      window.togglePkt(false);                  // fully off, or
+      window._PKT && (window._PKT.DEBUG.LOG_STREAM_EVERY_N = 16); // log every 16th chunk
+      window._PKT && (window._PKT.DEBUG.LOG_CONTENT = false);     // never dump payload bodies
       // also surface warnings for suppressed unhandled rejections while debugging
       const origUH = window.onunhandledrejection;
       window.addEventListener('unhandledrejection', (e) => {
@@ -2181,18 +2185,80 @@
 
 
 
+
       function addStreamingAssistantBubble(id) {
         const s = getSession(); if (!s) return;
         const w = document.createElement('div');
         w.className = 'msg assistant';
         w.dataset.stream = '1';
-        w.dataset.streamId = id; // ← NEW: let us find this bubble later
+        w.dataset.streamId = id;
+
+        // NOTE: content starts as plain text container for super-cheap appends.
+        // We also keep .dataset.raw with the full text so we can run markdown once at the end.
         w.innerHTML =
           `<div class="meta" id="meta-${id}">${s.model} • streaming…</div>` +
-          `<div class="content" id="streamContent"></div>`;
-        el('chat').appendChild(w);
-        el('chat').scrollTop = el('chat').scrollHeight;
+          `<div class="content" id="streamContent" data-mode="plain" style="white-space:pre-wrap"></div>`;
+
+        const chat = document.getElementById('chat');
+        chat.appendChild(w);
+        chat.scrollTop = chat.scrollHeight;
       }
+
+      function setStreamingContent(id, fullText) {
+        // If the stream has ended, ignore late writes
+        if (!streams.has(id) && id !== currentStreamId && id !== pendingStreamId) return;
+
+        let w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`);
+        let c = w && w.querySelector('#streamContent');
+        if (!c) {
+          // create if needed (preserves your current call sites)
+          addStreamingAssistantBubble(id);
+          w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`);
+          c = w && w.querySelector('#streamContent');
+          if (!c) return;
+        }
+
+        // read previous length to compute delta; store the new full text for final format pass
+        const prevLen = Number(c.dataset.len || 0);
+        const text = String(fullText || '');
+        const nextLen = text.length;
+
+        if (nextLen > prevLen) {
+          const delta = text.slice(prevLen);
+          // ultra-cheap append: text node only
+          c.appendChild(document.createTextNode(delta));
+          c.dataset.len = String(nextLen);
+          c.dataset.raw = text;            // keep the whole thing for final markdown
+          // keep viewport following naturally
+          const container = c.closest('.chat') || c.parentElement;
+          if (container && typeof container.scrollTop === 'number') {
+            container.scrollTop = container.scrollHeight;
+          }
+        }
+      }
+      function finishStreamingBubble(id) {
+        const w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`) ||
+          document.querySelector('.msg.assistant[data-stream="1"]');
+        if (!w) return;
+
+        const meta = w.querySelector(`#meta-${id}`) || w.querySelector('.meta');
+        const c = w.querySelector('#streamContent') || w.querySelector('.content');
+        if (!c) return;
+
+        // Only now run markdown + highlight (heavy work happens exactly once)
+        const raw = c.dataset.raw || c.textContent || '';
+        c.innerHTML = mdToHtml(raw);
+        try { highlightIn(c); } catch { /* noop */ }
+
+        c.removeAttribute('id');
+        c.removeAttribute('data-mode');
+        c.removeAttribute('data-len');
+        c.removeAttribute('data-raw');
+
+        w.dataset.stream = '0';
+        if (meta) { _setStreamMeta(id, 'done'); }   // preserves your TPS/meta behavior
+      }
+
 
       function setStreamingContent(id, text) {
         // If the stream has been ended, ignore late writes entirely
@@ -3165,8 +3231,101 @@ ${META_END}`;
         }
       }
 
+      function startStream(id, onChunk) {
+        // Per-stream state; preserves your next/ordered delivery contract
+        streams.set(id, {
+          next: 1,
+          buffer: new Map(),   // seq -> part
+          onChunk,
+          draining: false,     // pull loop active?
+          renderQ: [],         // parts queued for UI
+          raf: false           // a RAF flush is scheduled
+        });
+      }
 
-      function startStream(id, onChunk) { streams.set(id, { next: 1, lastAck: 0, buffer: new Map(), onChunk }); }
+      /** Internal: schedule a RAF to render a bounded number of parts */
+      function _flushRender(id) {
+        const st = streams.get(id); if (!st || st.raf) return;
+        st.raf = true;
+
+        requestAnimationFrame(function tick() {
+          const MAX_RENDER = 64; // parts per frame to avoid jank
+          let rendered = 0;
+
+          while (rendered < MAX_RENDER && st.renderQ.length) {
+            const p = st.renderQ.shift();
+            try { st.onChunk(p); } catch { /* ignore individual render errors */ }
+            rendered++;
+          }
+
+          if (st.renderQ.length) {
+            requestAnimationFrame(tick); // more to render next frame
+          } else {
+            st.raf = false;
+          }
+        });
+      }
+      /** Internal: pull chunks in order with a soft time budget to avoid long locks */
+      function _drain(id) {
+        const st = streams.get(id); if (!st) return;
+        if (st.draining) return;
+        st.draining = true;
+
+        const TIME_BUDGET_MS = 6;  // spend at most ~6ms per pull slice
+        const MAX_PULL = 128;      // safety cap per slice
+
+        (function pullSlice() {
+          const t0 = (performance && performance.now) ? performance.now() : Date.now();
+          let pulled = 0;
+
+          // Drain in order into the render queue
+          while (st.buffer.has(st.next)) {
+            const part = st.buffer.get(st.next);
+            st.buffer.delete(st.next);
+
+            // --- Optional: live TPS estimate (preserves your meta updates) ---
+            try {
+              const txt = extractDelta(part) || '';
+              if (txt) {
+                const rec = statsByStream.get(id) || { startAt: Date.now(), approxTokens: 0, approx: true };
+                rec.approxTokens = (rec.approxTokens || 0) + estimateTokensFromText(txt);
+                const elapsed = Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
+                rec.tps = rec.approxTokens > 0 ? (rec.approxTokens / elapsed) : rec.tps;
+                rec.tokens = Math.max(rec.tokens || 0, rec.approxTokens || 0);
+                rec.updatedAt = Date.now();
+                statsByStream.set(id, rec);
+                _setStreamMeta(id, 'streaming…');
+              }
+            } catch { /* non-fatal */ }
+
+            st.renderQ.push(part);
+            st.next++;
+
+            // ACK as we make forward progress (coalescer will batch it)
+            ackNote(id, st.next - 1);
+
+            pulled++;
+            const now = (performance && performance.now) ? performance.now() : Date.now();
+            if (pulled >= MAX_PULL || (now - t0) > TIME_BUDGET_MS) break;
+          }
+
+          // Make sure UI work is paced on the render thread
+          if (st.renderQ.length) _flushRender(id);
+
+          // If there’s more ordered data waiting, continue soon; otherwise we’re idle
+          if (st.buffer.has(st.next)) {
+            setTimeout(pullSlice, 8); // yield; keep latency low under heavy streams
+          } else {
+            st.draining = false;
+          }
+        })();
+      }
+
+      function handleChunk(id, seq, data) {
+        const st = streams.get(id); if (!st) return;
+        st.buffer.set(seq, data);
+        _drain(id); // cheap: starts/continues a time-sliced pull if needed
+      }
       // capture tool calls per stream id
       const toolCallsByStream = new Map(); // id -> [{ name, arguments, raw }]
 
@@ -3959,30 +4118,34 @@ ${META_END}`;
         // Not handled here
         return false;
       }
-
       /* ----- DATA handler (llm streams/results/errors unrelated to models) ----- */
       function onInboundData(ev, body, srcStr) {
         const route = routeFor(body.id);
+
+        const hasAckRendered = (typeof ackRendered === 'function'); // safe feature-detect
 
         if (ev === 'llm.start') {
           const { id, stream } = body;
           ackInit(id);
           console.info('[llm.start]', { id, stream });
+
           // init record for this stream (add timing fields for fallback estimates)
           statsByStream.set(id, {
             tps: null,
             tokens: 0,
             updatedAt: Date.now(),
-            startAt: Date.now(),   // <— for live TPS estimate
-            approxTokens: 0,       // <— running token est (chars→tokens)
+            startAt: Date.now(),   // live TPS estimate
+            approxTokens: 0,       // running token est (chars→tokens)
             approx: true
           });
 
-          statsLatencyActive = true;          // ← NEW
-          lastStatsRecvAt = Date.now();       // ← NEW
-          updateLatencyFromStatsEnvelope(body); // optional prime if server sent a ts
+          // prime latency stats
+          statsLatencyActive = true;
+          lastStatsRecvAt = Date.now();
+          updateLatencyFromStatsEnvelope(body);
 
-          if (route.sink === 'element') {
+          // Element sink (e.g., write directly into a textarea)
+          if (route && route.sink === 'element') {
             const elx = resolveEl(route.elId);
             if (route.lock) lockElement(elx, true);
             if (route.elId) streamingElements.add(route.elId);
@@ -4000,33 +4163,89 @@ ${META_END}`;
                 scroll: true, caretToEnd: true
               });
               first = false;
+              // mark rendered progress (lets backend exit freeze mode)
+              if (hasAckRendered && typeof lastSeqForStream === 'function') {
+                const s = lastSeqForStream(id); // if you track it
+                if (Number.isInteger(s)) ackRendered(id, s);
+              }
             });
             return true;
           }
 
+          // Chat bubble sink (streaming assistant bubble)
           if (stream) {
             pendingStreamId = id;
             addStreamingAssistantBubble(id);
             const sess = getSession(); if (!sess) return true;
             sess.messages.push({ role: 'assistant', content: '', ts: Date.now() });
             saveJSON(STORAGE.SESS, sessions);
+
             let acc = '';
             startStream(id, (part) => {
               const text = extractDelta(part);
-              if (text) { acc += text; setStreamingContent(id, acc); updateLastAssistantContent(sess.id, acc); }
+              if (text) {
+                acc += text;
+                setStreamingContent(id, acc);
+                updateLastAssistantContent(sess.id, acc);
+                // mark latest rendered if available
+                if (hasAckRendered && typeof lastSeqForStream === 'function') {
+                  const s = lastSeqForStream(id);
+                  if (Number.isInteger(s)) ackRendered(id, s);
+                }
+              }
             });
-
           }
 
           return true;
         }
 
         if (ev === 'llm.stats') {
-          applyStreamStats(body.id, body);   // same sink
+          applyStreamStats(body.id, body);
           if (useStatsLatency && statsLatencyActive) {
             updateLatencyFromStatsEnvelope(body);
-            updateLatencyFromStatsEnvelope(body.data || {}); // harmless if absent
+            updateLatencyFromStatsEnvelope(body.data || {});
           }
+          return true;
+        }
+
+        // ─────────────────── Coalesced head (server sent llm.bulk) ───────────────────
+        if (ev === 'llm.bulk') {
+          const id = body.id;
+          const items = Array.isArray(body.items) ? body.items.slice() : [];
+          if (!id || !items.length) return true;
+
+          if (statsLatencyActive) updateLatencyFromStatsEnvelope(body);
+
+          // sort just in case
+          items.sort((a, b) => ((a?.seq | 0) - (b?.seq | 0)));
+
+          let maxSeq = 0;
+          for (const it of items) {
+            if (!it || it.event !== 'llm.chunk') continue;
+
+            if (statsLatencyActive) {
+              updateLatencyFromStatsEnvelope(it);
+              updateLatencyFromStatsEnvelope(it.data || {});
+            }
+
+            const seq = it.seq | 0;
+            if (!seq) continue;
+
+            // 1) note RECEIVE immediately (keeps server window draining)
+            ackNote(id, seq);
+
+            // 2) render
+            handleChunk(id, seq, it.data);
+
+            // 3) note RENDERED (lets backend leave freeze mode)
+            if (hasAckRendered) ackRendered(id, seq);
+
+            if (seq > maxSeq) maxSeq = seq;
+          }
+
+          // high-water ACK
+          const hi = Number.isInteger(body.last_seq) ? body.last_seq : maxSeq;
+          if (hi) sendAck(id, hi); // your sendAck should include clientNow; see note below
           return true;
         }
 
@@ -4035,12 +4254,21 @@ ${META_END}`;
             updateLatencyFromStatsEnvelope(body);
             updateLatencyFromStatsEnvelope(body.data || {});
           }
-          ackNote(body.id, body.seq);    // <-- NEW
+
+          // 1) note RECEIVE first
+          ackNote(body.id, body.seq);
+
+          // 2) render
           handleChunk(body.id, body.seq, body.data);
+
+          // 3) note RENDERED after paint
+          if (hasAckRendered) ackRendered(body.id, body.seq);
+
           return true;
         }
+
         if (ev === 'llm.done') {
-          // ── 1) Merge any "tail" text carried on the done envelope (various backends) ──
+          // 1) Merge any "tail" text carried on the done envelope
           const tail = (() => {
             const d = body && body.data;
             if (!d) return '';
@@ -4057,33 +4285,28 @@ ${META_END}`;
           if (tail) {
             const sess = getSession();
             if (sess && Array.isArray(sess.messages) && sess.messages.length) {
-              // Append to the most recent assistant turn (the one that just streamed)
               for (let i = sess.messages.length - 1; i >= 0; i--) {
                 const m = sess.messages[i];
-                if (m.role === 'assistant') {
-                  m.content = (m.content || '') + tail;
-                  break;
-                }
+                if (m.role === 'assistant') { m.content = (m.content || '') + tail; break; }
               }
               saveJSON(STORAGE.SESS, sessions);
             }
           }
 
-          // ── 2) Finalize stream + ACKs (after we've merged the tail) ───────────────────
+          // 2) Finalize stream + ACKs
           sendAck(body.id, body.last_seq);
-          ackFlushAndClear(body.id, body.last_seq); // ensure no leftover pending ACK
+          ackFlushAndClear(body.id, body.last_seq);
           endStream(body.id);
 
-          // ── 3) Stop stats-based latency mode; optionally capture a last server TS ─────
+          // 3) stop stats latency; capture final ts if present
           statsLatencyActive = false;
           if (useStatsLatency) {
             updateLatencyFromStatsEnvelope(body);
             updateLatencyFromStatsEnvelope(body.data || {});
           }
 
-          // ── 4) Fold in any final stats + guarantee non-zero final TPS if possible ─────
+          // 4) final stats & TPS fallback
           applyStreamStats(body.id, body);
-
           const rec = statsByStream.get(body.id);
           if (rec && (!Number.isFinite(rec.tps) || rec.tps <= 0)) {
             const elapsed = Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
@@ -4094,7 +4317,7 @@ ${META_END}`;
             }
           }
 
-          // ── 5) Persist TPS onto the last assistant message for display/debug ──────────
+          // 5) persist TPS on last assistant msg
           {
             const sess = getSession();
             if (sess && Array.isArray(sess.messages)) {
@@ -4112,7 +4335,7 @@ ${META_END}`;
             }
           }
 
-          // ── 6) Tidy up the UI exactly once (no resurrected bubbles) ───────────────────
+          // 6) tidy UI
           finishStreamingBubble(body.id);
           renderChat();
           setSendMode();
@@ -4121,21 +4344,18 @@ ${META_END}`;
         }
 
         if (ev === 'llm.result') {
-          // ── 1) Callback sink (e.g., model.show programmatic callers) ────────────────
+          // 1) Callback sink
           if (route && route.sink === 'callback' && typeof route.cb === 'function') {
-            try { route.cb({ ok: true, body }); } catch { /* no-op */ }
+            try { route.cb({ ok: true, body }); } catch { }
             clearRoute(body.id);
             return true;
           }
 
-          // ── 2) Element sink (e.g., system prompt generator textarea) ────────────────
-          if (route.sink === 'element') {
+          // 2) Element sink
+          if (route && route.sink === 'element') {
             const elx = resolveEl(route.elId);
             const text = extractFull(body.data) || '';
-            writeToElement(elx, text, {
-              mode: route.mode || 'replace',
-              format: route.format || 'text'
-            });
+            writeToElement(elx, text, { mode: route.mode || 'replace', format: route.format || 'text' });
             lockElement(elx, false);
             if (route.elId) streamingElements.delete(route.elId);
 
@@ -4154,7 +4374,7 @@ ${META_END}`;
             return true;
           }
 
-          // ── 3) Non-element results: model "show" payloads should not create chat msgs ─
+          // 3) Model "show" results shouldn't create chat msgs
           try {
             if (isLikelyModelShowPayload(body.data)) {
               const raw = (body.data && body.data.data) ? body.data.data : body.data;
@@ -4162,10 +4382,9 @@ ${META_END}`;
               const info = normalizeModelShow(model, raw);
               cacheSetModelInfo(model, info);
               renderModelInfo(info);
-              const hasVision = Array.isArray(info.capabilities) &&
-                info.capabilities.some(c => String(c).toLowerCase() === 'vision');
+              const hasVision = Array.isArray(info.capabilities)
+                && info.capabilities.some(c => String(c).toLowerCase() === 'vision');
               toggleImageAttach(hasVision);
-              // No chat bubble for "show" responses.
               clearRoute(body.id);
               return true;
             }
@@ -4173,40 +4392,35 @@ ${META_END}`;
             console.debug('[caps-toggle] skipped:', e);
           }
 
-          // ── 4) Chat-style results (non-streamed, or "final full" echo after streaming) ─
+          // 4) Chat-style results
           const sess = getSession();
           if (!sess) { clearRoute(body.id); return true; }
 
-          // Pull best-effort full text from various common shapes
           const finalText = (() => {
             const d = body && body.data;
             if (!d) return '';
-            // prefer full content if present
             if (d.message && typeof d.message.content === 'string') return d.message.content;
             if (typeof d.response === 'string') return d.response;
             if (typeof d.text === 'string') return d.text;
             const ch = Array.isArray(d.choices) && d.choices[0];
             if (ch && ch.message && typeof ch.message.content === 'string') return ch.message.content;
-            // last-resort: whatever extractFull would return
             return extractFull(d) || '';
           })();
 
-          // Nothing meaningful to add
           if (!finalText) {
             renderChat();
             clearRoute(body.id);
             return true;
           }
 
-          // Heuristic de-dup merge into the most recent assistant turn (avoids tail blob)
           const mergeText = (prev, add) => {
             const A = String(prev || '');
             const B = String(add || '');
             if (!A) return B;
             if (!B) return A;
-            if (B.startsWith(A)) return B;   // final includes streamed prefix → replace with final
-            if (A.endsWith(B)) return A;     // streamed already contains final tail → keep streamed
-            return A + B;                    // fallback: concatenate (rare drift)
+            if (B.startsWith(A)) return B;
+            if (A.endsWith(B)) return A;
+            return A + B;
           };
 
           let merged = false;
@@ -4215,7 +4429,6 @@ ${META_END}`;
             if (m.role === 'assistant') {
               m.content = mergeText(m.content, finalText);
               merged = true;
-              // If we have stats for this id, persist TPS on this message (optional)
               const st = statsByStream.get(body.id);
               if (st && Number.isFinite(st.tps)) {
                 m._tps = st.tps;
@@ -4225,22 +4438,19 @@ ${META_END}`;
             }
           }
 
-          // If there was no assistant turn to merge into (pure non-stream), create one
           if (!merged) {
             sess.messages.push({ role: 'assistant', content: finalText, ts: Date.now() });
           }
 
           saveJSON(STORAGE.SESS, sessions);
           renderChat();
-
           clearRoute(body.id);
           return true;
         }
 
         if (ev === 'llm.error') {
           ackFlushAndClear(body.id, 0);
-          // callback sink
-          if (route.sink === 'callback' && typeof route.cb === 'function') {
+          if (route && route.sink === 'callback' && typeof route.cb === 'function') {
             try { route.cb({ ok: false, body }); } catch { }
             clearRoute(body.id);
             return true;
@@ -4251,7 +4461,7 @@ ${META_END}`;
             showModelsError('— no models (hub error) —');
             return true;
           }
-          if (route.sink === 'element') {
+          if (route && route.sink === 'element') {
             const elx = resolveEl(route.elId);
             lockElement(elx, false);
             if (route.elId) streamingElements.delete(route.elId);
@@ -4272,6 +4482,7 @@ ${META_END}`;
 
         return false; // not handled here
       }
+
 
       /* ----- Unified entrypoint (keeps your decode + logging) ----- */
       function onInbound(a, b) {

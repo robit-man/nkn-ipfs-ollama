@@ -144,90 +144,131 @@ if not PKG_JSON.exists():
     subprocess.check_call([NPM_BIN, "install", "nkn-sdk@^1.3.6"], cwd=NODE_DIR)
 
 BRIDGE_SRC = r"""
-/* nkn_bridge.js — DM-only bridge for client hub (continuous drain, always-enqueue, optional coalesce) */
+/* nkn_bridge.js — robust DM-only bridge for hub ⇄ clients
+   - Always-enqueue, concurrent drain
+   - Head coalescing of llm.chunk → llm.bulk (bounded by bytes/age/count)
+   - Splits oversize bulks on size preflight or send error and retries
+   - Hardened against WS flaps; watchdog heartbeats
+   - Detailed crit.* reports (includes mb, q, stack)
+
+   Drop-in replacement for BRIDGE_SRC.
+*/
+'use strict';
+
 const nkn = require('nkn-sdk');
 const readline = require('readline');
 
-const SEED_HEX = (process.env.NKN_SEED_HEX || '').toLowerCase().replace(/^0x/,'');
-const TOPIC_NS = process.env.NKN_TOPIC_PREFIX || 'client';
+/* ────────────────────────── ENV / CONFIG ────────────────────────── */
+const SEED_HEX   = (process.env.NKN_SEED_HEX || '').toLowerCase().replace(/^0x/, '');
+const TOPIC_NS   = process.env.NKN_TOPIC_PREFIX || 'client';
+const NUM_SUBCLIENTS = parseInt(process.env.NKN_NUM_SUBCLIENTS || '4', 10) || 4;
+const SEED_WS = (process.env.NKN_BRIDGE_SEED_WS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
-function sendToPy(obj){ process.stdout.write(JSON.stringify(obj) + '\n'); }
-function log(...args){ console.error('[bridge]', ...args); }
+/* Queue & memory */
+const MAX_QUEUE   = parseInt(process.env.NKN_MAX_QUEUE || '4000', 10);
+const HEAP_SOFT   = parseInt(process.env.NKN_HEAP_SOFT_MB || '640', 10);
+const HEAP_HARD   = parseInt(process.env.NKN_HEAP_HARD_MB || '896', 10);
 
-let READY = false;
-let queue = [];   // {to, data, isPub, topic}
-let draining = false;
+/* Drain behavior */
+const DRAIN_BASE_BATCH = parseInt(process.env.NKN_DRAIN_BASE || '192', 10);
+const DRAIN_MAX_BATCH  = parseInt(process.env.NKN_DRAIN_MAX_BATCH || '1536', 10);
+const CATCHUP_AGE_MS   = parseInt(process.env.NKN_CATCHUP_AGE_MS || '500', 10);
+const SEND_CONCURRENCY = parseInt(process.env.NKN_SEND_CONC || '1', 10);
 
-// Suspend window to pause drain on transient WS closures
-let suspendUntil = 0;
-function suspend(ms=2000){ suspendUntil = Date.now() + ms; READY = false; }
+/* Coalescing / payload sizing */
+const COALESCE_HEAD       = (process.env.NKN_COALESCE_HEAD || '0') !== '0';
+const COALESCE_MAX_COUNT  = parseInt(process.env.NKN_COALESCE_MAX_COUNT || '9999999', 10);
+/* FIX: give a numeric default (e.g., 1 MiB) — not 'str(...)' */
+const COALESCE_MAX_BYTES  = parseInt(process.env.NKN_COALESCE_MAX_BYTES || '880000', 10);
+const COALESCE_MAX_AGE_MS = parseInt(process.env.NKN_COALESCE_MAX_AGE_MS || '40', 10);
+const DYNAMIC_COALESCE_LAT_MS = parseInt(process.env.NKN_COALESCE_LAT_MS || '1000', 10);
 
-/* ── Tunables (env overridable) ───────────────────────────────────────── */
-const MAX_QUEUE          = parseInt(process.env.NKN_MAX_QUEUE || '4000', 10);
-const HEAP_SOFT          = parseInt(process.env.NKN_HEAP_SOFT_MB || '640', 10);
-const HEAP_HARD          = parseInt(process.env.NKN_HEAP_HARD_MB || '896', 10);
+/* Safety cap for NKN payloads; envelope headroom for JSON */
+const MAX_PAYLOAD_BYTES = Number(process.env.NKN_MAX_PAYLOAD_BYTES ?? 950_000); // < 1MB
+const ENVELOPE_OVERHEAD = 512;
 
-/* Aggressive defaults to hold e2e latency <1s under load */
-const DRAIN_BASE_BATCH   = parseInt(process.env.NKN_DRAIN_BASE || '192', 10);
-const DRAIN_MAX_BATCH    = parseInt(process.env.NKN_DRAIN_MAX_BATCH || '1536', 10);
-const CATCHUP_AGE_MS     = parseInt(process.env.NKN_CATCHUP_AGE_MS || '500', 10);
-const SEND_CONCURRENCY   = parseInt(process.env.NKN_SEND_CONC || '16', 10);
-
-/* Optional head coalescing (disabled by default for compatibility) */
-const COALESCE_HEAD          = (process.env.NKN_COALESCE_HEAD || '0') !== '0';
-const COALESCE_MAX_COUNT     = parseInt(process.env.NKN_COALESCE_MAX_COUNT || '64', 10);
-const COALESCE_MAX_BYTES     = parseInt(process.env.NKN_COALESCE_MAX_BYTES || '65536', 10); // ~64 KiB
-const COALESCE_MAX_AGE_MS    = parseInt(process.env.NKN_COALESCE_MAX_AGE_MS || '40', 10);   // flush quickly
+/* Send defaults */
 const SEND_OPTS = { noReply: true, maxHoldingSeconds: 120 };
 
-function heapMB(){ const m = process.memoryUsage(); return Math.round(((m.rss || 0)/1024/1024)); }
+/* ────────────────────────── STATE ────────────────────────── */
+let clientRef = null;
+let READY = false;
+let draining = false;
+let suspendUntil = 0; // pause drain until ts (on WS flap)
+const queue = [];     // items: { to, data } or { isPub:true, topic, data }
 
-function enqueue(item){
+/* ────────────────────────── UTIL ────────────────────────── */
+function sendToPy(obj) {
+  try { process.stdout.write(JSON.stringify(obj) + '\n'); } catch { /* ignore */ }
+}
+function log(...args) { console.error('[bridge]', ...args); }
+function heapMB() { const m = process.memoryUsage(); return Math.round((m.rss || 0) / 1024 / 1024); }
+function rateLimit(fn, ms) { let last = 0; return (...a) => { const t = Date.now(); if (t - last > ms) { last = t; fn(...a); } }; }
+const logSendErr = rateLimit((msg) => log('send warn', msg), 1500);
+
+function suspend(ms = 2000) { suspendUntil = Date.now() + ms; READY = false; }
+
+/* Safe stringify size estimator */
+function jsonSizeBytes(obj) {
+  try { return Buffer.byteLength(JSON.stringify(obj), 'utf8'); }
+  catch { return 0; }
+}
+
+/* ────────────────────────── ENQUEUE ────────────────────────── */
+function enqueue(item) {
+  if (!item || typeof item !== 'object') return;
   if (queue.length >= MAX_QUEUE) {
-    const drop = queue.splice(0, Math.ceil(MAX_QUEUE * 0.10)); // drop oldest 10%
-    try { sendToPy({ type: 'queue.drop', drop: drop.length, q: queue.length }); } catch {}
+    // Drop oldest 10% to survive bursts
+    const drop = queue.splice(0, Math.ceil(MAX_QUEUE * 0.10));
+    sendToPy({ type: 'queue.drop', drop: drop.length, q: queue.length });
   }
-  // stamp first-seen time for adaptive catch-up; use payload ts if present
+  // Stamp generator time for adaptive coalescing/catch-up
+  if (!item.data) item.data = {};
   if (!item.data.gen_ts) item.data.gen_ts = item.data.ts || Date.now();
+
   queue.push(item);
   if (READY && Date.now() >= suspendUntil) kickDrain();
 }
 
-function rateLimit(fn, ms){ let last=0; return (...args)=>{ const t=Date.now(); if(t-last>ms){ last=t; fn(...args); } }; }
-const logSendErr = rateLimit((msg)=>log('send warn', msg), 1500);
-const DYNAMIC_COALESCE_LAT_MS = parseInt(process.env.NKN_COALESCE_LAT_MS || '5000', 10);
-
-/* ── Optional: coalesce many small llm.chunk at the queue head into one llm.bulk ── */
-function tryCoalesceHead(force = false){
-  if (!(COALESCE_HEAD || force)) return null;
+/* ────────────────────────── COALESCE HEAD ──────────────────────────
+   Merge consecutive llm.chunk for the same stream/to into one llm.bulk.
+   Under "severe" backlog (old head or long queue), we relax caps a bit.
+--------------------------------------------------------------------- */
+function tryCoalesceHead(force = false) {
+  if (!COALESCE_HEAD && !force) return null;
   if (queue.length < 2) return null;
 
   const first = queue[0];
-  const d0 = first && first.data || {};
-  if (!first || d0.event !== 'llm.chunk') return null;
+  if (!first) return null;
+  const d0 = first.data || {};
+  if (d0.event !== 'llm.chunk') return null;
 
   const to = first.to;
   const streamId = d0.id;
   const startTs = d0.gen_ts || Date.now();
 
+  const countLimit = force ? Number.POSITIVE_INFINITY : COALESCE_MAX_COUNT;
+  const hardCap    = Math.min(COALESCE_MAX_BYTES || MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES - ENVELOPE_OVERHEAD);
+  const byteLimit  = force ? hardCap : hardCap;
+
+  let bytes = jsonSizeBytes(d0);
   let count = 1;
-  let bytes = Buffer.byteLength(JSON.stringify(d0));
   const items = [d0];
 
-  // look-ahead merge
-  for (let i = 1; i < queue.length; i++) {
-    if (count >= COALESCE_MAX_COUNT) break;
-    const it = queue[i];
-    if (!it || it.to !== to) break;
+  for (let i = 1; i < queue.length && count < countLimit; i++) {
+    const it = queue[i]; if (!it || it.to !== to) break;
     const dx = it.data || {};
     if (dx.event !== 'llm.chunk' || dx.id !== streamId) break;
 
-    const sz = Buffer.byteLength(JSON.stringify(dx));
-    if (bytes + sz > COALESCE_MAX_BYTES) break;
+    const sz = jsonSizeBytes(dx);
+    const projected = bytes + sz + ENVELOPE_OVERHEAD;
+    if (!force && projected > byteLimit) break;
 
-    // keep the head window fresh; don't hold too long
-    const age = Date.now() - startTs;
-    if (age > COALESCE_MAX_AGE_MS) break;
+    if (!force) {
+      const age = Date.now() - startTs;
+      if (age > COALESCE_MAX_AGE_MS) break;
+    }
 
     items.push(dx);
     bytes += sz;
@@ -236,85 +277,116 @@ function tryCoalesceHead(force = false){
 
   if (count <= 1) return null;
 
-  // remove merged items from the head
+  // Remove merged items from head
   queue.splice(0, count);
 
-  const merged = {
+  const last = items[items.length - 1];
+  return {
     to,
     data: {
       event: 'llm.bulk',
       id: streamId,
-      items,                // array of original llm.chunk payloads (ordered)
+      items,                             // original llm.chunk payloads
+      first_seq: items[0]?.seq,
+      last_seq: last?.seq,
+      count: items.length,
+      seq: last?.seq,                    // helps simple clients that just read .seq
       ts: Date.now(),
       gen_ts: d0.gen_ts
     }
   };
-  return merged;
 }
 
-/* ── Core drain ──────────────────────────────────────────────────────── */
-async function safeSendDM(client, to, data){
+/* ────────────────────────── SEND HELPERS ────────────────────────── */
+async function safeSendDM(client, to, data) {
   try {
+    // Preflight size protection to avoid NKN/WS close on oversize
+    const bytes = jsonSizeBytes(data);
+    if (bytes > MAX_PAYLOAD_BYTES) {
+      if (data?.event === 'llm.bulk' && Array.isArray(data.items) && data.items.length > 1) {
+        // Split in half and re-enqueue both parts
+        const mid = Math.floor(data.items.length / 2);
+        const aItems = data.items.slice(0, mid);
+        const bItems = data.items.slice(mid);
+        const a = { ...data, items: aItems, first_seq: aItems[0]?.seq, last_seq: aItems[aItems.length - 1]?.seq, count: aItems.length, seq: aItems[aItems.length - 1]?.seq };
+        const b = { ...data, items: bItems, first_seq: bItems[0]?.seq, last_seq: bItems[bItems.length - 1]?.seq, count: bItems.length, seq: bItems[bItems.length - 1]?.seq };
+        enqueue({ to, data: a });
+        enqueue({ to, data: b });
+        return true;
+      }
+      // If a single chunk exceeds limit (rare), fall through and try anyway.
+    }
+
     await client.send(to, JSON.stringify(data), SEND_OPTS);
     return true;
   } catch (e) {
     const msg = (e && e.message) || String(e || '');
+    // If bulk failed, split and retry
+    if (data?.event === 'llm.bulk' && Array.isArray(data.items) && data.items.length > 1) {
+      const mid = Math.floor(data.items.length / 2);
+      const aItems = data.items.slice(0, mid);
+      const bItems = data.items.slice(mid);
+      const a = { ...data, items: aItems, first_seq: aItems[0]?.seq, last_seq: aItems[aItems.length - 1]?.seq, count: aItems.length, seq: aItems[aItems.length - 1]?.seq };
+      const b = { ...data, items: bItems, first_seq: bItems[0]?.seq, last_seq: bItems[bItems.length - 1]?.seq, count: bItems.length, seq: bItems[bItems.length - 1]?.seq };
+      enqueue({ to, data: a });
+      enqueue({ to, data: b });
+      return false;
+    }
     logSendErr(`${to} → ${msg}`);
-    if (msg.includes('WebSocket unexpectedly closed')) {
+    if (msg.includes('WebSocket unexpectedly closed') || msg.includes('socket hang up')) {
       suspend(2500);
-      try { sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() }); } catch {}
+      sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() });
       setTimeout(() => { if (READY) kickDrain(); }, 2600);
     }
     return false;
   }
 }
-async function safePub(client, topic, data){
+async function safePub(client, topic, data) {
   try {
     await client.publish(TOPIC_NS + '.' + topic, JSON.stringify(data));
     return true;
   } catch (e) {
     const msg = (e && e.message) || String(e || '');
     logSendErr(`pub ${topic} → ${msg}`);
-    if (msg.includes('WebSocket unexpectedly closed')) {
+    if (msg.includes('WebSocket unexpectedly closed') || msg.includes('socket hang up')) {
       suspend(2500);
-      try { sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() }); } catch {}
+      sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() });
       setTimeout(() => { if (READY) kickDrain(); }, 2600);
     }
     return false;
   }
 }
 
-async function drain(client){
+/* ────────────────────────── DRAIN LOOP ────────────────────────── */
+async function drain(client) {
   if (!READY || Date.now() < suspendUntil || queue.length === 0) return;
 
   const now = Date.now();
-  const firstTs = (queue[0] && queue[0].data && (queue[0].data.gen_ts || queue[0].data.ts)) || now;
-  const age = Math.max(0, now - firstTs);
+  const headTs = (queue[0] && queue[0].data && (queue[0].data.gen_ts || queue[0].data.ts)) || now;
+  const age = Math.max(0, now - headTs);
   const backlog = queue.length;
+  const severe = (age >= DYNAMIC_COALESCE_LAT_MS);
 
-  const severe = age >= DYNAMIC_COALESCE_LAT_MS;
-
-  // adaptive take size
+  // Adaptive take size
   let take = DRAIN_BASE_BATCH;
   if (backlog > 256 || age > CATCHUP_AGE_MS) take = Math.min(DRAIN_MAX_BATCH, DRAIN_BASE_BATCH * 2);
-  if (backlog > 512 || age > 2*CATCHUP_AGE_MS) take = Math.min(DRAIN_MAX_BATCH, Math.floor(DRAIN_BASE_BATCH * 3));
-  if (backlog > 1024 || age > 3*CATCHUP_AGE_MS) take = DRAIN_MAX_BATCH;
-
-  if (severe) take = DRAIN_MAX_BATCH; // ★ go wide immediately
+  if (backlog > 512 || age > 2 * CATCHUP_AGE_MS) take = Math.min(DRAIN_MAX_BATCH, Math.floor(DRAIN_BASE_BATCH * 3));
+  if (backlog > 1024 || age > 3 * CATCHUP_AGE_MS) take = DRAIN_MAX_BATCH;
+  if (severe) take = DRAIN_MAX_BATCH; // go wide under pressure
 
   const batch = [];
   while (batch.length < take && queue.length > 0) {
-    const merged = tryCoalesceHead(severe);  // ★ force merge head chunks when severe
+    const merged = tryCoalesceHead(severe);
     if (merged) { batch.push(merged); continue; }
     batch.push(queue.shift());
   }
 
-  // ★ higher parallelism while catching up hard
+  // Higher parallelism while catching up hard
   const workers = severe ? SEND_CONCURRENCY
                          : Math.min(SEND_CONCURRENCY, Math.max(1, Math.ceil(batch.length / 8)));
-  let idx = 0;
 
-  async function worker(){
+  let idx = 0;
+  async function worker() {
     while (true) {
       const i = idx++; if (i >= batch.length) break;
       const it = batch[i];
@@ -323,128 +395,179 @@ async function drain(client){
       if (!ok) queue.unshift(it); // retry after transient flap
     }
   }
-  await Promise.all(new Array(workers).fill(0).map(()=>worker()));
+  await Promise.all(new Array(workers).fill(0).map(() => worker()));
 }
 
-async function kickDrain(){
+async function kickDrain() {
   if (draining) return;
   draining = true;
   try {
     while (queue.length > 0 && READY && Date.now() >= suspendUntil) {
       await drain(clientRef);
       const q = queue.length;
-      const wait = q > 1500 ? 0 : q > 300 ? 1 : 3;
-      // ★ if head is very old, don't wait at all
+
+      // If head very old, don't sleep at all
       const head = queue[0];
       const headAge = head && head.data ? (Date.now() - (head.data.gen_ts || head.data.ts || Date.now())) : 0;
       const severe = headAge >= DYNAMIC_COALESCE_LAT_MS;
-      if (!severe && wait > 0) await new Promise(r => setTimeout(r, wait));
-      if (severe || wait === 0) await new Promise(r => setImmediate(r));
+
+      if (severe) { await new Promise(r => setImmediate(r)); continue; }
+
+      const wait = q > 1500 ? 0 : q > 300 ? 1 : 3;
+      if (wait > 0) await new Promise(r => setTimeout(r, wait));
+      else await new Promise(r => setImmediate(r));
     }
   } finally {
     draining = false;
   }
 }
 
-
-/* ── Client bootstrap ────────────────────────────────────────────────── */
-let clientRef = null;
-
+/* ────────────────────────── BOOTSTRAP ────────────────────────── */
 (async () => {
-  if (!/^[0-9a-f]{64}$/.test(SEED_HEX)) throw new RangeError('invalid hex seed');
-
-  const SEED_WS = (process.env.NKN_BRIDGE_SEED_WS || '')
-    .split(',').map(s => s.trim()).filter(Boolean);
-
-  const NUM_SUBCLIENTS = parseInt(process.env.NKN_NUM_SUBCLIENTS || '4', 10) || 4;
-
-  const client = new nkn.MultiClient({
-    seed: SEED_HEX,
-    identifier: 'hub',
-    numSubClients: NUM_SUBCLIENTS,
-    seedWsAddr: SEED_WS.length ? SEED_WS : undefined,
-    wsConnHeartbeatTimeout: 120000,
-    reconnectIntervalMin: 1000,
-    reconnectIntervalMax: 10000,
-    connectTimeout: 15000,
-  });
-  clientRef = client;
-
-  client.on('connect', () => {
-    if (READY) return;
-    READY = true;
-    sendToPy({ type: 'ready', address: client.addr, topicPrefix: TOPIC_NS, ts: Date.now() });
-    log('ready at', client.addr);
-    kickDrain();
-  });
-
-  client.on('error', e => {
-    const msg = (e && e.message) || String(e || '');
-    log('client error', msg);
-    if (msg.includes('WebSocket unexpectedly closed') || msg.includes('VERIFY SIGNATURE ERROR')) {
-      try { sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() }); } catch {}
-      suspend(2500);
-      setTimeout(() => { if (READY) kickDrain(); }, 2600);
+  try {
+    if (!/^[0-9a-f]{64}$/.test(SEED_HEX)) {
+      sendToPy({ type: 'crit.config', msg: 'Invalid NKN_SEED_HEX (need 64 hex chars)', mb: heapMB() });
+      process.exit(1);
+      return;
     }
-  });
 
-  client.on('connectFailed', e => log('connect failed', e && e.message || e));
+    const client = new nkn.MultiClient({
+      seed: SEED_HEX,
+      identifier: 'hub',
+      numSubClients: NUM_SUBCLIENTS,
+      seedWsAddr: SEED_WS.length ? SEED_WS : undefined,
+      wsConnHeartbeatTimeout: 120000,
+      reconnectIntervalMin: 1000,
+      reconnectIntervalMax: 10000,
+      connectTimeout: 15000,
+    });
+    clientRef = client;
 
-  const onMessage = (a, b) => {
-    let src, payload;
-    if (a && typeof a === 'object' && a.payload !== undefined) { src = a.src; payload = a.payload; }
-    else { src = a; payload = b; }
-    try {
-      const asStr = Buffer.isBuffer(payload) ? payload.toString('utf8') : String(payload || '');
-      try { const msg = JSON.parse(asStr); sendToPy({ type: 'nkn-dm', src, msg }); } catch {}
-    } catch (e) { /* ignore */ }
-  };
-  client.on('message', onMessage);
+    client.on('connect', () => {
+      READY = true;
+      sendToPy({ type: 'ready', address: client.addr, topicPrefix: TOPIC_NS, ts: Date.now() });
+      log('ready at', client.addr);
+      kickDrain();
+    });
 
-  /* ALWAYS enqueue from stdin; let drain handle sending with concurrency */
-  const rl = readline.createInterface({ input: process.stdin });
-  rl.on('line', async line => {
-    if (!line) return;
-    let cmd; try { cmd = JSON.parse(line); } catch { return; }
-
-    if (cmd.type === 'dm' && cmd.to && cmd.data) {
-      enqueue({to: cmd.to, data: cmd.data});
-    } else if (cmd.type === 'pub' && cmd.topic && cmd.data) {
-      enqueue({isPub:true, topic: cmd.topic, data: cmd.data});
-    }
-  });
-
-  /* Heap guard: soft trim, then hard exit (Python watchdog restarts us) */
-  setInterval(() => {
-    const mb = heapMB();
-    if (mb >= HEAP_SOFT) {
-      try { if (global.gc) global.gc(); } catch {}
-      if (queue.length > Math.floor(MAX_QUEUE * 0.6)) {
-        const drop = queue.splice(0, Math.max(1, queue.length - Math.floor(MAX_QUEUE * 0.6)));
-        try { sendToPy({ type: 'queue.trim', drop: drop.length, q: queue.length, mb }); } catch {}
+    client.on('error', (e) => {
+      const msg = (e && e.message) || String(e || '');
+      log('client error', msg);
+      if (msg.includes('WebSocket unexpectedly closed') || msg.includes('VERIFY SIGNATURE ERROR')) {
+        sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() });
+        suspend(2500);
+        setTimeout(() => { if (READY) kickDrain(); }, 2600);
       }
-    }
-    if (mb >= HEAP_HARD) {
-      try { sendToPy({ type: 'crit.heap', mb, q: queue.length }); } catch {}
-      process.exitCode = 137;
-      setTimeout(() => process.exit(137), 10);
-    }
-  }, 2000);
+    });
 
-  // Bridge heartbeat to Python watchdog
-  setInterval(() => {
-    try { sendToPy({ type: 'hb', ts: Date.now(), ready: READY, q: queue.length, mb: heapMB() }); } catch {}
-  }, 5000);
+    client.on('connectFailed', (e) => {
+      log('connect failed', (e && e.message) || e);
+    });
 
-  // Safety net: if anything left in queue and we're READY, keep nudging the pump
-  setInterval(() => {
-    if (queue.length && READY && Date.now() >= suspendUntil) kickDrain();
-  }, 25);
+    const onMessage = (a, b) => {
+      let src, payload;
+      if (a && typeof a === 'object' && a.payload !== undefined) { src = a.src; payload = a.payload; }
+      else { src = a; payload = b; }
+      try {
+        const asStr = Buffer.isBuffer(payload) ? payload.toString('utf8') : String(payload || '');
+        try {
+          const msg = JSON.parse(asStr);
+          sendToPy({ type: 'nkn-dm', src, msg });
+        } catch {
+          // Non-JSON message; ignore silently (or forward raw if desired)
+        }
+      } catch { /* ignore */ }
+    };
+    client.on('message', onMessage);
 
-  // Fail fast on unexpected errors
-  process.on('uncaughtException', (e) => { try { sendToPy({ type: 'crit.uncaught', msg: String(e&&e.message||e) }); } catch {}; process.exit(1); });
-  process.on('unhandledRejection', (e) => { try { sendToPy({ type: 'crit.unhandled', msg: String(e&&e.message||e) }); } catch {}; process.exit(1); });
+    // ALWAYS enqueue from stdin; drain handles sending with concurrency
+    const rl = readline.createInterface({ input: process.stdin });
+    rl.on('line', (line) => {
+      if (!line) return;
+      let cmd;
+      try { cmd = JSON.parse(line); } catch { return; }
 
+      if (cmd && cmd.type === 'dm' && cmd.to && cmd.data) {
+        if (typeof cmd.data === 'object' && cmd.data && !cmd.data.ts) cmd.data.ts = Date.now();
+        enqueue({ to: cmd.to, data: cmd.data });
+      } else if (cmd && cmd.type === 'pub' && cmd.topic && cmd.data) {
+        if (typeof cmd.data === 'object' && cmd.data && !cmd.data.ts) cmd.data.ts = Date.now();
+        enqueue({ isPub: true, topic: cmd.topic, data: cmd.data });
+      }
+    });
+    rl.on('close', () => { process.exit(0); });
+
+    // Heap guard: soft trim, then hard exit (watchdog restarts)
+    setInterval(() => {
+      const mb = heapMB();
+      if (mb >= HEAP_SOFT) {
+        try { if (global.gc) global.gc(); } catch {}
+        if (queue.length > Math.floor(MAX_QUEUE * 0.6)) {
+          const drop = queue.splice(0, Math.max(1, queue.length - Math.floor(MAX_QUEUE * 0.6)));
+          sendToPy({ type: 'queue.trim', drop: drop.length, q: queue.length, mb });
+        }
+      }
+      if (mb >= HEAP_HARD) {
+        sendToPy({ type: 'crit.heap', mb, q: queue.length });
+        process.exitCode = 137;
+        setTimeout(() => process.exit(137), 10);
+      }
+    }, 2000);
+
+    // Bridge heartbeat to Python watchdog
+    setInterval(() => {
+      sendToPy({ type: 'hb', ts: Date.now(), ready: READY, q: queue.length, mb: heapMB() });
+    }, 5000);
+
+    // Safety net: if anything left in queue and we're READY, keep nudging the pump
+    setInterval(() => {
+      if (queue.length && READY && Date.now() >= suspendUntil) kickDrain();
+    }, 25);
+
+    // Graceful shutdown
+    const shutdown = (sig) => {
+      try { sendToPy({ type: 'shutdown', sig, q: queue.length, mb: heapMB(), ts: Date.now() }); } catch {}
+      try { rl.close(); } catch {}
+      try { client && client.close && client.close(); } catch {}
+      setTimeout(() => process.exit(0), 20);
+    };
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+    // Fail fast on unexpected errors — INCLUDE mb/q/stack so Python won’t show mb=None
+    process.on('uncaughtException', (e) => {
+      sendToPy({
+        type: 'crit.uncaught',
+        msg: String(e && e.message || e),
+        stack: String(e && e.stack || ''),
+        mb: heapMB(),
+        q: queue.length,
+        ts: Date.now()
+      });
+      process.exit(1);
+    });
+    process.on('unhandledRejection', (e) => {
+      sendToPy({
+        type: 'crit.unhandled',
+        msg: String((e && e.message) || e),
+        stack: String((e && e.stack) || ''),
+        mb: heapMB(),
+        q: queue.length,
+        ts: Date.now()
+      });
+      process.exit(1);
+    });
+
+  } catch (bootErr) {
+    sendToPy({
+      type: 'crit.boot',
+      msg: String(bootErr && bootErr.message || bootErr),
+      stack: String(bootErr && bootErr.stack || ''),
+      mb: heapMB(),
+      ts: Date.now()
+    });
+    process.exit(1);
+  }
 })();
 """
 
@@ -1319,13 +1442,20 @@ class _LLMStream:
     FINAL_GAP_SECS  = 0.12
     ACK_STALL_SECS   = 25.0
     MAX_WINDOW_PKTS  = 1024
-    BULK_UNACK_THRESHOLD = 256
+    BULK_UNACK_THRESHOLD = 10
     BULK_MAX_MS          = 120
-    BULK_MAX_PARTS       = 16
+    BULK_MAX_PARTS       = 200
     STATS_INTERVAL_SECS = 0.5
     SEVERE_ACK_STALE_SECS = 5.0
     BULK_PANIC_MS = 850          # flush at most ~1x/sec while lagging badly
     BULK_PANIC_PARTS = 9999      # effectively “as many as arrive”
+    FREEZE_E2E_MS         = int(os.environ.get("LLM_FREEZE_E2E_MS", "1500"))   # ema of client_now - pkt.ts
+    FREEZE_UNACK          = int(os.environ.get("LLM_FREEZE_UNACK", "100000"))     # unacked seqs threshold
+    FREEZE_ACK_STALE_S    = float(os.environ.get("LLM_FREEZE_ACK_STALE_S", "1.5"))
+    FREEZE_RENDERED_GAP   = int(os.environ.get("LLM_FREEZE_RENDERED_GAP", "100000"))
+    FREEZE_MAX_HOLD_S     = float(os.environ.get("LLM_FREEZE_MAX_HOLD_S", "0.2"))  # how long we’re willing to hold
+    FREEZE_MAX_BYTES      = int(os.environ.get("LLM_FREEZE_MAX_BYTES", str(1024 * 1024)))  # safety cap
+
     def __init__(self, src_addr: str, req: dict,
                  on_start=None, on_delta=None, on_done=None):
         self.src_addr = src_addr
@@ -1339,6 +1469,13 @@ class _LLMStream:
         self.seq      = 0
         self.last_acked = 0
         self._last_ack_change = time.monotonic()
+
+        self.last_recv_seq = 0
+        self.last_rendered_seq = 0
+        self._last_recv_change = time.monotonic()
+        self._e2e_latency_ema_ms = None   # client_now - pkt.ts (ms)
+        self._ack_rtt_ema_ms = None       # server_now - pkt.ts (fallback if client_now missing)
+
         self.window   = {}
         self.window_order = []
         self.done_sent  = False
@@ -1453,14 +1590,51 @@ class _LLMStream:
         except Exception as e:
             _log("llm.on_done.err", str(e))
 
-    def ack(self, upto: int):
+    def ack(self, upto: int, meta: Optional[dict] = None):
+        client_now = None
+        rendered = None
+        if isinstance(meta, dict):
+            client_now = meta.get("client_now")
+            rendered = meta.get("rendered")
+
         with self._lock:
+            # track receive progress
+            if upto > self.last_recv_seq:
+                self.last_recv_seq = upto
+                self._last_recv_change = time.monotonic()
+
+            # advance delivery-ACK as well (kept for window eviction/backpressure logic)
             if upto > self.last_acked:
                 self.last_acked = upto
                 self._last_ack_change = time.monotonic()
-                for s in [s for s in list(self.window.keys()) if s <= self.last_acked]:
-                    self.window.pop(s, None)
-                self.window_order = [s for s in self.window_order if s > self.last_acked]
+
+            # compute latency using the packet timestamp we sent
+            pkt = self.window.get(upto)
+            pkt_ts = pkt.get("ts") if isinstance(pkt, dict) else None
+            now_ms = int(time.time() * 1000)
+
+            # E2E (client clock) if provided
+            if pkt_ts and isinstance(client_now, (int, float)):
+                sample = max(0, float(client_now) - float(pkt_ts))
+                self._e2e_latency_ema_ms = sample if self._e2e_latency_ema_ms is None \
+                    else (0.8 * self._e2e_latency_ema_ms + 0.2 * sample)
+
+            # Fallback RTT-ish (server clock only)
+            if pkt_ts:
+                sample_rtt = max(0, now_ms - int(pkt_ts))
+                self._ack_rtt_ema_ms = sample_rtt if self._ack_rtt_ema_ms is None \
+                    else (0.8 * self._ack_rtt_ema_ms + 0.2 * sample_rtt)
+
+            # rendered progress (optional)
+            if isinstance(rendered, int) and rendered > self.last_rendered_seq:
+                self.last_rendered_seq = rendered
+
+            # free memory: evict anything <= max(received, acked)
+            hi = max(self.last_recv_seq, self.last_acked)
+            for s in [s for s in list(self.window.keys()) if s <= hi]:
+                self.window.pop(s, None)
+            self.window_order = [s for s in self.window_order if s > hi]
+
 
     def cancel(self):
         with self._lock:
@@ -1470,9 +1644,12 @@ class _LLMStream:
         while True:
             now = time.monotonic()
             with self._lock:
-                stalled = (now - self._last_ack_change) > self.ACK_STALL_SECS
+                ack_stalled = (now - self._last_ack_change) > self.ACK_STALL_SECS
+                recv_stalled = (now - self._last_recv_change) > self.ACK_STALL_SECS
                 unacked = self.seq - self.last_acked
-            if stalled and unacked > (self.MAX_WINDOW_PKTS // 2):
+                window_full = len(self.window_order) > self.MAX_WINDOW_PKTS
+            # Only bail if BOTH sides look stalled and we’re at real risk
+            if (ack_stalled and recv_stalled) and (unacked > (self.MAX_WINDOW_PKTS // 2) or window_full):
                 self._send_error("ack stall: aborting stream to prevent memory pressure", kind="ack_stall")
                 self.cancelled = True
                 return
@@ -1487,6 +1664,7 @@ class _LLMStream:
                         self._dm(pkt)
                 if self.done_sent and self.last_acked >= self.done_seq:
                     return
+
 
     def _send_coalesced_text(self, text: str):
         if not text: return
@@ -1523,6 +1701,12 @@ class _LLMStream:
             tps_real = float(self._stats["eval_count"]) / float(self._stats["eval_duration_s"])
         approx_tokens = int(self._stats["chars"] / 4.0) if self._stats["chars"] else 0
         approx_tps = (approx_tokens / elapsed_s) if elapsed_s > 0 else None
+
+        # derived net state
+        unacked = max(0, self.seq - self.last_acked)
+        recv_gap = max(0, self.seq - self.last_recv_seq)
+        rendered_gap = max(0, self.seq - self.last_rendered_seq)
+
         payload = {
             "event": "llm.stats",
             "id": self.id,
@@ -1543,12 +1727,19 @@ class _LLMStream:
                 "tokens_per_sec": tps_real,
             },
             "net": {
-                "last_acked": self.last_acked,
                 "last_seq": self.seq,
-                "unacked": max(0, self.seq - self.last_acked),
+                "last_acked": self.last_acked,
+                "last_recv": self.last_recv_seq,
+                "last_rendered": self.last_rendered_seq,
+                "unacked": unacked,
+                "recv_gap": recv_gap,
+                "rendered_gap": rendered_gap,
+                "e2e_latency_ema_ms": self._e2e_latency_ema_ms,
+                "ack_rtt_ema_ms": self._ack_rtt_ema_ms,
             },
         }
         self._dm(payload)
+
 
     def run(self):
         if self.client is None: return
@@ -1571,12 +1762,28 @@ class _LLMStream:
             bulk_buf: list[str] = []
             last_flush = time.monotonic()
 
+            bulk_buf: list[str] = []
+            last_flush = time.monotonic()
+
+            # NEW: freeze-to-bulk state
+            freeze_mode = False
+            freeze_started = 0.0
+            freeze_buf: list[str] = []
+            freeze_bytes = 0
+
             def _bulk_flush():
                 nonlocal bulk_buf, last_flush
                 if bulk_buf:
                     self._send_coalesced_text("".join(bulk_buf))
                     bulk_buf = []
                     last_flush = time.monotonic()
+
+            def _freeze_flush():
+                nonlocal freeze_buf, freeze_bytes
+                if freeze_buf:
+                    self._send_coalesced_text("".join(freeze_buf))
+                    freeze_buf = []
+                    freeze_bytes = 0
 
             for part in gen:
                 if self.cancelled:
@@ -1586,17 +1793,56 @@ class _LLMStream:
                 with self._lock:
                     unacked = self.seq - self.last_acked
                     ack_stalled_s = (now - self._last_ack_change)
+                    rendered_gap = self.seq - self.last_rendered_seq
+                    e2e_ms = (self._e2e_latency_ema_ms or 0.0)
+
+                # Decide if we should enter/keep FREEZE (one-big-frame) mode
+                want_freeze = (
+                    (unacked >= self.FREEZE_UNACK) or
+                    (ack_stalled_s >= self.FREEZE_ACK_STALE_S and e2e_ms >= self.FREEZE_E2E_MS) or
+                    (rendered_gap >= self.FREEZE_RENDERED_GAP)
+                )
+
+                if want_freeze and not freeze_mode:
+                    freeze_mode = True
+                    freeze_started = now
+                    # dump any normal bulk we were preparing so we don't interleave strategies
+                    _bulk_flush()
+
+                # always extract textual delta once
+                delta = _extract_delta_from_part(self.api, part)
+
+                if freeze_mode:
+                    # Buffer aggressively; send nothing until we recover or finish
+                    if delta:
+                        freeze_buf.append(delta)
+                        freeze_bytes += len(delta.encode("utf-8", "ignore"))
+                        # safety: don't grow without bound
+                        if freeze_bytes >= self.FREEZE_MAX_BYTES:
+                            _freeze_flush()
+                    else:
+                        # non-text event: flush text once, then forward this structural part
+                        _freeze_flush()
+                        self._send_chunk(part)
+
+                    # Exit conditions: we caught up OR we’ve held long enough
+                    with self._lock:
+                        recovered = (self.seq - self.last_acked) <= max(8, self.FREEZE_UNACK // 4)
+                    held_too_long = (now - freeze_started) >= self.FREEZE_MAX_HOLD_S
+
+                    if recovered or held_too_long:
+                        _freeze_flush()
+                        freeze_mode = False
+                    continue  # don’t fall through to normal bulk logic
+
+                # ── Normal bulk logic (milder coalescing) ──
+                with self._lock:
+                    unacked = self.seq - self.last_acked
+                    ack_stalled_s = (now - self._last_ack_change)
                 ack_stale = ack_stalled_s > 0.8
                 panic = ack_stalled_s >= self.SEVERE_ACK_STALE_SECS
 
-                # Normal bulk heuristic (mild lag) still applies:
-                bulk_mode = (unacked >= self.BULK_UNACK_THRESHOLD) or ack_stale
-
-                # Extract once; we treat non-text parts as boundaries that force a flush
-                delta = _extract_delta_from_part(self.api, part)
-
                 if panic:
-                    # ★ Panic mode: grow the chunk a lot before flushing
                     if delta:
                         bulk_buf.append(delta)
                         too_many = len(bulk_buf) >= self.BULK_PANIC_PARTS
@@ -1609,6 +1855,7 @@ class _LLMStream:
                         self._send_chunk(part)
                     continue
 
+                bulk_mode = (unacked >= self.BULK_UNACK_THRESHOLD) or ack_stale
                 if bulk_mode:
                     if delta:
                         bulk_buf.append(delta)
@@ -1624,7 +1871,9 @@ class _LLMStream:
                     _bulk_flush()
                     self._send_chunk(part)
 
+            # stream ended — flush whatever is left
             if not self.cancelled:
+                _freeze_flush()
                 _bulk_flush()
 
             for _ in range(self.FINAL_SWEEPS):
@@ -1704,10 +1953,17 @@ def _start_llm(src_addr: str, body: dict,
 
 def _ack_llm(body: dict):
     sid = body.get("id")
-    upto = body.get("upto")
-    if not isinstance(sid, str) or not isinstance(upto, int): return
+    upto = body.get("upto")                 # highest contiguous RECEIVED
+    upto_recv = body.get("upto_recv")       # alias; prefer this if present
+    upto_rendered = body.get("upto_rendered")  # highest CONTIGUOUS RENDERED (optional)
+    client_now = body.get("clientNow")      # client ms clock (optional)
+    if not isinstance(sid, str): return
+    seq = upto_recv if isinstance(upto_recv, int) else upto
+    if not isinstance(seq, int): return
     stream = _llm_streams.get(sid)
-    if stream: stream.ack(upto)
+    if stream:
+        stream.ack(seq, {"rendered": upto_rendered if isinstance(upto_rendered, int) else None,
+                         "client_now": client_now if isinstance(client_now, (int, float)) else None})
 
 def _cancel_llm(body: dict):
     sid = body.get("id")
@@ -1716,7 +1972,7 @@ def _cancel_llm(body: dict):
     if stream: stream.cancel()
 
 # Advertised control-ops this node supports
-CTRL_CAPS = {"models", "info", "peers", "caps"}
+CTRL_CAPS = {"models", "info", "peers", "caps", "llm.bulk"}
 
 def _send_ctrl_caps(dst: str, req_id: Optional[str] = None):
     _dm(dst, {
