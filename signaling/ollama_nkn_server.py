@@ -1216,59 +1216,6 @@ def _sessions_gc_loop():
 
 threading.Thread(target=_sessions_gc_loop, daemon=True).start()
 
-# ──────────────────────────────────────────────────────────────────────
-# VII. Legacy globe (kept minimal)
-# ──────────────────────────────────────────────────────────────────────
-clients = set()  # active DM src addrs
-peers_by_addr: Dict[str, Dict[str, Any]] = {}  # addr -> {lat, lon, ts(ms)}
-
-def _sanitize_state(s: dict) -> Dict[str, float]:
-    try:
-        lat = float(s.get("lat", 0.0))
-        lon = float(s.get("lon", 0.0))
-    except Exception:
-        lat, lon = 0.0, 0.0
-    if lat > 89.9: lat = 89.9
-    if lat < -89.9: lat = -89.9
-    lon = ((lon % 360.0) + 360.0) % 360.0
-    return {"lat": lat, "lon": lon}
-
-ACTIVE_WINDOW_MS = 30_000
-PRUNE_WINDOW_MS  = 120_000
-
-def _send_world_snapshot(targets=None):
-    now = _now_ms()
-    for addr, st in list(peers_by_addr.items()):
-        if st.get("ts", 0) < (now - PRUNE_WINDOW_MS):
-            _log("prune", f"{addr} idle")
-            peers_by_addr.pop(addr, None)
-            clients.discard(addr)
-    client_snapshot = tuple(clients)
-    peers_snapshot = dict(peers_by_addr)
-    if targets is None:
-        targets = [
-            a for a in client_snapshot
-            if peers_snapshot.get(a, {}).get("ts", 0) >= (now - ACTIVE_WINDOW_MS)
-        ]
-    if not targets:
-        return
-    peers_obj = {
-        addr: {"lat": st["lat"], "lon": st["lon"], "ts": st["ts"]}
-        for addr, st in peers_snapshot.items()
-    }
-    pkt = {"event": "world", "peers": peers_obj, "ts": now}
-    for to in targets:
-        _dm(to, pkt)
-
-def _broadcaster_loop():
-    while True:
-        try:
-            _send_world_snapshot()
-        except Exception as e:
-            _log("broadcast-error", repr(e))
-        time.sleep(2.0)
-
-threading.Thread(target=_broadcaster_loop, daemon=True).start()
 
 # ──────────────────────────────────────────────────────────────────────
 # VIII. LLM streaming with session integration
@@ -1532,6 +1479,7 @@ class _LLMStream:
         self.id       = req.get("id") or secrets.token_hex(8)
         self.api      = (req.get("api") or "chat").strip().lower()
         self.model    = req.get("model")
+        self.think   = bool(req.get("think", False))
         self.stream   = bool(req.get("stream", False))
         self.client_cfg = req.get("client") or {}
         self.kwargs   = req.get("kwargs") or {}
@@ -1595,7 +1543,7 @@ class _LLMStream:
         _dm(self.src_addr, payload)
 
     def _send_start(self):
-        self._dm({"event":"llm.start","id":self.id,"api":self.api,"model":self.model,"stream":self.stream})
+        self._dm({"event":"llm.start","id":self.id,"api":self.api,"model":self.model,"stream":self.stream,"think": bool(getattr(self, "think", False)),})
         try:
             if callable(self.on_start): self.on_start()
         except Exception as e:
@@ -2135,8 +2083,29 @@ class _LLMStream:
 # Registry of active LLM streams by id
 _llm_streams: Dict[str, _LLMStream] = {}
 
+def _normalize_think_on_body(body: dict) -> dict:
+    """
+    Normalize 'think' so downstream clients see it consistently.
+    - top-level: body['think'] = bool
+    - kwargs.think = bool
+    - kwargs.options.thinking = bool
+    """
+    out = dict(body or {})
+    think = bool(out.get("think") or (out.get("kwargs", {}) or {}).get("think") or False)
+    out["think"] = think
+    kw = out.setdefault("kwargs", {})
+    kw["think"] = think
+    if think:
+        opts = kw.setdefault("options", {})
+        # 'thinking' covers a broad set of clients; harmless if ignored
+        opts.setdefault("thinking", True)
+    return out
+
 def _start_llm(src_addr: str, body: dict,
                on_start=None, on_delta=None, on_done=None):
+    # Normalize 'think' into kwargs/options so the client library sees it.
+    body = _normalize_think_on_body(body)
+
     stream = _LLMStream(src_addr, body, on_start=on_start, on_delta=on_delta, on_done=on_done)
     _llm_streams[stream.id] = stream
     threading.Thread(target=stream.run, daemon=True).start()
