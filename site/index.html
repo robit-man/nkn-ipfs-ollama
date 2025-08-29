@@ -2933,30 +2933,59 @@ ${META_END}`;
         return (tps != null || tokens != null) ? { tps, tokens } : null;
       }
 
-      // Apply stats to the in-memory record + update streaming bubble + (re)render
-      function applyStreamStats(id, payload) {
-        if (!id) return;
-        const rec = statsByStream.get(id) || {};
-        const ext =
-          extractTPSAndTokens(payload) ||
-          extractTPSAndTokens(payload && payload.data) ||
-          extractTPSAndTokens(payload && payload.ollama);
 
-        if (ext) {
-          if (ext.tps != null) { rec.tps = ext.tps; rec.approx = false; }
-          if (ext.tokens != null) rec.tokens = ext.tokens;
-        } else if (rec.startAt && rec.approxTokens > 0) {
-          // fallback: keep the running estimate if no explicit stats came
-          const elapsed = Math.max(0.25, (Date.now() - rec.startAt) / 1000);
-          rec.tps = rec.approxTokens / elapsed;
-          rec.approx = true;
+      // --- helpers used by onInboundData ---
+      function applyStreamStats(id, env) {
+        if (!id || !env) return;
+        let rec = statsByStream.get(id);
+        if (!rec) {
+          rec = { tps: null, tokens: 0, approx: true, startAt: Date.now(), updatedAt: Date.now() };
+          statsByStream.set(id, rec);
         }
 
+        // Pull candidates from the envelope the hub sends
+        const approx = (env.approx || {});
+        const ollama = (env.ollama || {});
+
+        // 1) tokens (cumulative best-effort)
+        // Prefer exact eval_count if present; else use approx.tokens; else keep previous.
+        let newTokens = rec.tokens;
+        if (Number.isFinite(ollama.eval_count)) newTokens = Math.max(newTokens, Number(ollama.eval_count));
+        else if (Number.isFinite(approx.tokens)) newTokens = Math.max(newTokens, Number(approx.tokens));
+
+        // 2) instantaneous TPS candidates
+        let realTps = null;
+        if (Number.isFinite(ollama.tokens_per_sec)) realTps = Number(ollama.tokens_per_sec);
+
+        let approxTps = null;
+        if (Number.isFinite(approx.tokens_per_sec)) approxTps = Number(approx.tokens_per_sec);
+        else if (Number.isFinite(approx.chars_per_sec)) {
+          // chars → tokens ~ /4 heuristic
+          approxTps = approx.chars_per_sec / 4;
+        }
+
+        // 3) Wall-time fallback when neither real nor approx instantaneous TPS is present
+        let wallTps = null;
+        const elapsedS = Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
+        if (newTokens > 0) wallTps = newTokens / elapsedS;
+
+        // Choose the best signal this tick
+        let sampleTps = null;
+        let isApprox = true;
+        if (Number.isFinite(realTps)) { sampleTps = realTps; isApprox = false; }
+        else if (Number.isFinite(approxTps)) { sampleTps = approxTps; isApprox = true; }
+        else if (Number.isFinite(wallTps)) { sampleTps = wallTps; isApprox = true; }
+
+        // Smooth it if we have a sample
+        if (Number.isFinite(sampleTps)) {
+          if (!Number.isFinite(rec.tps)) rec.tps = sampleTps;
+          else rec.tps = (1 - TPS_SMOOTH) * rec.tps + TPS_SMOOTH * sampleTps;
+          rec.approx = !!isApprox;
+        }
+
+        rec.tokens = newTokens;
         rec.updatedAt = Date.now();
         statsByStream.set(id, rec);
-
-        _setStreamMeta(id, 'streaming…'); // updates bubble meta with live TPS
-        renderChat();                     // <- make it visible in the message meta too
       }
 
       // VERY rough chars→tokens converter for live fallback between stats frames
@@ -4208,42 +4237,41 @@ ${META_END}`;
           return true;
         }
 
-// NEW: accept bulk frames anywhere in the stream
-if (ev === 'llm.bulk') {
-  const { id, items = [], last_seq, first_seq } = body || {};
-  if (!id || !items.length) return true;
+        // NEW: accept bulk frames anywhere in the stream
+        if (ev === 'llm.bulk') {
+          const { id, items = [], last_seq, first_seq } = body || {};
+          if (!id || !items.length) return true;
 
-  // latency updates (optional/best-effort)
-  if (useStatsLatency && statsLatencyActive) {
-    updateLatencyFromStatsEnvelope(body);
-    // also peek into the last item; it’s closest to "now"
-    const tail = items[items.length - 1];
-    if (tail) {
-      updateLatencyFromStatsEnvelope(tail);
-      if (tail.data) updateLatencyFromStatsEnvelope(tail.data);
-    }
-  }
+          // latency updates (optional/best-effort)
+          if (useStatsLatency && statsLatencyActive) {
+            updateLatencyFromStatsEnvelope(body);
+            // also peek into the last item; it’s closest to "now"
+            const tail = items[items.length - 1];
+            if (tail) {
+              updateLatencyFromStatsEnvelope(tail);
+              if (tail.data) updateLatencyFromStatsEnvelope(tail.data);
+            }
+          }
 
-  // replay each original chunk through the exact same path
-  for (let i = 0; i < items.length; i++) {
-    const it = items[i] || {};
-    const seq = (typeof it.seq === 'number') ? it.seq
-               : (typeof first_seq === 'number') ? (first_seq + i)
-               : null;
-    if (seq == null) continue;
+          // replay each original chunk through the exact same path
+          for (let i = 0; i < items.length; i++) {
+            const it = items[i] || {};
+            const seq = (typeof it.seq === 'number') ? it.seq
+              : (typeof first_seq === 'number') ? (first_seq + i)
+                : null;
+            if (seq == null) continue;
 
-    // keep ack accounting happy (single pending window)
-    ackNote(id, seq);
-    handleChunk(id, seq, it.data ?? it);
-  }
+            // keep ack accounting happy (single pending window)
+            ackNote(id, seq);
+            handleChunk(id, seq, it.data ?? it);
+          }
 
-  // single ack keeps the server window draining aggressively
-  if (typeof last_seq === 'number') {
-    sendAck(id, last_seq);
-  }
-  return true;
-}
-
+          // single ack keeps the server window draining aggressively
+          if (typeof last_seq === 'number') {
+            sendAck(id, last_seq);
+          }
+          return true;
+        }
 
         if (ev === 'llm.chunk') {
           if (statsLatencyActive) {
@@ -4478,6 +4506,7 @@ if (ev === 'llm.bulk') {
 
         return false; // not handled here
       }
+
 
 
       /* ----- Unified entrypoint (keeps your decode + logging) ----- */
