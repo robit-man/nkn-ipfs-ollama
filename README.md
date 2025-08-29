@@ -1,7 +1,8 @@
 # nkn-ipfs-ollama
 
-**A simple demonstration of streaming responses between a frontend hosted via IPFS and a backend running on Ollama, facilitated by New Kind of Network (NKN).**
+![Screencastfrom2025-08-2823-06-35-ezgif com-video-to-gif-converter (2)](https://github.com/user-attachments/assets/7c7277ac-5680-4ed1-9ffe-5b0f0ae6681d)
 
+**A simple demonstration of streaming responses between a frontend hosted via IPFS and a backend running on Ollama, facilitated by New Kind of Network (NKN).**
 
 ## Overview
 
