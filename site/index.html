@@ -5390,7 +5390,8 @@ ${META_END}`;
           return;
         }
 
-        const s = getSession(); if (!s) {
+        const s = getSession(); 
+        if (!s) {
           const sel = el('modelSelect');
           const model = sel && sel.value;
           if (!modelsLoaded || !model || sel.disabled || /loading|no models/i.test(String(sel.options[0]?.text || ''))) {
