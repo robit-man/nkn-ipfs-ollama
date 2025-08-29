@@ -189,7 +189,7 @@ const COALESCE_BACKLOG_TRIGGER = parseInt(process.env.NKN_COALESCE_BACKLOG || '2
 const DYNAMIC_COALESCE_LAT_MS = parseInt(process.env.NKN_COALESCE_LAT_MS || '1000', 10);
 
 // Safety cap for NKN payloads; envelope headroom for JSON
-const MAX_PAYLOAD_BYTES = Number(process.env.NKN_MAX_PAYLOAD_BYTES ?? 900_000);
+const MAX_PAYLOAD_BYTES = Number(process.env.NKN_MAX_PAYLOAD_BYTES || 900_000);
 const ENVELOPE_OVERHEAD = 512;
 
 /* Send defaults */
@@ -2504,6 +2504,37 @@ if __name__ == "__main__":
     else:
         print("   (Waiting for NKN bridge to connect…)")
 
+    import errno
     from eventlet import wsgi
-    listener = eventlet.listen(("0.0.0.0", 3000))
+
+    def _bind_http(host: str = "0.0.0.0", base_port: int = None, tries: int = 50):
+        """Bind to base_port or the next available. If all tried, use ephemeral."""
+        if base_port is None:
+            try:
+                base_port = int(os.environ.get("PORT", "3000") or 3000)
+            except Exception:
+                base_port = 3000
+
+        # Try base_port .. base_port+tries-1
+        for i in range(max(1, tries)):
+            port = base_port + i
+            try:
+                listener = eventlet.listen((host, port))
+                return listener, port
+            except OSError as e:
+                # EADDRINUSE (Linux=98, macOS=48, Windows=10048). Keep scanning.
+                if getattr(e, "errno", None) in (errno.EADDRINUSE, 48, 98, 10048):
+                    continue
+                # Permission denied or other fatal errors -> re-raise.
+                raise
+
+        # Fallback: ephemeral port
+        listener = eventlet.listen((host, 0))
+        port = listener.getsockname()[1]
+        return listener, port
+
+    listener, http_port = _bind_http()
+    state["http_port"] = http_port  # optional: expose chosen port in / metadata
+    print(f"   HTTP listening on http://0.0.0.0:{http_port}")
+
     wsgi.server(listener, app)
