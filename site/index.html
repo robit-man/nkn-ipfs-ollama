@@ -826,10 +826,11 @@
       overflow: hidden;
     }
 
-    #hubList{
-      margin-bottom:0.5rem;
-      display:flex;flex-flow:column;
-      gap:0.5rem;
+    #hubList {
+      margin-bottom: 0.5rem;
+      display: flex;
+      flex-flow: column;
+      gap: 0.5rem;
     }
 
     .header-data-row {
@@ -1509,13 +1510,13 @@
 
       // --- Storage helpers (hub-aware for sessions only)
       function sessionsKeyForHubId(hid) {
-        return `${STORAGE.SESS}::${hid || 'hub-default'}`;
+        // Use a neutral "global" namespace when no hub is selected
+        return `${STORAGE.SESS}::${hid || 'global'}`;
       }
       function _maybeReKey(key) {
         if (key === STORAGE.SESS) {
-          // Defer lookup so HubManager is already constructed when called
-          const hid = (typeof HubManager?.currentId === 'string' && HubManager.currentId) ? HubManager.currentId : 'hub-default';
-          return sessionsKeyForHubId(hid);
+          const hid = (typeof HubManager?.currentId === 'string' && HubManager.currentId) ? HubManager.currentId : null;
+          return sessionsKeyForHubId(hid || 'global');
         }
         return key;
       }
@@ -1614,32 +1615,36 @@
           currentAddr() { return (api.current() && api.current().addr) || ''; },
 
           load() {
-            api.list = get(HUBS_LS_KEY, []);
-            api.currentId = loadJSON(CURR_HUB_LS_KEY, null);
+            this.list = loadJSON(HUBS_LS_KEY, []);
+            this.currentId = loadJSON(CURR_HUB_LS_KEY, null);
 
-            // First-run migration from single hub
-            if (!api.list.length) {
-              const legacy = localStorage.getItem(STORAGE.HUB) || localStorage.getItem(STORAGE.LEGACY_HUB) || '';
-              const def = { id: 'hub-default', name: 'Default', addr: legacy || '', addedAt: Date.now(), lastUsedAt: Date.now() };
-              api.list = [def];
-              api.currentId = def.id;
-              set(HUBS_LS_KEY, api.list);
-              saveJSON(CURR_HUB_LS_KEY, api.currentId);
-              // migrate sessions data into per-hub namespace
-              const raw = localStorage.getItem(STORAGE.SESS);
-              if (raw && !localStorage.getItem(sessionsKeyForHub(def.id))) {
-                localStorage.setItem(sessionsKeyForHub(def.id), raw);
+            // Hard drop any old 'hub-default' from prior builds
+            if (this.list.some(h => h.id === 'hub-default')) {
+              this.list = this.list.filter(h => h.id !== 'hub-default');
+              saveJSON(HUBS_LS_KEY, this.list);
+              if (this.currentId === 'hub-default') { this.currentId = null; saveJSON(CURR_HUB_LS_KEY, this.currentId); }
+            }
+
+            // Optionally import legacy hub (WITHOUT auto-creating a "Default")
+            if (!this.list.length) {
+              const legacy = (localStorage.getItem(STORAGE.HUB) || localStorage.getItem(STORAGE.LEGACY_HUB) || '').trim();
+              if (legacy && isNknAddr(legacy)) {
+                const id = `hub-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+                this.list = [{ id, name: 'Imported', addr: legacy, addedAt: Date.now(), lastUsedAt: Date.now() }];
+                this.currentId = id;
+                saveJSON(HUBS_LS_KEY, this.list);
+                saveJSON(CURR_HUB_LS_KEY, this.currentId);
               }
             }
 
-            // Ensure currentId valid
-            if (!api.list.some(h => h.id === api.currentId)) {
-              api.currentId = api.list[0]?.id || null;
-              saveJSON(CURR_HUB_LS_KEY, api.currentId);
+            // Ensure currentId valid (allow "no hub" state)
+            if (!this.list.some(h => h.id === this.currentId)) {
+              this.currentId = null;
+              saveJSON(CURR_HUB_LS_KEY, this.currentId);
             }
 
-            // Seed globals for compatibility even before applyToRuntime()
-            HUB_ADDR = api.currentAddr() || '';
+            // Seed globals even before applyToRuntime()
+            HUB_ADDR = this.current() ? this.current().addr : '';
             HUB_KEY = (HUB_ADDR.split('.')[1] || '').toLowerCase();
             window.HUB_ADDR = HUB_ADDR;
           },
@@ -1693,14 +1698,12 @@
           },
 
           applyToRuntime() {
-            const addr = api.currentAddr();
+            const addr = this.current() ? this.current().addr : '';
             HUB_ADDR = addr || '';
             HUB_KEY = (HUB_ADDR.split('.')[1] || '').toLowerCase();
             window.HUB_ADDR = HUB_ADDR;
-            ClockSync.reset();
-            setLatencyUI(null);
 
-            // ✅ reset model UI so we don’t show stale model list when hub changes
+            // Reset model UI so stale lists don't linger when hub changes or disappears
             try {
               const sel = el('modelSelect');
               if (sel) { sel.disabled = true; sel.classList.add('hide'); }
@@ -1708,18 +1711,19 @@
               window.modelsLoaded = false;
             } catch { }
 
-            // existing extras
             try { updateChips(); } catch { }
-            try { requestModelsList(true); } catch { }
 
-            // reconnect hooks if your app exposes them
-            try {
-              if (typeof window.setHubAddress === 'function') setHubAddress(HUB_ADDR);
-              else if (typeof window.reloadNKN === 'function') reloadNKN();
-              else if (typeof window.connectHub === 'function') connectHub(HUB_ADDR);
-              else if (typeof window.connectNKN === 'function') connectNKN();
-            } catch { }
-          },
+            if (HUB_ADDR) {
+              try { requestModelsList(true); } catch { }
+              try {
+                if (typeof window.setHubAddress === 'function') setHubAddress(HUB_ADDR);
+                else if (typeof window.reloadNKN === 'function') reloadNKN();
+                else if (typeof window.connectHub === 'function') connectHub(HUB_ADDR);
+                else if (typeof window.connectNKN === 'function') connectNKN();
+              } catch { }
+            }
+          }
+          ,
 
           // Monkey-patch session storage to be per-hub
           patchSessionStorage() {
@@ -1738,19 +1742,27 @@
           },
 
           loadSessionsIntoMemory() {
-            const arr = loadJSON(STORAGE.SESS, []); // hub-aware now
+            // No hub selected → keep sessions inert
+            if (!this.currentId) {
+              window.sessions = [];
+              window.activeSessionId = null;
+              try { if (typeof renderSessions === 'function') renderSessions(); } catch { }
+              try { if (typeof renderSystemEditor === 'function') renderSystemEditor(); } catch { }
+              try { if (typeof renderChat === 'function') renderChat(); } catch { }
+              return;
+            }
+
+            const arr = loadJSON(STORAGE.SESS, []); // hub-aware via _maybeReKey
             window.sessions = Array.isArray(arr) ? arr : [];
-            // pick a sensible active id
             window.activeSessionId = (window.sessions[0]?.id) || null;
 
-            // Re-render UI with sessions for THIS hub
             try { if (typeof renderSessions === 'function') renderSessions(); } catch { }
             try { if (typeof renderSystemEditor === 'function') renderSystemEditor(); } catch { }
             try { if (typeof renderChat === 'function') renderChat(); } catch { }
 
-            // Tell hub which session is open (if any)
-            try { const s = getSession && getSession(); if (s) sendSessionOpen(s, /*seed*/true); } catch { }
+            try { const s = (typeof getSession === 'function') && getSession(); if (s) sendSessionOpen(s, /*seed*/true); } catch { }
           }
+
         };
         return api;
       })();
@@ -1852,18 +1864,30 @@
           const hubs = HubManager.list;
           const curr = HubManager.currentId;
           sel.innerHTML = '';
-          hubs.forEach(h => {
+
+          if (!hubs.length) {
             const o = document.createElement('option');
-            o.value = h.id; o.textContent = h.name || h.addr || h.id;
-            if (h.id === curr) o.selected = true;
+            o.value = '';
+            o.textContent = '— Add a hub to start —';
+            o.disabled = true;
+            o.selected = true;
             sel.appendChild(o);
-          });
-          // onchange only once
+          } else {
+            hubs.forEach(h => {
+              const o = document.createElement('option');
+              o.value = h.id;
+              o.textContent = h.name || h.addr || h.id;
+              if (h.id === curr) o.selected = true;
+              sel.appendChild(o);
+            });
+          }
+
           if (!sel.__wired) {
             sel.addEventListener('change', () => HubManager.select(sel.value));
             sel.__wired = true;
           }
-        },
+        }
+        ,
         renderChips() {
           const list = el('hubList'); if (!list) return;
           list.innerHTML = '';
@@ -2224,6 +2248,7 @@
 
 
       // Try to update the UI list if you have a dedicated renderer; else fall back to re-render chat
+      // Replace your existing _applySessionTitle with this version
       function _applySessionTitle(sessId, newTitle) {
         const sess = getSession();
         if (!sess || sess.id !== sessId) return;
@@ -2231,6 +2256,9 @@
         // persist on session object
         sess.title = newTitle;
         sess._titleAt = Date.now();
+        // MARK: never auto-title this session again
+        sess._titleFinalized = true;
+
         try { saveJSON(STORAGE.SESS, sessions); } catch { }
 
         // if you have a dedicated session renderer, call it
@@ -2240,6 +2268,7 @@
         // otherwise re-render general UI
         try { renderChat(); } catch { }
       }
+
 
       // Build summary request payload
       function _summaryPayloadFrom(text) {
@@ -2280,24 +2309,40 @@
       // Public hook used by llm.done path (you already dispatch 'summary.request' there)
       window.enqueueSummary = function enqueueSummary(detail) {
         try {
-          const sess = getSession(); if (!sess) return;
-          if (detail && detail.aux === 'sysgen') return; // never name sessions from sysgen textarea
+          const sess = (typeof getSession === 'function') ? getSession() : null;
+          if (!sess) return;
+
+          // Ignore sysgen textarea runs
+          if (detail && detail.aux === 'sysgen') return;
+
+          // If we've already titled this session, never run again
+          if (sess._titleFinalized) return;
+
+          // Only run after the FIRST assistant message is completed
+          // Count assistant messages with non-empty content
+          const assistantMsgs = Array.isArray(sess.messages)
+            ? sess.messages.filter(m => m && m.role === 'assistant' && String(m.content || '').trim().length > 0)
+            : [];
+          if (assistantMsgs.length !== 1) return;  // gate: only the very first interaction
 
           const text = (detail && detail.text) || '';
           if (!text) return;
 
+          // Lightweight dedupe using a stable hash of the text
           const h = _hash32(text);
-          if (sess._lastTitleHash === h) return; // de-dupe identical content
+          if (sess._lastTitleHash === h) return; // already queued/finalized for this exact text
 
-          // Debounce per-session
-          if (_summaryQueue.has(sess.id)) clearTimeout(_summaryQueue.get(sess.id));
+          // Debounce per-session: avoid spamming if multiple signals fire in quick succession
+          if (window.__summaryQueue == null) window.__summaryQueue = new Map();
+          if (window.__summaryQueue.has(sess.id)) clearTimeout(window.__summaryQueue.get(sess.id));
           const tid = setTimeout(() => {
-            _summaryQueue.delete(sess.id);
+            window.__summaryQueue.delete(sess.id);
             _runSessionSummary(sess.id, text, h);
-          }, 180); // small debounce window
-          _summaryQueue.set(sess.id, tid);
-        } catch { }
+          }, 180);
+          window.__summaryQueue.set(sess.id, tid);
+        } catch { /* no-op */ }
       };
+
 
       // Fallback global listener in case you prefer event wiring
       window.addEventListener('summary.request', (ev) => {
@@ -2309,6 +2354,15 @@
       // Core: fire non-stream request and apply the returned title
       function _runSessionSummary(sessId, text, hashVal) {
         const sess = getSession(); if (!sess || sess.id !== sessId) return;
+
+        // Do not proceed if title already finalized
+        if (sess._titleFinalized) return;
+
+        // Defensive: ensure we're still on the FIRST assistant turn
+        const assistantMsgs = Array.isArray(sess.messages)
+          ? sess.messages.filter(m => m && m.role === 'assistant' && String(m.content || '').trim().length > 0)
+          : [];
+        if (assistantMsgs.length !== 1) return;
 
         // Guard: don’t re-run too often if user keeps typing
         const now = Date.now();
@@ -2325,26 +2379,32 @@
             const title = _cleanTitle(raw);
             if (!title) return;
 
-            // Commit only if session still matches
             const cur = getSession();
             if (!cur || cur.id !== sessId) return;
 
             cur._lastTitleHash = hashVal;
-            _applySessionTitle(sessId, title);
+            _applySessionTitle(sessId, title); // <- also sets _titleFinalized = true
           }
         };
 
-        // ship it
         requestLLM(payload, route);
       }
+
 
       // Convenience: kick a summary manually (e.g., after importing history)
       window.requestSessionTitleSummaryNow = function () {
         const sess = getSession(); if (!sess) return;
-        // Build a concise text from recent messages (assistant-first)
+        if (sess._titleFinalized) return;
+
+        const assistantMsgs = Array.isArray(sess.messages)
+          ? sess.messages.filter(m => m && m.role === 'assistant' && String(m.content || '').trim().length > 0)
+          : [];
+        if (assistantMsgs.length !== 1) return; // only first turn
+
+        // Build concise text from recent messages (assistant-first)
         let t = '';
         try {
-          const msgs = (sess.messages || []).slice(-6); // last few turns
+          const msgs = (sess.messages || []).slice(-6);
           const parts = [];
           for (let i = 0; i < msgs.length; i++) {
             const m = msgs[i];
@@ -2354,11 +2414,12 @@
               if (c) parts.push((m.role === 'user' ? 'Q: ' : 'A: ') + c);
             }
           }
-          t = parts.join('\n').slice(0, 2000); // cap input
+          t = parts.join('\n').slice(0, 2000);
         } catch { }
         if (!t) return;
         enqueueSummary({ id: 'manual', text: t, aux: 'manual' });
       };
+
 
       function getSession(id = activeSessionId) { return sessions.find(x => x.id === id) || null; }
       function setActiveSession(id) {
@@ -5292,7 +5353,16 @@ ${META_END}`;
           return;
         }
 
-        const s = getSession(); if (!s) { alert('Choose a model first.'); return; }
+        const s = getSession(); if (!s) {
+          const sel = el('modelSelect');
+          const model = sel && sel.value;
+          if (!modelsLoaded || !model || sel.disabled || /loading|no models/i.test(String(sel.options[0]?.text || ''))) {
+            alert('Models are not ready yet. Please wait for the list to load.');
+            return;
+          }
+          createSessionForModel(model); // creates under *current hub*
+          getSession();
+        }
         const text = el('prompt').value;
         if (!text.trim() && pendingImages.length === 0) return;
 
@@ -5430,6 +5500,16 @@ ${META_END}`;
       el('backdrop').onclick = toggleSidebar;
       el('toggleSidebar').onclick = toggleSidebar;
 
+      function connectIfHubSelected() {
+        if (HUB_ADDR) {
+          connectNKN();
+        } else {
+          setConn('');            // neutral status
+          setPeersUI(null);
+          setLatencyUI(null);
+          setModelsUIState(false);
+        }
+      }
 
       // Boot
       function boot() {
@@ -5668,7 +5748,7 @@ ${META_END}`;
         if (activeSessionId) setActiveSession(activeSessionId);
 
         // Kick off NKN connect; onConnect() will fetch models for the current hub
-        connectNKN();
+        connectIfHubSelected();
       }
 
       // Boot exactly once
