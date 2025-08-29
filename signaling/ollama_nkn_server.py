@@ -2469,7 +2469,7 @@ def _handle_dm(src_addr: str, body: dict):
             }
             rid = _start_llm(src_addr, req_body, on_start=on_start, on_delta=on_delta_fn, on_done=on_done_fn)
 
-            _log("llm.start", f"{src_addr} sid={sid} id={rid} api={api} model={s.model} stream={stream}")
+            _log("llm.start", f"{src_addr} sid={sid} id={rid} api={api} model={s.model} stream={stream} think={think_flag}")
             return
         else:
             top_msgs = body.get("messages")
