@@ -170,22 +170,26 @@ const MAX_QUEUE   = parseInt(process.env.NKN_MAX_QUEUE || '4000', 10);
 const HEAP_SOFT   = parseInt(process.env.NKN_HEAP_SOFT_MB || '640', 10);
 const HEAP_HARD   = parseInt(process.env.NKN_HEAP_HARD_MB || '896', 10);
 
-/* Drain behavior */
+// Drain behavior
 const DRAIN_BASE_BATCH = parseInt(process.env.NKN_DRAIN_BASE || '192', 10);
 const DRAIN_MAX_BATCH  = parseInt(process.env.NKN_DRAIN_MAX_BATCH || '1536', 10);
 const CATCHUP_AGE_MS   = parseInt(process.env.NKN_CATCHUP_AGE_MS || '500', 10);
-const SEND_CONCURRENCY = parseInt(process.env.NKN_SEND_CONC || '1', 10);
+// 🔧 was '1' — this starves the pump
+const SEND_CONCURRENCY = parseInt(process.env.NKN_SEND_CONC || '16', 10);
 
-/* Coalescing / payload sizing */
+// Coalescing / payload sizing
 const COALESCE_HEAD       = (process.env.NKN_COALESCE_HEAD || '0') !== '0';
 const COALESCE_MAX_COUNT  = parseInt(process.env.NKN_COALESCE_MAX_COUNT || '9999999', 10);
-/* FIX: give a numeric default (e.g., 1 MiB) — not 'str(...)' */
-const COALESCE_MAX_BYTES  = parseInt(process.env.NKN_COALESCE_MAX_BYTES || '880000', 10);
-const COALESCE_MAX_AGE_MS = parseInt(process.env.NKN_COALESCE_MAX_AGE_MS || '40', 10);
+// keep safe < 1MB including envelope; 900k avoids re-sends on some relays
+const COALESCE_MAX_BYTES  = parseInt(process.env.NKN_COALESCE_MAX_BYTES || '900000', 10);
+// 🔧 widen the window; 40ms is too twitchy
+const COALESCE_MAX_AGE_MS = parseInt(process.env.NKN_COALESCE_MAX_AGE_MS || '250', 10);
+// go "force" coalesce on backlog even if head is fresh
+const COALESCE_BACKLOG_TRIGGER = parseInt(process.env.NKN_COALESCE_BACKLOG || '256', 10);
 const DYNAMIC_COALESCE_LAT_MS = parseInt(process.env.NKN_COALESCE_LAT_MS || '1000', 10);
 
-/* Safety cap for NKN payloads; envelope headroom for JSON */
-const MAX_PAYLOAD_BYTES = Number(process.env.NKN_MAX_PAYLOAD_BYTES ?? 950_000); // < 1MB
+// Safety cap for NKN payloads; envelope headroom for JSON
+const MAX_PAYLOAD_BYTES = Number(process.env.NKN_MAX_PAYLOAD_BYTES ?? 900_000);
 const ENVELOPE_OVERHEAD = 512;
 
 /* Send defaults */
@@ -249,8 +253,8 @@ function tryCoalesceHead(force = false) {
   const startTs = d0.gen_ts || Date.now();
 
   const countLimit = force ? Number.POSITIVE_INFINITY : COALESCE_MAX_COUNT;
-  const hardCap    = Math.min(COALESCE_MAX_BYTES || MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES - ENVELOPE_OVERHEAD);
-  const byteLimit  = force ? hardCap : hardCap;
+const hardCap = Math.min(COALESCE_MAX_BYTES || MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES - ENVELOPE_OVERHEAD);
+const byteLimit = force ? hardCap : hardCap;
 
   let bytes = jsonSizeBytes(d0);
   let count = 1;
@@ -365,7 +369,9 @@ async function drain(client) {
   const headTs = (queue[0] && queue[0].data && (queue[0].data.gen_ts || queue[0].data.ts)) || now;
   const age = Math.max(0, now - headTs);
   const backlog = queue.length;
-  const severe = (age >= DYNAMIC_COALESCE_LAT_MS);
+  // 🔧 previously only age; add backlog trigger
+  const severe = (age >= DYNAMIC_COALESCE_LAT_MS) || (backlog >= COALESCE_BACKLOG_TRIGGER);
+
 
   // Adaptive take size
   let take = DRAIN_BASE_BATCH;
@@ -570,23 +576,71 @@ async function kickDrain() {
   }
 })();
 """
+# ──────────────────────────────────────────────────────────────────────
+# IV. Node NKN bridge (DM-first; hardened sends) + watchdog
+# ──────────────────────────────────────────────────────────────────────
+NODE_DIR = BASE_DIR / "bridge-node"
+NODE_BIN = shutil.which("node")
+NPM_BIN  = shutil.which("npm")
+if not NODE_BIN or not NPM_BIN:
+    sys.exit("‼️  Node.js and npm are required for the NKN bridge. Install Node 18+.")
 
+BRIDGE_JS = NODE_DIR / "nkn_bridge.js"
+PKG_JSON  = NODE_DIR / "package.json"
+
+if not NODE_DIR.exists():
+    NODE_DIR.mkdir(parents=True)
+if not PKG_JSON.exists():
+    print("→ Initializing bridge-node …")
+    subprocess.check_call([NPM_BIN, "init", "-y"], cwd=NODE_DIR)
+    subprocess.check_call([NPM_BIN, "install", "nkn-sdk@^1.3.6"], cwd=NODE_DIR)
+
+# Refresh bridge source if needed
 if not BRIDGE_JS.exists() or BRIDGE_JS.read_text() != BRIDGE_SRC:
     BRIDGE_JS.write_text(BRIDGE_SRC)
 
+# ── Bridge env (tuned for backlog coalescing) ─────────────────────────
 bridge_env = os.environ.copy()
 bridge_env["NKN_SEED_HEX"]       = NKN_SEED_HEX
 bridge_env["NKN_TOPIC_PREFIX"]   = TOPIC_PREFIX
 bridge_env["NKN_NUM_SUBCLIENTS"] = str(NKN_NUM_SUBCLIENTS)
 
-# Bridge process + watchdog state
+# Queue & memory
+bridge_env["NKN_MAX_QUEUE"]     = os.environ.get("NKN_MAX_QUEUE", "4000")
+bridge_env["NKN_HEAP_SOFT_MB"]  = os.environ.get("NKN_HEAP_SOFT_MB", "640")
+bridge_env["NKN_HEAP_HARD_MB"]  = os.environ.get("NKN_HEAP_HARD_MB", "896")
+
+# Drain behavior (moderate parallelism; avoid per-send thrash)
+bridge_env["NKN_DRAIN_BASE"]       = os.environ.get("NKN_DRAIN_BASE", "192")
+bridge_env["NKN_DRAIN_MAX_BATCH"]  = os.environ.get("NKN_DRAIN_MAX_BATCH", "2048")
+bridge_env["NKN_CATCHUP_AGE_MS"]   = os.environ.get("NKN_CATCHUP_AGE_MS", "500")
+bridge_env["NKN_SEND_CONC"]        = os.environ.get("NKN_SEND_CONC", "4")   # ↓ from 16
+
+# Coalescing — IMPORTANT:
+#  - Remove age as a limiter (set huge), so backlog can merge immediately.
+#  - Enter “severe” (force merge) quickly so we bulk on backlog instead of dribbling.
+bridge_env["NKN_COALESCE_HEAD"]       = os.environ.get("NKN_COALESCE_HEAD", "1")
+bridge_env["NKN_COALESCE_MAX_COUNT"]  = os.environ.get("NKN_COALESCE_MAX_COUNT", "9999999")
+bridge_env["NKN_COALESCE_MAX_BYTES"]  = os.environ.get("NKN_COALESCE_MAX_BYTES", "720000")   # ~700–720 KB
+bridge_env["NKN_COALESCE_MAX_AGE_MS"] = os.environ.get("NKN_COALESCE_MAX_AGE_MS", "10000")   # effectively off
+bridge_env["NKN_COALESCE_LAT_MS"]     = os.environ.get("NKN_COALESCE_LAT_MS", "80")          # severe much sooner
+
+# Payload cap with JSON headroom; keep below NKN/WS 1MB
+bridge_env["NKN_MAX_PAYLOAD_BYTES"] = os.environ.get("NKN_MAX_PAYLOAD_BYTES", "760000")
+
+# Node options
+node_opts = bridge_env.get("NODE_OPTIONS", "")
+extra = "--unhandled-rejections=strict --heapsnapshot-signal=SIGUSR2 --max-old-space-size=1024"
+bridge_env["NODE_OPTIONS"] = (node_opts + " " + extra).strip()
+
+# Bridge process + watchdog state (unchanged)
 bridge = None
 state: Dict[str, Any] = {"nkn_address": None, "topic_prefix": TOPIC_PREFIX}
 _last_hb = 0.0
 _ready_at = 0.0
 _bridge_starts = 0
 _bridge_lock = threading.Lock()
-_bridge_write_lock = threading.Lock()  # ← serialize writes to child stdin
+_bridge_write_lock = threading.Lock()
 _last_restart_ts = 0.0
 _FORCE_RESTART = False
 _CRIT_ERR_PATTERNS = (
@@ -596,30 +650,32 @@ _CRIT_ERR_PATTERNS = (
     "node::Abort()",
     "v8::internal::V8::FatalProcessOutOfMemory",
 )
-# Track websocket flap storms (repeated 'wsclosed' events) so we can restart proactively
 _ws_flap_times: List[float] = []
 _ws_flap_lock = threading.Lock()
-WS_FLAP_WINDOW = 60.0   # seconds to look back
-WS_FLAP_MAX = 6         # restart if >= this many wsclosed in window
-# ---- memory/backpressure tuning for the Node bridge
-bridge_env["NKN_MAX_QUEUE"]     = os.environ.get("NKN_MAX_QUEUE", "4000")   # max pending sends
-bridge_env["NKN_HEAP_SOFT_MB"]  = os.environ.get("NKN_HEAP_SOFT_MB", "640") # attempt GC, trim queue
-bridge_env["NKN_HEAP_HARD_MB"]  = os.environ.get("NKN_HEAP_HARD_MB", "896") # exit → watchdog restarts
-# Make crashes predictable & fast; expose GC so bridge can try to recover before restart
-node_opts = bridge_env.get("NODE_OPTIONS", "")
-extra = "--unhandled-rejections=strict --heapsnapshot-signal=SIGUSR2 --max-old-space-size=1024"
-bridge_env["NODE_OPTIONS"] = (node_opts + " " + extra).strip()
+WS_FLAP_WINDOW = 60.0
+WS_FLAP_MAX = 6
 
 def _spawn_bridge() -> Popen:
     global _last_hb, _ready_at, _bridge_starts
     _last_hb = time.time()
     _ready_at = 0.0
     _bridge_starts += 1
-    proc = Popen([str(shutil.which("node")), str(BRIDGE_JS)],
-                 cwd=NODE_DIR, env=bridge_env,
-                 stdin=PIPE, stdout=PIPE, stderr=PIPE,
-                 text=True, bufsize=1)
+    proc = Popen(
+        [str(shutil.which("node")), str(BRIDGE_JS)],
+        cwd=NODE_DIR, env=bridge_env,
+        stdin=PIPE, stdout=PIPE, stderr=PIPE,
+        text=True, bufsize=1
+    )
     setattr(proc, "start_time", time.time())
+    try:
+        print("→ bridge env:",
+              f"queue={bridge_env['NKN_MAX_QUEUE']}, conc={bridge_env['NKN_SEND_CONC']}, "
+              f"bulk_max={bridge_env['NKN_COALESCE_MAX_BYTES']}, "
+              f"cap={bridge_env['NKN_MAX_PAYLOAD_BYTES']}, "
+              f"coalesce_age={bridge_env['NKN_COALESCE_MAX_AGE_MS']}, "
+              f"severe_lat={bridge_env['NKN_COALESCE_LAT_MS']}")
+    except Exception:
+        pass
     return proc
 
 def _bridge_send(obj: dict):
@@ -651,16 +707,17 @@ def _bridge_reader_stdout():
             except Exception:
                 continue
 
-            if msg.get("type") == "ready":
+            t = msg.get("type")
+            if t == "ready":
                 addr = msg.get("address")
                 if state.get("nkn_address") == addr and _ready_at > 0:
-                    continue  # ← ignore duplicate ready
+                    continue
                 state["nkn_address"]  = addr
                 state["topic_prefix"] = msg.get("topicPrefix") or TOPIC_PREFIX
                 _ready_at = time.time()
                 print(f"→ NKN ready: {state['nkn_address']}  (topics prefix: {state['topic_prefix']})")
 
-            elif msg.get("type") == "hb":
+            elif t == "hb":
                 _last_hb = time.time()
                 try:
                     state["bridge_ready"] = bool(msg.get("ready"))
@@ -670,7 +727,7 @@ def _bridge_reader_stdout():
                 except Exception:
                     pass
 
-            elif msg.get("type") == "wsclosed":
+            elif t == "wsclosed":
                 print("⚠️ bridge reported wsclosed — pausing sends until reconnect …")
                 try:
                     now = time.time()
@@ -682,20 +739,20 @@ def _bridge_reader_stdout():
                 except Exception:
                     pass
 
-            elif msg.get("type") == "nkn-dm":
+            elif t == "nkn-dm":
                 src = msg.get("src") or ""
                 body = msg.get("msg") or {}
                 _handle_dm(src, body)
 
-            elif msg.get("type") in ("queue.drop", "queue.trim"):
+            elif t in ("queue.drop", "queue.trim"):
                 mb = msg.get("mb")
                 if mb is not None:
-                    print(f"⚠️ bridge backpressure: {msg['type']} drop={msg.get('drop')} q={msg.get('q')} mb={mb}")
+                    print(f"⚠️ bridge backpressure: {t} drop={msg.get('drop')} q={msg.get('q')} mb={mb}")
                 else:
-                    print(f"⚠️ bridge backpressure: {msg['type']} drop={msg.get('drop')} q={msg.get('q')}")
+                    print(f"⚠️ bridge backpressure: {t} drop={msg.get('drop')} q={msg.get('q')}")
 
-            elif msg.get("type") in ("crit.heap", "crit.uncaught", "crit.unhandled"):
-                print(f"‼️ bridge critical: {msg.get('type')} mb={msg.get('mb')} q={msg.get('q')}")
+            elif t in ("crit.heap", "crit.uncaught", "crit.unhandled"):
+                print(f"‼️ bridge critical: {t} mb={msg.get('mb')} q={msg.get('q')}")
                 globals()["_FORCE_RESTART"] = True
         except Exception:
             time.sleep(0.2)
@@ -782,6 +839,8 @@ with _bridge_lock:
 threading.Thread(target=_bridge_reader_stdout, daemon=True).start()
 threading.Thread(target=_bridge_reader_stderr, daemon=True).start()
 threading.Thread(target=_watchdog_loop, daemon=True).start()
+
+
 
 def _shutdown(*_):
     try: bridge.terminate()

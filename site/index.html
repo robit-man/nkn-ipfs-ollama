@@ -4208,46 +4208,42 @@ ${META_END}`;
           return true;
         }
 
-        // ─────────────────── Coalesced head (server sent llm.bulk) ───────────────────
-        if (ev === 'llm.bulk') {
-          const id = body.id;
-          const items = Array.isArray(body.items) ? body.items.slice() : [];
-          if (!id || !items.length) return true;
+// NEW: accept bulk frames anywhere in the stream
+if (ev === 'llm.bulk') {
+  const { id, items = [], last_seq, first_seq } = body || {};
+  if (!id || !items.length) return true;
 
-          if (statsLatencyActive) updateLatencyFromStatsEnvelope(body);
+  // latency updates (optional/best-effort)
+  if (useStatsLatency && statsLatencyActive) {
+    updateLatencyFromStatsEnvelope(body);
+    // also peek into the last item; it’s closest to "now"
+    const tail = items[items.length - 1];
+    if (tail) {
+      updateLatencyFromStatsEnvelope(tail);
+      if (tail.data) updateLatencyFromStatsEnvelope(tail.data);
+    }
+  }
 
-          // sort just in case
-          items.sort((a, b) => ((a?.seq | 0) - (b?.seq | 0)));
+  // replay each original chunk through the exact same path
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i] || {};
+    const seq = (typeof it.seq === 'number') ? it.seq
+               : (typeof first_seq === 'number') ? (first_seq + i)
+               : null;
+    if (seq == null) continue;
 
-          let maxSeq = 0;
-          for (const it of items) {
-            if (!it || it.event !== 'llm.chunk') continue;
+    // keep ack accounting happy (single pending window)
+    ackNote(id, seq);
+    handleChunk(id, seq, it.data ?? it);
+  }
 
-            if (statsLatencyActive) {
-              updateLatencyFromStatsEnvelope(it);
-              updateLatencyFromStatsEnvelope(it.data || {});
-            }
+  // single ack keeps the server window draining aggressively
+  if (typeof last_seq === 'number') {
+    sendAck(id, last_seq);
+  }
+  return true;
+}
 
-            const seq = it.seq | 0;
-            if (!seq) continue;
-
-            // 1) note RECEIVE immediately (keeps server window draining)
-            ackNote(id, seq);
-
-            // 2) render
-            handleChunk(id, seq, it.data);
-
-            // 3) note RENDERED (lets backend leave freeze mode)
-            if (hasAckRendered) ackRendered(id, seq);
-
-            if (seq > maxSeq) maxSeq = seq;
-          }
-
-          // high-water ACK
-          const hi = Number.isInteger(body.last_seq) ? body.last_seq : maxSeq;
-          if (hi) sendAck(id, hi); // your sendAck should include clientNow; see note below
-          return true;
-        }
 
         if (ev === 'llm.chunk') {
           if (statsLatencyActive) {
