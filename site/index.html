@@ -162,10 +162,10 @@
       align-items: center;
       flex-flow: row;
       gap: 0.5rem;
-      height: 4rem;
+      height: 3.5rem;
       overflow: auto;
       max-width: 100vw;
-      padding: 10px var(--pad);
+      padding: 0.5rem;
       background: #000;
       position: relative;
       top: 0;
@@ -193,12 +193,13 @@
       padding: 8px 10px;
       border-radius: 8px;
       height: 38px;
-      max-width: calc(100vw - 168px);
+      max-width: 200px;
     }
 
     .topbar-select option {
       font-size: 1rem;
       text-transform: capitalize;
+
 
     }
 
@@ -263,6 +264,7 @@
       flex-direction: column;
       min-width: 0;
       z-index: 21;
+      width: 400px;
 
     }
 
@@ -393,7 +395,8 @@
       overflow: auto;
       padding: 16px;
       max-height: calc(100vh - 124px);
-      scroll-behavior: smooth
+      scroll-behavior: smooth;
+      padding-top: 3.5rem;
     }
 
     .msg {
@@ -631,6 +634,11 @@
     #modelCaps {
       margin-right: auto;
       display: none;
+      margin: 0.5rem;
+      z-index: 10;
+      position: absolute;
+      top: 0px;
+      right: 0px;
     }
 
     .thumb {
@@ -672,7 +680,7 @@
       bottom: 0px;
       left: 0px;
       width: 100vw;
-      height: calc(100vh - 4rem);
+      height: calc(100vh - 3.5rem);
       position: relative;
       box-sizing: border-box;
 
@@ -760,7 +768,7 @@
       display: flex;
       flex-direction: column;
       gap: 6px;
-      margin-bottom: 10px
+      margin-bottom: 0.5rem;
     }
 
     .text {
@@ -797,6 +805,31 @@
       justify-content: space-between;
       margin-bottom: 0.5rem;
       gap: 0.5rem;
+    }
+
+    .hub-chip {
+      width: 100%;
+      overflow: hidden;
+      display: inline-flex;
+      align-items: center;
+      padding: 8px 10px;
+      border: 1px solid #2a2a2a;
+      height: 2.4rem;
+      border-radius: 8px;
+      color: #eaeaea;
+      background: #0a0a0a;
+    }
+
+    .hub-chip>span {
+
+      text-overflow: ellipsis;
+      overflow: hidden;
+    }
+
+    #hubList{
+      margin-bottom:0.5rem;
+      display:flex;flex-flow:column;
+      gap:0.5rem;
     }
 
     .header-data-row {
@@ -900,6 +933,28 @@
         bottom: 0px;
       }
 
+      .chat {
+        padding-top: 2.8rem;
+      }
+
+      #modelCaps {
+        margin-right: auto;
+        margin: 0.5rem;
+        z-index: 10;
+        position: absolute;
+        top: 0px;
+        right: unset;
+        left: 0px;
+        max-width: 100vw;
+        overflow: auto;
+      }
+
+      #modelCaps>.chip {
+        font-size: 0.6rem;
+        line-height: 0.6rem;
+        height: 1.8rem;
+      }
+
       #backdrop {
         height: 100vh;
         position: absolute;
@@ -910,9 +965,6 @@
         z-index: -1;
       }
 
-      #modelCaps {
-        display: none !important;
-      }
 
       .settings-data-row {
         display: flex;
@@ -922,9 +974,6 @@
         gap: 0.5rem;
       }
 
-      .header-data-row {
-        display: none;
-      }
     }
   </style>
 </head>
@@ -969,6 +1018,10 @@
       </div>
 
       <!-- The select stays in DOM; we will move it next to #statusRow and hide it until models are ready -->
+      <select id="hubs" class="topbar-select" title="Available hubs">
+        <option style="text-align:center;">Loading Hubs</option>
+      </select>
+      <!-- The select stays in DOM; we will move it next to #statusRow and hide it until models are ready -->
       <select id="modelSelect" class="topbar-select" title="Available models" disabled>
         <option style="text-align:center;">Loading Models</option>
       </select>
@@ -979,7 +1032,6 @@
           <div id="latent" class="chip" title="Round‑trip latency to the hub">Latency</div>
         </div>
 
-        <div id="modelCaps" class="row"></div>
 
       </div>
 
@@ -1002,6 +1054,7 @@
       </aside>
 
       <main class="col-main">
+        <div id="modelCaps" class="row"></div>
 
         <div id="chat" class="chat"></div>
 
@@ -1095,6 +1148,10 @@
       <div class="field">
         <label>Hub address (signaling server) <span class="muted">(identifier.publicKeyHex64)</span></label>
         <input id="hubInput" class="text" placeholder="e.g. hub.0123abcd…64hex" spellcheck="false" />
+      </div>
+
+      <div id="hubList">
+
       </div>
 
       <div class="chiprow">
@@ -1234,10 +1291,14 @@
       // mark the singleton as alive early to prevent re-entry
       window[SINGLETON_KEY] = { alive: true, booted: false, api: null };
       // -------------------------------------------------------------------------
+
+      // Keep a canonical mutable HUB_ADDR/HUB_KEY visible everywhere
+      let HUB_ADDR = '';
+      let HUB_KEY = '';
+
       // ===== DEBUG / Packet instrumentation (drop-in) ============================
       const LS_KEY = 'DEBUG_PKT';
       const INIT_DEBUG = (localStorage.getItem(LS_KEY) ?? '0') !== '0'; // default OFF; use window.togglePkt(true) to enable
-
 
       const DEBUG = {
         ON: INIT_DEBUG,           // toggle with window.togglePkt(true|false)
@@ -1356,7 +1417,6 @@
         }
       }
 
-
       function logRecvPacket(src, raw, body) {
         if (!DEBUG.ON) return;
         const ev = body?.event || '—';
@@ -1387,24 +1447,17 @@
         console.groupEnd();
       }
 
-
       function warnIfLargeFrame(obj, where = '') {
         const bytes = byteLenOfJSON(obj);
         if (bytes > DEBUG.WARN_FRAME_LIMIT) {
           console.warn(`⚠️ Large frame (${humanBytes(bytes)}) at ${where}`, (obj?.event || obj?.api || ''));
         }
       }
-
-
       // expose for quick toggling / stats in console
       window._PKT = { DEBUG, STATS, helpers: { humanBytes, byteLenOfJSON, approxB64ToBinLen } };
       window.togglePkt = (on) => { DEBUG.ON = !!on; localStorage.setItem(LS_KEY, DEBUG.ON ? '1' : '0'); console.log('[debug-pkt]', DEBUG.ON ? 'ON' : 'OFF'); };
       window.dumpPktStats = function () {
-        console.table({
-          sends: STATS.sends, recvs: STATS.recvs,
-          sendBytes: STATS.sendBytes, recvBytes: STATS.recvBytes,
-          maxSend: STATS.maxSend, maxRecv: STATS.maxRecv
-        });
+        console.table({ sends: STATS.sends, recvs: STATS.recvs, sendBytes: STATS.sendBytes, recvBytes: STATS.recvBytes, maxSend: STATS.maxSend, maxRecv: STATS.maxRecv });
       };
       window.togglePkt(false);                  // fully off, or
       window._PKT && (window._PKT.DEBUG.LOG_STREAM_EVERY_N = 16); // log every 16th chunk
@@ -1424,14 +1477,11 @@
       const debounce = (fn, ms = 300) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
       // Markdown + code highlighting setup (safer: no raw HTML, safe links)
-      // Markdown + code highlighting setup (safer: no raw HTML, safe links)
       marked.setOptions({ gfm: true, breaks: true, headerIds: false, mangle: false });
       marked.use({
-        // drop any raw HTML tokens entirely
         renderer: {
           html() { return ''; },
           link(href, title, text) {
-            // allow only http(s) and mailto; everything else becomes a harmless "#"
             const safe = /^(https?:|mailto:)/i.test(href || '') ? href : '#';
             const esc = (s = '') => String(s).replace(/"/g, '&quot;');
             const t = title ? ` title="${esc(title)}"` : '';
@@ -1440,35 +1490,64 @@
         }
       });
       function mdToHtml(s) { try { return marked.parse(String(s || '')); } catch { return String(s || ''); } }
-
       function highlightIn(node) { try { node.querySelectorAll('pre code').forEach(block => { try { hljs.highlightElement(block); } catch { } }); } catch { } }
 
+      // ─────────── Storage keys
       const STORAGE = {
-        SESS: 'CLIENT_SESSIONS_V2',
+        SESS: 'CLIENT_SESSIONS_V2',         // (transparently namespaced per hub)
         SETTINGS: 'CLIENT_SETTINGS_V2',
         SEED: 'CLIENT_SEED_HEX_V2',
-        HUB: 'CLIENT_HUB_ADDR_V2',
+        HUB: 'CLIENT_HUB_ADDR_V2',          // legacy single-hub (used for migration)
         LEGACY_SEED: 'PEERBALLS_SEED_HEX',
         LEGACY_HUB: 'PEERBALLS_HUB_ADDR',
-        LAST_MODEL: 'CLIENT_LAST_SELECTED_MODEL_V2',
-        MODELINFO: 'CLIENT_MODEL_INFO_CACHE_V1'      // ← NEW
+        LAST_MODEL: 'CLIENT_LAST_SELECTED_MODEL_V2', // will be per-hub via helper
+        MODELINFO: 'CLIENT_MODEL_INFO_CACHE_V1'
       };
+      // Multi-hub keys
+      const HUBS_LS_KEY = 'CLIENT_HUBS_V1';       // array of {id, addr, name, addedAt, lastUsedAt}
+      const CURR_HUB_LS_KEY = 'CLIENT_CURR_HUB_V1';
 
-
-      function loadJSON(key, fallback) {
-        try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch { return fallback; }
+      // --- Storage helpers (hub-aware for sessions only)
+      function sessionsKeyForHubId(hid) {
+        return `${STORAGE.SESS}::${hid || 'hub-default'}`;
       }
-      function saveJSON(key, val) { localStorage.setItem(key, JSON.stringify(val)); }
+      function _maybeReKey(key) {
+        if (key === STORAGE.SESS) {
+          // Defer lookup so HubManager is already constructed when called
+          const hid = (typeof HubManager?.currentId === 'string' && HubManager.currentId) ? HubManager.currentId : 'hub-default';
+          return sessionsKeyForHubId(hid);
+        }
+        return key;
+      }
+      function loadJSON(key, fallback) {
+        try {
+          const k = _maybeReKey(key);
+          const raw = localStorage.getItem(k);
+          if (raw != null) return JSON.parse(raw);
+          // one-time legacy fallback for sessions
+          if (key === STORAGE.SESS) {
+            const legacy = localStorage.getItem(STORAGE.SESS);
+            if (legacy != null) {
+              localStorage.setItem(k, legacy);
+              return JSON.parse(legacy);
+            }
+          }
+          return fallback;
+        } catch { return fallback; }
+      }
+      function saveJSON(key, val) {
+        const k = _maybeReKey(key);
+        localStorage.setItem(k, JSON.stringify(val));
+      }
 
-      // ── Model info cache (caps etc.) ──────────────────────────────────────────
+
+      // ── Model info cache (caps etc.)
       const MODEL_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
       const MODEL_CACHE_MAX = 50;
-
       let modelInfoCache = loadJSON(STORAGE.MODELINFO, {}); // { [model]: { ...info, _cachedAt } }
 
       function cacheSetModelInfo(model, info) {
         if (!model || !info) return;
-        // keep it lean: store only what we render / use
         const slim = {
           name: info.name || model,
           format: info.format || null,
@@ -1480,19 +1559,15 @@
           _cachedAt: Date.now()
         };
         modelInfoCache[model] = slim;
-
-        // LRU-ish cap
         const keys = Object.keys(modelInfoCache);
         if (keys.length > MODEL_CACHE_MAX) {
-          keys
-            .map(k => [k, modelInfoCache[k]?._cachedAt || 0])
+          keys.map(k => [k, modelInfoCache[k]?._cachedAt || 0])
             .sort((a, b) => a[1] - b[1])
             .slice(0, keys.length - MODEL_CACHE_MAX)
             .forEach(([k]) => delete modelInfoCache[k]);
         }
         saveJSON(STORAGE.MODELINFO, modelInfoCache);
       }
-
       function cacheGetModelInfo(model) {
         const rec = modelInfoCache && modelInfoCache[model];
         if (!rec) return null;
@@ -1503,7 +1578,6 @@
         }
         return rec;
       }
-
       function tryRenderModelInfoFromCache(model) {
         const row = el('modelCaps'); if (row) { row.style.display = 'flex'; }
         const info = cacheGetModelInfo(model);
@@ -1514,29 +1588,188 @@
         return true;
       }
 
-
+      // ─────────── Identity
       const toHex = buf => Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
       function getOrCreateSeed() {
         let hex = localStorage.getItem(STORAGE.SEED) || localStorage.getItem(STORAGE.LEGACY_SEED);
         if (/^[0-9a-f]{64}$/.test(hex || '')) return hex;
         const r = new Uint8Array(32); crypto.getRandomValues(r); hex = toHex(r);
-        localStorage.setItem(STORAGE.SEED, hex); return hex;
+        localStorage.setItem(STORAGE.SEED, hex);
+        return hex;
       }
 
-      // Settings
+      // ─────────── Multi-Hub Manager (sessions per hub)
+      const HubManager = (() => {
+        const get = (k, d) => loadJSON(k, d);
+        const set = (k, v) => saveJSON(k, v);
+
+        const sessionsKeyForHub = (hid) => `${STORAGE.SESS}::${hid}`;
+
+        const api = {
+          list: [],
+          currentId: null,
+          __patched: false,
+
+          current() { return api.list.find(h => h.id === api.currentId) || null; },
+          currentAddr() { return (api.current() && api.current().addr) || ''; },
+
+          load() {
+            api.list = get(HUBS_LS_KEY, []);
+            api.currentId = loadJSON(CURR_HUB_LS_KEY, null);
+
+            // First-run migration from single hub
+            if (!api.list.length) {
+              const legacy = localStorage.getItem(STORAGE.HUB) || localStorage.getItem(STORAGE.LEGACY_HUB) || '';
+              const def = { id: 'hub-default', name: 'Default', addr: legacy || '', addedAt: Date.now(), lastUsedAt: Date.now() };
+              api.list = [def];
+              api.currentId = def.id;
+              set(HUBS_LS_KEY, api.list);
+              saveJSON(CURR_HUB_LS_KEY, api.currentId);
+              // migrate sessions data into per-hub namespace
+              const raw = localStorage.getItem(STORAGE.SESS);
+              if (raw && !localStorage.getItem(sessionsKeyForHub(def.id))) {
+                localStorage.setItem(sessionsKeyForHub(def.id), raw);
+              }
+            }
+
+            // Ensure currentId valid
+            if (!api.list.some(h => h.id === api.currentId)) {
+              api.currentId = api.list[0]?.id || null;
+              saveJSON(CURR_HUB_LS_KEY, api.currentId);
+            }
+
+            // Seed globals for compatibility even before applyToRuntime()
+            HUB_ADDR = api.currentAddr() || '';
+            HUB_KEY = (HUB_ADDR.split('.')[1] || '').toLowerCase();
+            window.HUB_ADDR = HUB_ADDR;
+          },
+
+          save() {
+            set(HUBS_LS_KEY, api.list);
+            saveJSON(CURR_HUB_LS_KEY, api.currentId);
+          },
+
+          add(addr, name) {
+            addr = String(addr || '').trim();
+            name = String(name || '').trim() || addr || `Hub ${api.list.length + 1}`;
+            if (!addr || !isNknAddr(addr)) return { ok: false, reason: 'invalid' };
+            const exists = api.list.find(h => h.addr === addr);
+            if (exists) {
+              api.select(exists.id);
+              return { ok: true, id: exists.id, existed: true };
+            }
+            const id = `hub-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+            api.list.push({ id, name, addr, addedAt: Date.now(), lastUsedAt: Date.now() });
+            api.currentId = id;
+            api.save();
+            api.applyToRuntime();
+            api.loadSessionsIntoMemory();
+            HubUI.renderAll();
+            return { ok: true, id };
+          },
+
+          remove(id) {
+            if (api.list.length <= 1) return false;
+            const idx = api.list.findIndex(h => h.id === id);
+            if (idx < 0) return false;
+            const wasCurr = (api.currentId === id);
+            api.list.splice(idx, 1);
+            if (wasCurr) api.currentId = api.list[0]?.id || null;
+            api.save();
+            api.applyToRuntime();
+            api.loadSessionsIntoMemory();
+            HubUI.renderAll();
+            return true;
+          },
+
+          select(id) {
+            const h = api.list.find(x => x.id === id); if (!h) return false;
+            api.currentId = id; h.lastUsedAt = Date.now();
+            api.save();
+            api.applyToRuntime();
+            api.loadSessionsIntoMemory();
+            HubUI.renderAll();
+            return true;
+          },
+
+          applyToRuntime() {
+            const addr = api.currentAddr();
+            HUB_ADDR = addr || '';
+            HUB_KEY = (HUB_ADDR.split('.')[1] || '').toLowerCase();
+            window.HUB_ADDR = HUB_ADDR;
+            ClockSync.reset();
+            setLatencyUI(null);
+
+            // ✅ reset model UI so we don’t show stale model list when hub changes
+            try {
+              const sel = el('modelSelect');
+              if (sel) { sel.disabled = true; sel.classList.add('hide'); }
+              if (typeof showModelDropdown === 'function') showModelDropdown(false);
+              window.modelsLoaded = false;
+            } catch { }
+
+            // existing extras
+            try { updateChips(); } catch { }
+            try { requestModelsList(true); } catch { }
+
+            // reconnect hooks if your app exposes them
+            try {
+              if (typeof window.setHubAddress === 'function') setHubAddress(HUB_ADDR);
+              else if (typeof window.reloadNKN === 'function') reloadNKN();
+              else if (typeof window.connectHub === 'function') connectHub(HUB_ADDR);
+              else if (typeof window.connectNKN === 'function') connectNKN();
+            } catch { }
+          },
+
+          // Monkey-patch session storage to be per-hub
+          patchSessionStorage() {
+            if (api.__patched) return;
+            const __save = window.saveJSON;
+            const __load = window.loadJSON;
+            window.saveJSON = function (key, value) {
+              if (key === STORAGE.SESS) key = sessionsKeyForHub(api.currentId);
+              return __save(key, value);
+            };
+            window.loadJSON = function (key, def) {
+              if (key === STORAGE.SESS) key = sessionsKeyForHub(api.currentId);
+              return __load(key, def);
+            };
+            api.__patched = true;
+          },
+
+          loadSessionsIntoMemory() {
+            const arr = loadJSON(STORAGE.SESS, []); // hub-aware now
+            window.sessions = Array.isArray(arr) ? arr : [];
+            // pick a sensible active id
+            window.activeSessionId = (window.sessions[0]?.id) || null;
+
+            // Re-render UI with sessions for THIS hub
+            try { if (typeof renderSessions === 'function') renderSessions(); } catch { }
+            try { if (typeof renderSystemEditor === 'function') renderSystemEditor(); } catch { }
+            try { if (typeof renderChat === 'function') renderChat(); } catch { }
+
+            // Tell hub which session is open (if any)
+            try { const s = getSession && getSession(); if (s) sendSessionOpen(s, /*seed*/true); } catch { }
+          }
+        };
+        return api;
+      })();
+
+      // ─────────── Settings (non-hub fields remain here)
       const settings = (() => {
         const defaultHub = localStorage.getItem(STORAGE.HUB) || localStorage.getItem(STORAGE.LEGACY_HUB) || '';
         return loadJSON(STORAGE.SETTINGS, {
-          hub: defaultHub,
+          hub: defaultHub,       // legacy field; no longer authoritative once hubs list exists
           temperature: 0.2,
           top_p: 0.9,
           seed: 0,
           num_ctx: 4096,
           stream: true,
-          peers: 4,           // ← NEW: target subclients
+          peers: 4,              // target subclients
         });
       })();
-      // --- URL param → hub (supports ?hub=… or #hub=… and aliases) ---
+
+      // URL param → hub (kept for convenience; if valid, we add/select it)
       function getUrlHubParam() {
         const tryRead = (sp) => sp.get('hub') || sp.get('nkn') || sp.get('signaling') || sp.get('signal');
         let v = '';
@@ -1549,9 +1782,8 @@
       function applyHubFromUrl() {
         const h = getUrlHubParam();
         if (h && isNknAddr(h)) {
-          settings.hub = h;
-          saveJSON(STORAGE.SETTINGS, settings);
-          localStorage.setItem(STORAGE.HUB, h);
+          // add/select into hubs rather than mutating settings directly
+          HubManager.add(h, 'URL hub');
           try {
             const url = new URL(location.href);
             ['hub', 'nkn', 'signaling', 'signal'].forEach(k => url.searchParams.delete(k));
@@ -1561,84 +1793,130 @@
       }
 
       function updateSettingsUI() {
-        el('hubInput').value = settings.hub || '';
-        el('optTemperature').value = settings.temperature;
-        el('optTopP').value = settings.top_p;
-        el('optSeed').value = settings.seed;
-        el('optNumCtx').value = settings.num_ctx;
-        el('optStream').checked = !!settings.stream;
-        const p = Number(settings.peers || 6);
+        // show current hub in the input as a convenience for adding/editing
+        const currAddr = HubManager.currentAddr() || settings.hub || '';
+        if (el('hubInput')) el('hubInput').value = currAddr;
+
+        if (el('optTemperature')) el('optTemperature').value = settings.temperature;
+        if (el('optTopP')) el('optTopP').value = settings.top_p;
+        if (el('optSeed')) el('optSeed').value = settings.seed;
+        if (el('optNumCtx')) el('optNumCtx').value = settings.num_ctx;
+        if (el('optStream')) el('optStream').checked = !!settings.stream;
+        const p = Number(settings.peers || 4);
         const peersBox = el('optPeers'); if (peersBox) peersBox.value = Math.max(1, Math.min(12, p));
+
+        // render hub select + chips
+        HubUI.renderAll();
       }
 
       function saveSettingsFromUI() {
-        const prevHub = settings.hub;
         const prevPeers = Number(settings.peers || 4);
 
-        const hub = el('hubInput').value.trim();
-        if (!isNknAddr(hub)) { alert('Invalid hub address'); return false; }
-
-        settings.hub = hub;
-        settings.temperature = parseFloat(el('optTemperature').value || '0') || 0;
-        settings.top_p = parseFloat(el('optTopP').value || '1') || 1;
-        settings.seed = parseInt(el('optSeed').value || '0', 10) || 0;
-        settings.num_ctx = parseInt(el('optNumCtx').value || '4096', 10) || 4096;
-        settings.stream = !!el('optStream').checked;
+        // Temperature et al.
+        settings.temperature = parseFloat(el('optTemperature')?.value || '0') || 0;
+        settings.top_p = parseFloat(el('optTopP')?.value || '1') || 1;
+        settings.seed = parseInt(el('optSeed')?.value || '0', 10) || 0;
+        settings.num_ctx = parseInt(el('optNumCtx')?.value || '4096', 10) || 4096;
+        settings.stream = !!el('optStream')?.checked;
 
         const peersBox = el('optPeers');
         const newPeers = Math.max(1, Math.min(12, parseInt(peersBox?.value || '4', 10) || 4));
         settings.peers = newPeers;
 
-        saveJSON(STORAGE.SETTINGS, settings);
-        localStorage.setItem(STORAGE.HUB, settings.hub);
+        // If user typed a hub and hits Save, treat it as "add/update"
+        const maybeHub = (el('hubInput')?.value || '').trim();
+        if (maybeHub && isNknAddr(maybeHub)) {
+          HubManager.add(maybeHub, '');
+        }
 
-        // If hub or peer target changed, reconnect to apply
-        if (prevHub !== settings.hub || prevPeers !== newPeers) {
+        saveJSON(STORAGE.SETTINGS, settings);
+
+        // If peers changed, reconnect to apply
+        if (prevPeers !== newPeers) {
           try { client && client.close && client.close(); } catch { }
-          client = null;
-          isConnected = false;
-          connectNKN();
+          window.client = null;
+          window.isConnected = false;
+          try { connectNKN && connectNKN(); } catch { }
           return false;
         }
 
-        const s = getSession(); if (s) sendSessionOpen(s, /*seed*/false);
+        try { const s = getSession && getSession(); if (s) sendSessionOpen(s, /*seed*/false); } catch { }
         return true;
       }
 
-      // Sessions
-      let sessions = loadJSON(STORAGE.SESS, []);
 
-      // ── MIGRATION: normalize any message roles that were accidentally set to the model name.
-      (function migrateSessionRoles() {
-        let dirty = false;
-        for (const s of (sessions || [])) {
-          for (const m of (s?.messages || [])) {
-            // Keep a copy of the old value if it wasn't one of the canonical roles
-            if (m && typeof m.role === 'string' &&
-              m.role !== 'user' && m.role !== 'assistant' && m.role !== 'system') {
-              // Preserve who answered (for display/debug) without breaking role semantics
-              if (!m.agent) m.agent = m.role; // e.g., "gemma3:4b"
-              m.role = 'assistant';
-              dirty = true;
-            }
+      // ─────────── Hub UI wiring (#hubInput, #hubList, #hubs)
+      const HubUI = {
+        renderSelect() {
+          const sel = el('hubs'); if (!sel) return;
+          const hubs = HubManager.list;
+          const curr = HubManager.currentId;
+          sel.innerHTML = '';
+          hubs.forEach(h => {
+            const o = document.createElement('option');
+            o.value = h.id; o.textContent = h.name || h.addr || h.id;
+            if (h.id === curr) o.selected = true;
+            sel.appendChild(o);
+          });
+          // onchange only once
+          if (!sel.__wired) {
+            sel.addEventListener('change', () => HubManager.select(sel.value));
+            sel.__wired = true;
           }
+        },
+        renderChips() {
+          const list = el('hubList'); if (!list) return;
+          list.innerHTML = '';
+          HubManager.list.forEach(h => {
+            const chip = document.createElement('div');
+            chip.className = 'hub-chip';
+            chip.style.cssText = '';
+            const span = document.createElement('span');
+            span.textContent = h.name || h.addr || h.id;
+            const x = document.createElement('button');
+            x.textContent = '×';
+            x.title = 'Remove';
+            x.style.cssText = 'border:none;background:transparent;color:#fff;cursor:pointer;font-size:14px;line-height:1;';
+            x.onclick = () => {
+              if (confirm('Remove this hub? Sessions stay saved under its key.')) HubManager.remove(h.id);
+            };
+            chip.onclick = (e) => {
+              if (e.target === x) return; // avoid double
+              HubManager.select(h.id);
+              const sel = el('hubs'); if (sel) sel.value = h.id;
+            };
+            chip.appendChild(span); chip.appendChild(x);
+            list.appendChild(chip);
+          });
+        },
+        wireInput() {
+          const inp = el('hubInput'); if (!inp || inp.__wired) return;
+          inp.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+              const v = (inp.value || '').trim();
+              if (!isNknAddr(v)) { alert('Invalid hub address'); return; }
+              const res = HubManager.add(v, '');
+              if (!res.ok) alert('Could not add hub.');
+              inp.value = '';
+            }
+          });
+          inp.__wired = true;
+        },
+        renderAll() {
+          this.wireInput();
+          this.renderSelect();
+          this.renderChips();
         }
-        if (dirty) saveJSON(STORAGE.SESS, sessions);
-      })();
+      };
 
-      let activeSessionId = (sessions[0]?.id) || null;
-
-      // ── Blob upload (chunked) ─────────────────────────────────────────────
+      // ─────────── Blob upload (unchanged, but now sends to current HUB_ADDR)
       const PACK_INLINE_MAX = 120 * 1024;
       // Keep each websocket frame <= ~64 KiB including JSON + base64 overhead to avoid WS closes.
       const BLOB_CHUNK_SIZE = 32 * 1024;   // 32 KiB raw → ~43.7 KiB base64
       let BLOB_WINDOW = 1;                  // keep concurrency low; we'll cap it to at most 2
-
-      // NEW: how long we wait before re-nudging the hub if no accept/acks
       const UPLOAD_ACCEPT_TIMEOUT_MS = 2000;
 
-      const uploads = new Map(); // blobId -> { file, name, mime, size, total, chunkSize, nextSeq, inflight:Set, acked:Set, done, readyRef, sha256?, startedAt }
-
+      const uploads = new Map(); // blobId -> { ... }
       let pendingBlobRefs = [];  // refs ready to use in next message (e.g. ['blob:...'])
 
       function abToBase64(buf) {
@@ -1649,11 +1927,13 @@
         return btoa(binary);
       }
 
-      const getSavedModel = () => localStorage.getItem(STORAGE.LAST_MODEL) || (sessions[0]?.model || '');
-      const setSavedModel = (m) => { if (m) localStorage.setItem(STORAGE.LAST_MODEL, m); };
+      // Per-hub "last model" helpers
+      const lastModelKey = () => `${STORAGE.LAST_MODEL}::${HubManager.currentId || 'default'}`;
+      const getSavedModel = () => localStorage.getItem(lastModelKey()) || (window.sessions[0]?.model || '');
+      const setSavedModel = (m) => { if (m) localStorage.setItem(lastModelKey(), m); };
 
       function getCurrentModel() {
-        const s = getSession();
+        const s = getSession && getSession();
         const candidate =
           (s && s.model) ||
           (el('modelSelect') && el('modelSelect').value) ||
@@ -1661,6 +1941,7 @@
           '';
         return isValidModelName(candidate) ? candidate : '';
       }
+
       function looksLikeModels(x) {
         const d = x?.data ?? x;
         return Array.isArray(d) ||
@@ -1806,7 +2087,6 @@
         const up = uploads.get(id); if (!up) return;
         if (up.retryTicker) { clearInterval(up.retryTicker); up.retryTicker = null; }
 
-
         up.retryTicker = setInterval(() => {
           if (!up.uploading || up.done) return;
 
@@ -1861,7 +2141,7 @@
             window: (up.window || BLOB_WINDOW)
           });
 
-          // Fine‑grained warning if frame looks large
+          // Fine-grained warning if frame looks large
           const jbytes = (window._PKT && _PKT.helpers) ? _PKT.helpers.byteLenOfJSON(wire) : JSON.stringify(wire).length;
           if (jbytes > (window._PKT?.DEBUG?.WARN_FRAME_LIMIT ?? 65536)) {
             console.warn('⚠️ blob.part JSON frame close to/over limit', { id, seq, jbytes });
@@ -1884,8 +2164,9 @@
         }
       }
 
-
       function newId(prefix = 'id') { return prefix + '-' + Math.random().toString(16).slice(2) + Date.now().toString(36); }
+
+      // Create a new session under the CURRENT hub (namespaced storage)
       function createSessionForModel(model) {
         if (!modelsLoaded || !isValidModelName(model)) {
           console.warn('[session] blocked: model list not ready or invalid model:', model);
@@ -1893,19 +2174,27 @@
           return;
         }
         const id = newId('sess');
-        const s = { id, title: model, model, system: '', createdAt: Date.now(), messages: [] };
+        const s = {
+          id,
+          hubId: HubManager.currentId,      // ← tie to hub (metadata)
+          title: model,
+          model,
+          system: '',
+          createdAt: Date.now(),
+          messages: []
+        };
         sessions.unshift(s);
         activeSessionId = id;
-        saveJSON(STORAGE.SESS, sessions);
+        saveJSON(STORAGE.SESS, sessions);   // ← transparently namespaced via patch
         setSavedModel(model);
 
-        renderSessions();
-        renderSystemEditor();
-        renderChat();
-        sendSessionOpen(s, /*seed*/true);
+        renderSessions && renderSessions();
+        renderSystemEditor && renderSystemEditor();
+        renderChat && renderChat();
+        try { sendSessionOpen(s, /*seed*/true); } catch { }
 
         // prime the UI + cache
-        updateModelInfo(model);
+        updateModelInfo && updateModelInfo(model);
       }
 
       // Cheap stable 32-bit string hash for dedupe
@@ -1932,6 +2221,7 @@
         if (t.length > 72) t = t.slice(0, 72).trim();
         return t;
       }
+
 
       // Try to update the UI list if you have a dedicated renderer; else fall back to re-render chat
       function _applySessionTitle(sessId, newTitle) {
@@ -2174,6 +2464,50 @@
         updateSysMetaButtons();
       }
 
+      // NTP-style clock offset estimator (best-of samples, smoothed)
+      const ClockSync = (() => {
+        const MAX = 8;
+        let samples = [];            // { off, rtt, at }
+        let offset = 0;
+        let have = false;
+
+        function noteSample(serverMs, t0, t1) {
+          // serverMs must be epoch ms; t0/t1 are local epoch ms at send/recv
+          if (!Number.isFinite(serverMs) || !Number.isFinite(t0) || !Number.isFinite(t1)) return;
+          const rtt = Math.max(0, t1 - t0);
+          if (rtt > 5000) return;    // ignore tab-sleep outliers
+          const off = serverMs - ((t0 + t1) / 2); // NTP offset estimate
+          samples.push({ off, rtt, at: Date.now() });
+          if (samples.length > MAX) samples.shift();
+
+          // choose the smallest-RTT sample (most symmetric path)
+          const best = samples.reduce((a, b) => b.rtt < a.rtt ? b : a, samples[0]);
+          // light EWMA so we don’t jump around
+          offset = have ? (0.15 * best.off + 0.85 * offset) : best.off;
+          have = true;
+        }
+
+        function toLocal(remoteEpochMs) {
+          return Number.isFinite(remoteEpochMs) ? (remoteEpochMs - offset) : null;
+        }
+
+        function reset() { samples = []; offset = 0; have = false; }
+
+        return {
+          noteSample, toLocal, reset,
+          get have() { return have; }, get offset() { return offset; }
+        };
+      })();
+
+      function handlePong(body) {
+        const t0 = Number(body?.ts) || lastPingSentAt || 0;   // our send time (echoed)
+        const t1 = Date.now();                                // our receive time
+        const srv = _coerceMs(body?.server_ts || body?.server_time || body?.time);
+        if (Number.isFinite(srv)) ClockSync.noteSample(srv, t0, t1);
+
+        const rtt = Math.max(0, t1 - t0);
+        if (rtt <= 5000) { lastPongAt = t1; latencyMs = rtt; setLatencyUI(rtt); }
+      }
 
       // ── Sticky autoscroll manager ───────────────────────────────────────────────
       const StickyScroll = (() => {
@@ -2368,39 +2702,34 @@
         chat.appendChild(w);
         chat.scrollTop = chat.scrollHeight;
       }
-
       function setStreamingContent(id, fullText) {
-        // If the stream has ended, ignore late writes
         if (!streams.has(id) && id !== currentStreamId && id !== pendingStreamId) return;
 
         let w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`);
         let c = w && w.querySelector('#streamContent');
         if (!c) {
-          // create if needed (preserves your current call sites)
           addStreamingAssistantBubble(id);
           w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`);
           c = w && w.querySelector('#streamContent');
           if (!c) return;
         }
 
-        // read previous length to compute delta; store the new full text for final format pass
         const prevLen = Number(c.dataset.len || 0);
         const text = String(fullText || '');
         const nextLen = text.length;
 
         if (nextLen > prevLen) {
           const delta = text.slice(prevLen);
-          // ultra-cheap append: text node only
           c.appendChild(document.createTextNode(delta));
           c.dataset.len = String(nextLen);
-          c.dataset.raw = text;            // keep the whole thing for final markdown
-          // keep viewport following naturally
+          c.dataset.raw = text;
           const container = c.closest('.chat') || c.parentElement;
           if (container && typeof container.scrollTop === 'number') {
             container.scrollTop = container.scrollHeight;
           }
         }
       }
+
       function finishStreamingBubble(id) {
         const w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`) ||
           document.querySelector('.msg.assistant[data-stream="1"]');
@@ -2410,10 +2739,9 @@
         const c = w.querySelector('#streamContent') || w.querySelector('.content');
         if (!c) return;
 
-        // Only now run markdown + highlight (heavy work happens exactly once)
         const raw = c.dataset.raw || c.textContent || '';
         c.innerHTML = mdToHtml(raw);
-        try { highlightIn(c); } catch { /* noop */ }
+        try { highlightIn(c); } catch { }
 
         c.removeAttribute('id');
         c.removeAttribute('data-mode');
@@ -2421,8 +2749,9 @@
         c.removeAttribute('data-raw');
 
         w.dataset.stream = '0';
-        if (meta) { _setStreamMeta(id, 'done'); }   // preserves your TPS/meta behavior
+        if (meta) { _setStreamMeta(id, 'done'); }
       }
+
 
 
       function setStreamingContent(id, text) {
@@ -2434,7 +2763,6 @@
         if (!c) {
           // Only create a bubble if the stream is still active/pending
           if (!streams.has(id) && pendingStreamId !== id) return;
-          addStreamingAssistantBubble(id);
           w = document.querySelector(`.msg.assistant[data-stream-id="${id}"]`);
           c = w && w.querySelector('#streamContent');
         }
@@ -2716,7 +3044,7 @@ ${META_END}`;
 
       let latestPeersCount = null;
       let peersPollTimer = null;
-      const PEERS_POLL_MS = 5000;       // ask hub every 5s for peers
+      const PEERS_POLL_MS = 1000;       // ask hub every 5s for peers
 
       // ───────────────────── NKN peers UI (count of ready subclients) ─────────────────────
       let peersTicker = null;
@@ -2725,7 +3053,7 @@ ${META_END}`;
       let statsLatencyActive = false;        // toggled on llm.start/llm.done
       let lastStatsRecvAt = 0;               // when we last updated latency from stats
       const STATS_STALENESS_MS = 3000;       // if no stats for this long, allow ctrl pings again
-      const LATENCY_UI_MIN_INTERVAL = 120;       // throttle UI updates
+      const LATENCY_UI_MIN_INTERVAL = 200;       // throttle UI updates
       let _lastLatencyUIAt = 0;
 
       function _coerceMs(t) {
@@ -2769,19 +3097,24 @@ ${META_END}`;
       }
 
       function updateLatencyFromStatsEnvelope(envelope) {
-        const ts = _findRemoteTsDeep(envelope);
-        if (!ts) return;
+        if (!statsLatencyActive || envelope?.id !== currentStreamId) return;
 
-        const now = Date.now();
-        const ms = Math.max(0, Math.min(90000, now - ts));
+        // pull a remote epoch-ms timestamp from known spots
+        const tsRemote = _findRemoteTsDeep(envelope); // returns epoch ms or null
+        if (!Number.isFinite(tsRemote) || !ClockSync.have) return; // no offset → ignore
 
-        // UI throttle
-        if (now - _lastLatencyUIAt < LATENCY_UI_MIN_INTERVAL) return;
-        _lastLatencyUIAt = now;
+        const tsLocal = ClockSync.toLocal(tsRemote);
+        if (!Number.isFinite(tsLocal)) return;
 
-        lastStatsRecvAt = now;
-        setLatencyUI(ms); // uses your EWMA + chip coloring
+        const ms = Date.now() - tsLocal;
+
+        // discard skew / buffered frames
+        if (ms < 0 || ms > 2000) return;
+
+        lastStatsRecvAt = Date.now();
+        setLatencyUI(ms);
       }
+
 
       function _parseRemoteTs(o) {
         // accept common server timestamp keys; seconds or millis
@@ -2793,29 +3126,21 @@ ${META_END}`;
         if (t < 1e11) t = t * 1000; // seconds → ms
         return t;
       }
-      function updateLatencyFromStatsEnvelope(envelope) {
-        const remoteMs = _parseRemoteTs(envelope);
-        if (!remoteMs) return;
-        const ms = Math.max(0, Math.min(90000, Date.now() - remoteMs));
-        lastStatsRecvAt = Date.now();
-        setLatencyUI(ms); // reuse your existing EWMA + coloring
-      }
 
       function setPeersUI(n) {
-        let slot = document.getElementById('peers');
-        let slot2 = document.getElementById('peers2');
-        if (!slot) {
-          const host = document.getElementById('statusRow') || document.querySelector('header');
-          slot = document.createElement('span');
-          slot.id = 'peers';
-          slot.className = 'muted';
-          slot.style.marginLeft = '8px';
-          if (host) host.appendChild(slot);
+        const slot = document.getElementById('peers');
+        const slot2 = document.getElementById('peers2');
+        if (!slot && !slot2) return;
+
+        if (n == null) {
+          if (slot) { slot.textContent = ''; }
+          if (slot2) { slot2.textContent = ''; }
+          return;
         }
-        if (n == null) { slot.textContent = ''; return; }   // ← NEW: hide when unknown
         const num = Math.max(0, Number(n) || 0);
-        slot.textContent = `${num} peer${num === 1 ? '' : 's'}`;
-        slot2.textContent = `${num} peer${num === 1 ? '' : 's'}`;
+        const txt = `${num} peer${num === 1 ? '' : 's'}`;
+        if (slot) slot.textContent = txt;
+        if (slot2) slot2.textContent = txt;
       }
 
 
@@ -3212,8 +3537,6 @@ ${META_END}`;
 
       // ─────────── NKN (robust MultiClient + your message contract)
       let client = null, myAddr = null;
-      let HUB_ADDR = settings.hub || '';
-      let HUB_KEY = (HUB_ADDR.split('.')[1] || '').toLowerCase();   // <— NEW
 
       const linkConnected = `<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
 <path d="M14 7H16C18.7614 7 21 9.23858 21 12C21 14.7614 18.7614 17 16 17H14M10 7H8C5.23858 7 3 9.23858 3 12C3 14.7614 5.23858 17 8 17H10M8 12H16" stroke="#00ff00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -3571,7 +3894,6 @@ ${META_END}`;
             _setStreamMeta(id, 'streaming…'); // updates bubble header immediately
           }
 
-
           st.onChunk(part);
           st.next++;
         }
@@ -3667,7 +3989,6 @@ ${META_END}`;
         trySend(HUB_ADDR, { event: 'llm.request', id: lastModelsReqId, api: 'list', stream: false });
         trySend(HUB_ADDR, { event: 'ctrl.request', op: 'models', id: lastModelsReqId });
       }
-
 
 
       function populateModels(modelsLike) {
@@ -3884,8 +4205,6 @@ ${META_END}`;
         });
       }
 
-
-
       // Build history for seeding (exclude 'system'; it's sent separately)
       function buildHistoryForSession(sess) {
         const HISTORY_SEED_LIMIT = 16;         // max messages to seed
@@ -3926,7 +4245,7 @@ ${META_END}`;
 
       // Back off: let the SDK handle path rotation & reconnects.
       // We only intervene if we miss multiple pongs *and* all subclients are 0 for a while.
-      const HEARTBEAT_MS = 100;                // ping every 6s (tolerant of timer clamping)
+      const HEARTBEAT_MS = 500;                // ping every 6s (tolerant of timer clamping)
       const MISSED_PONG_LIMIT = 4;              // ~24s of missed pongs before we consider action
       const PEERS_ZERO_GRACE_MS = 12000;        // require peers==0 for at least 12s too
       let hbTimer = null;
@@ -4319,6 +4638,7 @@ ${META_END}`;
         // Not handled here
         return false;
       }
+
       /* ----- DATA handler (llm streams/results/errors unrelated to models) ----- */
       function onInboundData(ev, body, srcStr) {
         const route = routeFor(body.id);
@@ -4905,11 +5225,20 @@ ${META_END}`;
 
       function extractDelta(part) {
         if (!part) return '';
-        if (part.message && typeof part.message.content === 'string') return part.message.content;
+        // common shapes
         if (typeof part.delta === 'string') return part.delta;
         if (typeof part.text === 'string') return part.text;
-        const ch = part.choices?.[0];
-        if (typeof ch?.delta?.content === 'string') return ch.delta.content;
+
+        // nested
+        const d = part.data || part.message || {};
+        if (typeof d.delta === 'string') return d.delta;
+        if (typeof d.text === 'string') return d.text;
+        if (typeof d.content === 'string') return d.content;
+
+        // OpenAI-ish
+        const ch = part.choices && part.choices[0];
+        if (ch && ch.delta && typeof ch.delta.content === 'string') return ch.delta.content;
+
         return '';
       }
       function extractFull(data) {
@@ -5101,8 +5430,18 @@ ${META_END}`;
       el('backdrop').onclick = toggleSidebar;
       el('toggleSidebar').onclick = toggleSidebar;
 
+
       // Boot
       function boot() {
+        // ── 0) Initialize hubs + per-hub session storage FIRST
+        //     (so everything else — UI, sessions, connects — is scoped to the selected hub)
+        HubManager.load();                 // load hubs list + currentId (migrates legacy if needed)
+        applyHubFromUrl();                 // allow ?hub=... to add/select a hub
+        HubManager.applyToRuntime();       // sets HUB_ADDR/HUB_KEY globals + triggers model refresh hooks
+        HubManager.loadSessionsIntoMemory(); // loads sessions for current hub and re-renders UI
+        HubUI.renderAll();                 // populate <select id="hubs"> and hub chips
+
+        // Connection UI baseline
         setConn(); // clears blue & hides label
 
         // Move the model select next to status + keep it hidden until we truly have models
@@ -5169,10 +5508,9 @@ ${META_END}`;
           const s = getSession();
           if (!s) { alert('Create/select a session first.'); return; }
           s.system = el('systemMsg').value || '';
-          saveJSON(STORAGE.SESS, sessions);
+          saveJSON(STORAGE.SESS, sessions);   // per-hub because of patchSessionStorage()
           sendSessionOpen(s, /*seed*/false);
         };
-
 
         // --- System metadata toggles wiring ---
         updateSysMetaButtons();
@@ -5202,7 +5540,6 @@ ${META_END}`;
           applySystemMeta(true);
         };
 
-
         // Attach button opens file picker
         el('attachBtn').onclick = () => { const fi = el('fileInput'); if (fi) fi.click(); };
 
@@ -5229,7 +5566,7 @@ ${META_END}`;
                   fr.onerror = rej; fr.readAsDataURL(f.slice(0, 200 * 1024));
                 });
 
-                const blobId = await stageBlob(f); // ← stage only, no network
+                const blobId = await stageBlob(f); // stage only, no network
                 pendingImages.push({
                   name: f.name,
                   size: f.size,
@@ -5238,7 +5575,7 @@ ${META_END}`;
                   big: true,
                   blobId,
                   pct: 0,
-                  staged: true,   // ← NEW: used by UI to show "staged"
+                  staged: true,
                   fp
                 });
                 renderAttachments();
@@ -5259,15 +5596,12 @@ ${META_END}`;
           }
         });
 
-
-        // Apply hub from URL before anything else that depends on it
-        applyHubFromUrl();
-
+        // (we already did applyHubFromUrl + HubManager.applyToRuntime above)
+        // Render UI now that hub & sessions are in place
         renderSessions(); renderSystemEditor(); renderChat(); updateSettingsUI();
 
-        // Ensure HUB_ADDR reflects (possibly updated) settings.hub
-        HUB_ADDR = settings.hub || '';
-        HUB_KEY = (HUB_ADDR.split('.')[1] || '').toLowerCase();  // <— NEW
+        // DO NOT overwrite HUB_ADDR from legacy settings; it’s owned by HubManager now.
+        // updateChips can still reflect current address:
         updateChips();
 
         // Wire inputs
@@ -5289,7 +5623,7 @@ ${META_END}`;
         el('backdropModal').onclick = closeSettings;
         el('saveSettings').onclick = () => { if (saveSettingsFromUI()) { closeSettings(); } };
 
-        // NEW: reset local NKN key and reconnect (no full reload needed)
+        // Reset local NKN key and reconnect
         (() => {
           const btn = el('resetKeyBtn');
           if (!btn) return;
@@ -5301,10 +5635,12 @@ ${META_END}`;
             myAddr = null;
             updateChips();
             setConn(RECONNECTING_HTML);
-            connectNKN();
+            connectNKN(); // will use current HUB_ADDR
           };
         })();
 
+        try { HubUI.renderAll(); } catch { }   // keep hub UI fresh if elements mounted late
+        try { updateSettingsUI(); } catch { }
 
         // Disallow creating a session until models have actually loaded
         const newBtn = el('newSessionBtn');
@@ -5317,7 +5653,7 @@ ${META_END}`;
               alert('Models are not ready yet. Please wait for the list to load.');
               return;
             }
-            createSessionForModel(model);
+            createSessionForModel(model); // creates under *current hub*
           };
         }
 
@@ -5331,9 +5667,10 @@ ${META_END}`;
         // Keep existing session selection behavior
         if (activeSessionId) setActiveSession(activeSessionId);
 
-        // Kick off NKN connect; onConnect()
+        // Kick off NKN connect; onConnect() will fetch models for the current hub
         connectNKN();
       }
+
       // Boot exactly once
       if (!window[SINGLETON_KEY].booted) {
         boot();
@@ -5346,6 +5683,7 @@ ${META_END}`;
         getSession,
         setActiveSession
       });
+
     })();
   </script>
 
