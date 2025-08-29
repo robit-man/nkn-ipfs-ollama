@@ -1908,6 +1908,168 @@
         updateModelInfo(model);
       }
 
+      // Cheap stable 32-bit string hash for dedupe
+      function _hash32(str) {
+        let h = 2166136261 >>> 0;
+        for (let i = 0; i < str.length; i++) {
+          h ^= str.charCodeAt(i);
+          h = Math.imul(h, 16777619);
+        }
+        return (h >>> 0);
+      }
+
+      // Sanitize the model output into a clean title
+      function _cleanTitle(s) {
+        if (!s) return '';
+        let t = String(s).trim();
+        // take only first line, strip quotes/backticks and trailing punctuation
+        t = t.split(/\r?\n/)[0].trim();
+        t = t.replace(/^['"`\u2018\u2019\u201C\u201D]+|['"`\u2018\u2019\u201C\u201D]+$/g, '');
+        t = t.replace(/[.!?…\s]+$/g, '');
+        // collapse whitespace
+        t = t.replace(/\s+/g, ' ');
+        // limit length hard just in case
+        if (t.length > 72) t = t.slice(0, 72).trim();
+        return t;
+      }
+
+      // Try to update the UI list if you have a dedicated renderer; else fall back to re-render chat
+      function _applySessionTitle(sessId, newTitle) {
+        const sess = getSession();
+        if (!sess || sess.id !== sessId) return;
+
+        // persist on session object
+        sess.title = newTitle;
+        sess._titleAt = Date.now();
+        try { saveJSON(STORAGE.SESS, sessions); } catch { }
+
+        // if you have a dedicated session renderer, call it
+        if (typeof renderSessions === 'function') {
+          try { renderSessions(); return; } catch { }
+        }
+        // otherwise re-render general UI
+        try { renderChat(); } catch { }
+      }
+
+      // Build summary request payload
+      function _summaryPayloadFrom(text) {
+        const model = getCurrentModel();
+        const messages = [
+          { role: 'system', content: TITLE_SUMMARY_PROMPT },
+          { role: 'user', content: text }
+        ];
+        return {
+          event: 'llm.request',
+          id: newId('sum'),
+          api: 'chat',
+          model,
+          stream: false, // callback path; we only need a single short result
+          messages,
+          kwargs: { options: Object.assign({}, currentOptions?.() || {}, { temperature: 0.2 }) },
+          aux: 'autosummary'
+        };
+      }
+
+      // Extract full text from llm.result body (mirrors your helpers)
+      function _extractFullFromResult(body) {
+        try {
+          const d = body && body.data;
+          if (!d) return '';
+          if (d.message && typeof d.message.content === 'string') return d.message.content;
+          if (typeof d.response === 'string') return d.response;
+          if (typeof d.text === 'string') return d.text;
+          const ch = Array.isArray(d.choices) && d.choices[0];
+          if (ch && ch.message && typeof ch.message.content === 'string') return ch.message.content;
+          return extractFull(d) || '';
+        } catch { return ''; }
+      }
+
+      // Debounced queue to avoid spamming summaries while UI settles
+      const _summaryQueue = new Map(); // sessId -> timeoutId
+
+      // Public hook used by llm.done path (you already dispatch 'summary.request' there)
+      window.enqueueSummary = function enqueueSummary(detail) {
+        try {
+          const sess = getSession(); if (!sess) return;
+          if (detail && detail.aux === 'sysgen') return; // never name sessions from sysgen textarea
+
+          const text = (detail && detail.text) || '';
+          if (!text) return;
+
+          const h = _hash32(text);
+          if (sess._lastTitleHash === h) return; // de-dupe identical content
+
+          // Debounce per-session
+          if (_summaryQueue.has(sess.id)) clearTimeout(_summaryQueue.get(sess.id));
+          const tid = setTimeout(() => {
+            _summaryQueue.delete(sess.id);
+            _runSessionSummary(sess.id, text, h);
+          }, 180); // small debounce window
+          _summaryQueue.set(sess.id, tid);
+        } catch { }
+      };
+
+      // Fallback global listener in case you prefer event wiring
+      window.addEventListener('summary.request', (ev) => {
+        const d = ev && ev.detail;
+        if (!d) return;
+        enqueueSummary(d);
+      });
+
+      // Core: fire non-stream request and apply the returned title
+      function _runSessionSummary(sessId, text, hashVal) {
+        const sess = getSession(); if (!sess || sess.id !== sessId) return;
+
+        // Guard: don’t re-run too often if user keeps typing
+        const now = Date.now();
+        if (sess._titleCooldown && (now - sess._titleCooldown) < 2000) return;
+        sess._titleCooldown = now;
+
+        const payload = _summaryPayloadFrom(text);
+
+        const route = {
+          sink: 'callback',
+          cb: ({ ok, body }) => {
+            if (!ok || !body) return;
+            const raw = _extractFullFromResult(body);
+            const title = _cleanTitle(raw);
+            if (!title) return;
+
+            // Commit only if session still matches
+            const cur = getSession();
+            if (!cur || cur.id !== sessId) return;
+
+            cur._lastTitleHash = hashVal;
+            _applySessionTitle(sessId, title);
+          }
+        };
+
+        // ship it
+        requestLLM(payload, route);
+      }
+
+      // Convenience: kick a summary manually (e.g., after importing history)
+      window.requestSessionTitleSummaryNow = function () {
+        const sess = getSession(); if (!sess) return;
+        // Build a concise text from recent messages (assistant-first)
+        let t = '';
+        try {
+          const msgs = (sess.messages || []).slice(-6); // last few turns
+          const parts = [];
+          for (let i = 0; i < msgs.length; i++) {
+            const m = msgs[i];
+            if (!m || !m.role) continue;
+            if (m.role === 'assistant' || m.role === 'user') {
+              const c = (m.content || '').trim();
+              if (c) parts.push((m.role === 'user' ? 'Q: ' : 'A: ') + c);
+            }
+          }
+          t = parts.join('\n').slice(0, 2000); // cap input
+        } catch { }
+        if (!t) return;
+        enqueueSummary({ id: 'manual', text: t, aux: 'manual' });
+      };
+
       function getSession(id = activeSessionId) { return sessions.find(x => x.id === id) || null; }
       function setActiveSession(id) {
         activeSessionId = id;
@@ -2300,6 +2462,10 @@
       // --- System Message helpers/state ---
       const SYSTEM_GEN_PROMPT =
         "You are a system prompt generator. Given the user's description, return ONE highly detailed, actionable system prompt, with NO header explainer, or footer debrief, ONLY return the raw system prompt, Dont even label it, only the instructions that sets role, tone, constraints. Use imperative, second person. No examples unless relevant. Verbose and explicit enhancements to the provided content to ensure high quality expansion of instruction set to match determined intention.";
+
+      // Concise, raw title only. No quotes, no emojis, 3–7 words, ~60 chars.
+      const TITLE_SUMMARY_PROMPT =
+        "You are a session title generator. Given the assistant's final answer (and implied user ask), return ONE short, descriptive title capturing the task/topic. Requirements: 3–7 words, under ~60 characters, Title Case preferred, NO quotes, NO punctuation at the end, NO emojis, NO prefixes like 'Title:'—return ONLY the title text.";
 
 
       /* ===== System metadata toggles (LOC / TIME / UA) ===== */
@@ -4377,154 +4543,180 @@ ${META_END}`;
         }
 
         if (ev === 'llm.done') {
-  const id = body.id;
+          const id = body.id;
 
-  // 1) Extract any tail text carried on the done envelope
-  const tail = (() => {
-    const d = body && body.data;
-    if (!d) return '';
-    if (d.message && typeof d.message.content === 'string') return d.message.content;
-    if (typeof d.response === 'string') return d.response;
-    if (typeof d.delta === 'string') return d.delta;
-    if (typeof d.text === 'string') return d.text;
-    const ch = Array.isArray(d.choices) && d.choices[0];
-    if (ch && ch.delta && typeof ch.delta.content === 'string') return ch.delta.content;
-    if (ch && ch.message && typeof ch.message.content === 'string') return ch.message.content;
-    return '';
-  })();
-
-  // 🔸 Element sink (system prompt generator etc.)
-  if (route && route.sink === 'element') {
-    const elx = resolveEl(route.elId);
-
-    // Merge any tail that arrived only on llm.done
-    if (tail) {
-      writeToElement(elx, tail, {
-        mode: 'append',
-        format: route.format || 'text',
-        scroll: true,
-        caretToEnd: true,
-      });
-    }
-
-    // ACK the server’s final window (uses the done_seq = seq+1 scheme server-side)
-    if (typeof body.last_seq === 'number') {
-      sendAck(id, body.last_seq, { clientNow: Date.now(), seen_done: true });
-      if (typeof ackRendered === 'function') ackRendered(id, body.last_seq);
-      ackFlushAndClear(id, body.last_seq);
-    }
-
-    // Finalize stream accounting
-    endStream(id);
-
-    // Stop latency sampling
-    statsLatencyActive = false;
-    if (useStatsLatency) {
-      updateLatencyFromStatsEnvelope(body);
-      updateLatencyFromStatsEnvelope(body.data || {});
-    }
-
-    // Persist TPS if we have it
-    applyStreamStats(id, body);
-    const st = statsByStream.get(id);
-    if (st && (!Number.isFinite(st.tps) || st.tps <= 0)) {
-      const elapsed = Math.max(0.25, (Date.now() - (st.startAt || Date.now())) / 1000);
-      if (Number.isFinite(st.tokens) && st.tokens > 0) {
-        st.tps = st.tokens / elapsed;
-        st.approx = true;
-        statsByStream.set(id, st);
-      }
-    }
-
-    // Unlock UI + clear sysgen flags
-    lockElement(elx, false);
-    if (route.elId) streamingElements.delete(route.elId);
-
-    if (route.elId === 'systemMsg') {
-      const s = getSession();
-      if (s) {
-        s.system = (el('systemMsg').value || '');
-        saveJSON(STORAGE.SESS, sessions);
-        // keep session metadata in sync (no reseed)
-        sendSessionOpen(s, /*seed*/ false);
-      }
-      setSysGenBusy(false);
-      sysgenPending && sysgenPending.delete(id);
-    }
-
-    isSysGenStreaming = false;
-    sysgenCurrentId = null;
-
-    // Tidy toolbar (stop → play)
-    setSendMode();
-
-    clearRoute(id);
-    renderChat(); // harmless for element sinks
-    return true;
-  }
-
-  // 🔸 Default chat-bubble sink finalize (unchanged from your flow)
-  // Merge tail into last assistant turn if needed
-  if (tail) {
-    const sess = getSession();
-    if (sess && Array.isArray(sess.messages) && sess.messages.length) {
-      for (let i = sess.messages.length - 1; i >= 0; i--) {
-        const m = sess.messages[i];
-        if (m.role === 'assistant') { m.content = (m.content || '') + tail; break; }
-      }
-      saveJSON(STORAGE.SESS, sessions);
-    }
-  }
-
-  // Final ACK window + end stream
-  if (typeof body.last_seq === 'number') {
-    sendAck(id, body.last_seq, { clientNow: Date.now(), seen_done: true });
-    if (typeof ackRendered === 'function') ackRendered(id, body.last_seq);
-    ackFlushAndClear(id, body.last_seq);
-  }
-  endStream(id);
-
-  statsLatencyActive = false;
-  if (useStatsLatency) {
-    updateLatencyFromStatsEnvelope(body);
-    updateLatencyFromStatsEnvelope(body.data || {});
-  }
-
-  applyStreamStats(id, body);
-  const rec = statsByStream.get(id);
-  if (rec && (!Number.isFinite(rec.tps) || rec.tps <= 0)) {
-    const elapsed = Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
-    if (Number.isFinite(rec.tokens) && rec.tokens > 0) {
-      rec.tps = rec.tokens / elapsed;
-      rec.approx = true;
-      statsByStream.set(id, rec);
-    }
-  }
-
-  // persist TPS onto the last assistant message
-  {
-    const sess = getSession();
-    if (sess && Array.isArray(sess.messages)) {
-      for (let i = sess.messages.length - 1; i >= 0; i--) {
-        if (sess.messages[i].role === 'assistant') {
-          const st = statsByStream.get(id);
-          if (st && Number.isFinite(st.tps)) {
-            sess.messages[i]._tps = st.tps;
-            sess.messages[i]._tpsIsApprox = !!st.approx;
+          // Ignore stale finishes for old streams (prevents PLAY flicker)
+          if (uiLatch && typeof uiLatch.abandonIfOld === 'function' && uiLatch.abandonIfOld(id)) {
+            return true;
           }
-          break;
-        }
-      }
-      saveJSON(STORAGE.SESS, sessions);
-    }
-  }
 
-  finishStreamingBubble(id);
-  renderChat();
-  setSendMode();
-  clearRoute(id);
-  return true;
-}
+          // 1) Extract any tail text carried on the done envelope
+          const tail = (() => {
+            const d = body && body.data;
+            if (!d) return '';
+            if (d.message && typeof d.message.content === 'string') return d.message.content;
+            if (typeof d.response === 'string') return d.response;
+            if (typeof d.delta === 'string') return d.delta;
+            if (typeof d.text === 'string') return d.text;
+            const ch = Array.isArray(d.choices) && d.choices[0];
+            if (ch && ch.delta && typeof ch.delta.content === 'string') return ch.delta.content;
+            if (ch && ch.message && typeof ch.message.content === 'string') return ch.message.content;
+            return '';
+          })();
+
+          const hasAckRendered = (typeof ackRendered === 'function');
+          const lastRendered = (typeof lastSeqForStream === 'function') ? lastSeqForStream(id) : undefined;
+
+          // 2) Merge tail into UI/session (both sinks supported)
+          const route = routeFor(body.id);
+          if (tail) {
+            if (route && route.sink === 'element') {
+              const elx = resolveEl(route.elId);
+              writeToElement(elx, tail, {
+                mode: 'append',
+                format: route.format || 'text',
+                scroll: true, caretToEnd: true
+              });
+            } else {
+              const sess = getSession();
+              if (sess && Array.isArray(sess.messages) && sess.messages.length) {
+                for (let i = sess.messages.length - 1; i >= 0; i--) {
+                  const m = sess.messages[i];
+                  if (m.role === 'assistant') { m.content = (m.content || '') + tail; break; }
+                }
+                saveJSON(STORAGE.SESS, sessions);
+              }
+            }
+          }
+
+          // 3) Send an explicit DM ACK (what server waits for), then regular ACK
+          const ackPayload = {
+            event: 'llm.ack',
+            id,
+            upto: body.last_seq,
+            upto_rendered: Number.isInteger(lastRendered) ? lastRendered : undefined,
+            clientNow: Date.now(),
+            seen_done: true
+          };
+          try { sendDM(ackPayload); } catch { /* no-op */ }
+
+          if (typeof body.last_seq === 'number') {
+            sendAck(id, body.last_seq);
+            if (hasAckRendered) ackRendered(id, body.last_seq);
+            ackFlushAndClear(id, body.last_seq);
+          }
+
+          // 4) Finalize stream + stats
+          endStream(id);
+
+          statsLatencyActive = false;
+          if (useStatsLatency) {
+            updateLatencyFromStatsEnvelope(body);
+            updateLatencyFromStatsEnvelope(body.data || {});
+          }
+
+          applyStreamStats(id, body);
+
+          // TPS fallback if backend didn’t report tokens/sec
+          {
+            const rec = statsByStream.get(id);
+            if (rec && (!Number.isFinite(rec.tps) || rec.tps <= 0)) {
+              const elapsed = Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
+              if (Number.isFinite(rec.tokens) && rec.tokens > 0) {
+                rec.tps = rec.tokens / elapsed;
+                rec.approx = true;
+                statsByStream.set(id, rec);
+              }
+            }
+          }
+
+          // Persist TPS on last assistant turn (chat sink)
+          {
+            const sess = getSession();
+            if (sess && Array.isArray(sess.messages)) {
+              for (let i = sess.messages.length - 1; i >= 0; i--) {
+                if (sess.messages[i].role === 'assistant') {
+                  const st = statsByStream.get(id);
+                  if (st && Number.isFinite(st.tps)) {
+                    sess.messages[i]._tps = st.tps;
+                    sess.messages[i]._tpsIsApprox = !!st.approx;
+                  }
+                  break;
+                }
+              }
+              saveJSON(STORAGE.SESS, sessions);
+            }
+          }
+
+          // 5) Element sink finalize (e.g., system prompt generator textarea)
+          if (route && route.sink === 'element') {
+            const elx = resolveEl(route.elId);
+            lockElement(elx, false);
+            if (route.elId) streamingElements.delete(route.elId);
+
+            if (route.elId === 'systemMsg') {
+              const s = getSession();
+              if (s) {
+                s.system = (el('systemMsg').value || '');
+                saveJSON(STORAGE.SESS, sessions);
+                // keep session metadata in sync (no reseed)
+                sendSessionOpen(s, /*seed*/ false);
+              }
+              setSysGenBusy(false);
+              if (typeof sysgenPending !== 'undefined') sysgenPending.delete(id);
+            }
+            isSysGenStreaming = false; sysgenCurrentId = null;
+          }
+
+          // 6) Optional summary path — call your summarizer later
+          //    Triggers if:
+          //      - route.sink === 'summary'  OR
+          //      - route.summary === true    OR
+          //      - global hooks exist (enqueueSummary / autoSummarize)
+          try {
+            let finalText = '';
+            if (route && route.sink === 'element') {
+              if (route.elId === 'systemMsg') {
+                finalText = (el('systemMsg').value || '');
+              } else {
+                finalText = (resolveEl(route.elId)?.value || '');
+              }
+            } else {
+              const sess = getSession();
+              if (sess && sess.messages && sess.messages.length) {
+                for (let i = sess.messages.length - 1; i >= 0; i--) {
+                  if (sess.messages[i].role === 'assistant') { finalText = sess.messages[i].content || ''; break; }
+                }
+              }
+            }
+
+            const wantsSummary =
+              (route && (route.sink === 'summary' || route.summary === true)) ||
+              (typeof enqueueSummary === 'function') ||
+              (typeof autoSummarize === 'function');
+
+            if (wantsSummary && finalText) {
+              const sumPayload = { id, text: finalText, ts: Date.now(), model: (body && body.model) || getCurrentModel() };
+              if (typeof enqueueSummary === 'function') enqueueSummary(sumPayload);
+              else if (typeof autoSummarize === 'function') autoSummarize(sumPayload);
+              else if (window && typeof window.dispatchEvent === 'function') {
+                window.dispatchEvent(new CustomEvent('summary.request', { detail: sumPayload }));
+              }
+            }
+          } catch (e) {
+            console.debug('[summary] skipped:', e);
+          }
+
+          // 7) UI: request a debounced flip to PLAY after QUIET period
+          finishStreamingBubble(id);
+          renderChat();
+          if (uiLatch && typeof uiLatch.requestPlay === 'function') uiLatch.requestPlay(id);
+
+          // do not clear pendingStreamId immediately; it clears when flip happens
+          // but make sure route is cleared
+          clearRoute(id);
+          return true;
+        }
 
 
         if (ev === 'llm.result') {
