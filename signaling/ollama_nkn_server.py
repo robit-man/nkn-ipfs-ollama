@@ -1522,6 +1522,8 @@ class _LLMStream:
     # ── resend tail-bulk controls ────────────────────────────────────
     RESEND_TAIL_MAX       = int(os.environ.get("LLM_RESEND_TAIL_MAX", "256"))   # resend at most last N
     RESEND_BULK_MAX_BYTES = int(os.environ.get("LLM_RESEND_BULK_MAX_BYTES", str(700_000)))  # ~< 1MB
+    DONE_RESEND_MS       = float(os.environ.get("LLM_DONE_RESEND_MS", "350"))  # resend llm.done cadence
+    DONE_EXIT_GRACE_S    = float(os.environ.get("LLM_DONE_EXIT_GRACE_S", "0")) # 0 = wait forever
 
     STATS_INTERVAL_SECS = 0.5
 
@@ -1557,7 +1559,12 @@ class _LLMStream:
         self.on_start = on_start
         self.on_delta = on_delta
         self.on_done  = on_done
-
+        self.done_sent       = False
+        self.done_seq        = 0
+        self.done_seen       = False         # ← set True only when client acks *done*
+        self._last_done_send = 0.0
+        self._first_done_at  = 0.0
+        
         self.sid     = self.client_cfg.get("sid") or self.kwargs.get("sid") or req.get("sid")
 
         # stats book
@@ -1690,34 +1697,43 @@ class _LLMStream:
         })
 
     def _sweep_resend_unacked_tail_bulk(self, force=False):
-        """
-        Resend ONLY the tail of the unacked window as one llm.bulk, not
-        every packet one-by-one.
-        """
         with self._lock:
             start = self.last_acked + 1
             end   = self.seq
-            if end < start:
+            if end < start and not (self.done_sent and not self.done_seen):
                 return
-            unacked = end - start + 1
-            # If not forced and pressure is light, skip heavy resends
-            if not force and unacked <= 2:
-                return
-            # Take only the tail
-            take = min(self.RESEND_TAIL_MAX, unacked)
-            seqs = list(range(end - take + 1, end + 1))
-        self._send_bulk(seqs)
+            if end >= start:
+                unacked = end - start + 1
+                if not force and unacked <= 2:
+                    pass
+                else:
+                    take = min(self.RESEND_TAIL_MAX, unacked)
+                    seqs = list(range(end - take + 1, end + 1))
+                    self._send_bulk(seqs)
+
+            # also re-send the done frame if it hasn't been seen
+            if self.done_sent and not self.done_seen:
+                # small guard to avoid spamming at microsecond intervals
+                if (time.monotonic() - self._last_done_send) * 1000.0 >= self.DONE_RESEND_MS:
+                    self._send_done({"mode": "stream", "api": self.api, "retry": True})
+
 
     def _send_done(self, meta: dict):
         with self._lock:
-            self.done_sent = True
-            self.done_seq = self.seq
-            self._dm({"event":"llm.done","id":self.id,"last_seq":self.done_seq,"meta":meta,"ts":_now_ms()})
-        try:
-            if callable(self.on_done) and self.stream:
-                self.on_done(None)
-        except Exception as e:
-            _log("llm.on_done.err", str(e))
+            if not self.done_sent:
+                self.done_seq = self.seq
+                self.done_sent = True
+                self._first_done_at = time.monotonic()
+            frame = {
+                "event": "llm.done",
+                "id": self.id,
+                "last_seq": self.done_seq,
+                "meta": meta,
+                "ts": _now_ms(),
+            }
+            self._dm(frame)
+            self._last_done_send = time.monotonic()
+
 
     # ────────────────────────────────────────────────────────────────
     # ACK + pressure hints from client
@@ -1736,6 +1752,7 @@ class _LLMStream:
             panic_for_ms = int(meta.get("panic_for_ms", 0) or 0)
             bulk_max_ms  = meta.get("bulk_max_ms")
             bulk_parts   = meta.get("bulk_parts")
+            seen_done    = bool(meta.get("seen_done"))           # ← NEW
 
         with self._lock:
             # track receive progress
@@ -1768,6 +1785,9 @@ class _LLMStream:
             # rendered progress (optional)
             if isinstance(rendered, int) and rendered > self.last_rendered_seq:
                 self.last_rendered_seq = rendered
+
+            if seen_done:
+                self.done_seen = True
 
             # evict anything <= max(received, acked)
             hi = max(self.last_recv_seq, self.last_acked)
@@ -1802,20 +1822,37 @@ class _LLMStream:
             time.sleep(self.RESEND_INTERVAL)
             now = time.monotonic()
             with self._lock:
-                ack_stalled = (now - self._last_ack_change) > self.ACK_STALL_SECS
+                ack_stalled  = (now - self._last_ack_change) > self.ACK_STALL_SECS
                 recv_stalled = (now - self._last_recv_change) > self.ACK_STALL_SECS
-                unacked = self.seq - self.last_acked
-            # watchdog-ish: if both sides appear dead, just keep nudging the tail in bulk
+                unacked      = self.seq - self.last_acked
+                need_done    = self.done_sent and not self.done_seen
+
+            # keep resending llm.done until the client confirms it
+            if need_done:
+                if (now - self._last_done_send) * 1000.0 >= self.DONE_RESEND_MS:
+                    self._send_done({"mode": "stream", "api": self.api, "retry": True})
+                # optional escape if you set DONE_EXIT_GRACE_S > 0
+                if self.DONE_EXIT_GRACE_S > 0 and (now - self._first_done_at) >= self.DONE_EXIT_GRACE_S:
+                    return
+                # continue nudging tail while we wait for the done ack
+                if unacked > 0:
+                    self._sweep_resend_unacked_tail_bulk(force=False)
+                continue
+
+            # watchdog-ish bulk resend when both sides look stalled
             if ack_stalled and recv_stalled and unacked > 0:
                 self._sweep_resend_unacked_tail_bulk(force=True)
                 continue
-            # normal resend: bulk the tail only when there is useful pressure
+
+            # normal pressure resend
             if unacked > 4:
                 self._sweep_resend_unacked_tail_bulk(force=False)
-            # if we’ve fully acked the done frame, exit
+
+            # only exit after all chunks acked AND done seen
             with self._lock:
-                if self.done_sent and self.last_acked >= self.done_seq:
+                if self.done_sent and self.last_acked >= self.done_seq and self.done_seen:
                     return
+
 
     # ────────────────────────────────────────────────────────────────
     # Send helpers for coalesced text
@@ -2112,13 +2149,16 @@ def _ack_llm(body: dict):
     upto_recv = body.get("upto_recv")       # alias; prefer this if present
     upto_rendered = body.get("upto_rendered")  # highest CONTIGUOUS RENDERED (optional)
     client_now = body.get("clientNow")      # client ms clock (optional)
+    seen_done = bool(body.get("seen_done"))            # ← NEW
     if not isinstance(sid, str): return
     seq = upto_recv if isinstance(upto_recv, int) else upto
     if not isinstance(seq, int): return
     stream = _llm_streams.get(sid)
     if stream:
         stream.ack(seq, {"rendered": upto_rendered if isinstance(upto_rendered, int) else None,
-                         "client_now": client_now if isinstance(client_now, (int, float)) else None})
+                         "client_now": client_now if isinstance(client_now, (int, float)) else None,
+                         "seen_done":     seen_done,                          # ← NEW
+                         })
 
 def _cancel_llm(body: dict):
     sid = body.get("id")
