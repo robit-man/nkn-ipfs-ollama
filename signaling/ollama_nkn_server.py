@@ -1495,25 +1495,35 @@ def _massage_images_in_messages(
     return out
 
 class _LLMStream:
-    RESEND_INTERVAL = 1
-    WINDOW_LIMIT    = 512
+    # ── timing / windows ─────────────────────────────────────────────
+    RESEND_INTERVAL = 0.75                 # seconds between resend sweeps
+    WINDOW_LIMIT    = 1024                 # soft eviction threshold
+    MAX_WINDOW_PKTS = 4096                 # hard safety cap (no abort on hit)
     FINAL_SWEEPS    = 3
     FINAL_GAP_SECS  = 0.12
-    ACK_STALL_SECS   = 25.0
-    MAX_WINDOW_PKTS  = 1024
-    BULK_UNACK_THRESHOLD = 10
-    BULK_MAX_MS          = 120
-    BULK_MAX_PARTS       = 200
+    ACK_STALL_SECS   = 25.0                # “overall” stall (for watchdog)
+    SEVERE_ACK_STALE_SECS = 2.0            # ↓ enter panic sooner
+
+    # ── coalescing thresholds (normal/panic) ─────────────────────────
+    BULK_UNACK_THRESHOLD = 6               # ↓ start bulking quickly
+    BULK_MAX_MS          = 90              # normal flush cadence (ms)
+    BULK_MAX_PARTS       = 300             # normal max parts per flush
+    BULK_PANIC_MS        = 120             # panic cadence (ms)
+    BULK_PANIC_PARTS     = 9999            # huge bulks while behind
+
+    # ── freeze (hold-then-burst) gating ──────────────────────────────
+    FREEZE_E2E_MS         = int(os.environ.get("LLM_FREEZE_E2E_MS", "1500"))
+    FREEZE_UNACK          = int(os.environ.get("LLM_FREEZE_UNACK", "256"))
+    FREEZE_ACK_STALE_S    = float(os.environ.get("LLM_FREEZE_ACK_STALE_S", "1.2"))
+    FREEZE_RENDERED_GAP   = int(os.environ.get("LLM_FREEZE_RENDERED_GAP", "128"))
+    FREEZE_MAX_HOLD_S     = float(os.environ.get("LLM_FREEZE_MAX_HOLD_S", "0.25"))
+    FREEZE_MAX_BYTES      = int(os.environ.get("LLM_FREEZE_MAX_BYTES", str(2 * 1024 * 1024)))
+
+    # ── resend tail-bulk controls ────────────────────────────────────
+    RESEND_TAIL_MAX       = int(os.environ.get("LLM_RESEND_TAIL_MAX", "256"))   # resend at most last N
+    RESEND_BULK_MAX_BYTES = int(os.environ.get("LLM_RESEND_BULK_MAX_BYTES", str(700_000)))  # ~< 1MB
+
     STATS_INTERVAL_SECS = 0.5
-    SEVERE_ACK_STALE_SECS = 5.0
-    BULK_PANIC_MS = 850          # flush at most ~1x/sec while lagging badly
-    BULK_PANIC_PARTS = 9999      # effectively “as many as arrive”
-    FREEZE_E2E_MS         = int(os.environ.get("LLM_FREEZE_E2E_MS", "1500"))   # ema of client_now - pkt.ts
-    FREEZE_UNACK          = int(os.environ.get("LLM_FREEZE_UNACK", "100000"))     # unacked seqs threshold
-    FREEZE_ACK_STALE_S    = float(os.environ.get("LLM_FREEZE_ACK_STALE_S", "1.5"))
-    FREEZE_RENDERED_GAP   = int(os.environ.get("LLM_FREEZE_RENDERED_GAP", "100000"))
-    FREEZE_MAX_HOLD_S     = float(os.environ.get("LLM_FREEZE_MAX_HOLD_S", "0.2"))  # how long we’re willing to hold
-    FREEZE_MAX_BYTES      = int(os.environ.get("LLM_FREEZE_MAX_BYTES", str(1024 * 1024)))  # safety cap
 
     def __init__(self, src_addr: str, req: dict,
                  on_start=None, on_delta=None, on_done=None):
@@ -1535,23 +1545,29 @@ class _LLMStream:
         self._e2e_latency_ema_ms = None   # client_now - pkt.ts (ms)
         self._ack_rtt_ema_ms = None       # server_now - pkt.ts (fallback if client_now missing)
 
-        self.window   = {}
-        self.window_order = []
+        self.window   = {}                # seq -> pkt (llm.chunk)
+        self.window_order = []            # seq in send order
         self.done_sent  = False
         self.done_seq   = 0
         self.cancelled  = False
         self._lock    = threading.Lock()
         self._resender = threading.Thread(target=self._resend_loop, daemon=True)
 
+        # callbacks
         self.on_start = on_start
         self.on_delta = on_delta
         self.on_done  = on_done
+
         self.sid     = self.client_cfg.get("sid") or self.kwargs.get("sid") or req.get("sid")
+
+        # stats book
         self._stats = {
             "t0": None, "tlast": None, "chars": 0,
             "eval_count": None, "eval_duration_s": None,
         }
         self._last_stats_emit = 0.0
+
+        # client / Ollama
         host = self.client_cfg.get("host") or OLLAMA_HOST
         headers = self.client_cfg.get("headers") or {}
         try:
@@ -1560,6 +1576,15 @@ class _LLMStream:
             self.client = None
             self._send_error(f"ollama client init failed: {e}", kind="client_init")
 
+        # ── escalation hint overrides from client ACKs ────────────────
+        self._panic_until = 0.0
+        self._force_freeze_until = 0.0
+        self._bulk_max_ms_override = None   # type: Optional[int]
+        self._bulk_parts_override = None    # type: Optional[int]
+
+    # ────────────────────────────────────────────────────────────────
+    # DM helpers
+    # ────────────────────────────────────────────────────────────────
     def _dm(self, payload: dict):
         _dm(self.src_addr, payload)
 
@@ -1594,24 +1619,25 @@ class _LLMStream:
         except Exception: pass
 
     def _send_chunk(self, data: dict):
+        """
+        Send a single llm.chunk and track it in the window for resend/bulk replay.
+        """
         with self._lock:
             self.seq += 1
             seq = self.seq
             pkt = {"event":"llm.chunk","id":self.id,"seq":seq,"data":_to_jsonable2(data),"ts":_now_ms()}
             self.window[seq] = pkt
             self.window_order.append(seq)
+            # Soft eviction (only for already-acked seqs)
             if len(self.window_order) > self.WINDOW_LIMIT:
-                oldest = self.window_order.pop(0)
+                oldest = self.window_order[0]
                 if oldest <= self.last_acked:
                     self.window.pop(oldest, None)
-                else:
-                    self.window_order.insert(0, oldest)
-            if len(self.window_order) > self.MAX_WINDOW_PKTS:
-                self._send_error("backpressure: client not ACKing fast enough; aborting stream", kind="backpressure")
-                self.cancelled = True
-                return
+                    self.window_order.pop(0)
+            # NO aborts on window growth; we rely on bulk/freeze/resend-tail to depressurize
             self._dm(pkt)
 
+        # stats + callbacks
         try:
             self._update_stats_from_part(data)
             now = time.monotonic()
@@ -1620,7 +1646,6 @@ class _LLMStream:
                 self._last_stats_emit = now
         except Exception:
             pass
-
         try:
             if callable(self.on_delta):
                 delta = _extract_delta_from_part(self.api, data)
@@ -1628,15 +1653,60 @@ class _LLMStream:
         except Exception as e:
             _log("llm.on_delta.err", str(e))
 
-    def _sweep_resend_unacked(self):
+    def _send_bulk(self, seqs: list[int]):
+        """
+        Send a single llm.bulk with the specified seqs (must exist in window).
+        Items are the original llm.chunk envelopes.
+        """
+        if not seqs:
+            return
+        items = []
+        total_bytes = 0
+        for s in seqs:
+            pkt = self.window.get(s)
+            if not pkt:
+                continue
+            # cheap size estimate
+            try:
+                b = len(json.dumps(pkt).encode("utf-8"))
+            except Exception:
+                b = 0
+            if self.RESEND_BULK_MAX_BYTES and (total_bytes + b) > self.RESEND_BULK_MAX_BYTES:
+                break
+            items.append(pkt)
+            total_bytes += b
+
+        if not items:
+            return
+
+        first = items[0]["seq"]; last = items[-1]["seq"]
+        self._dm({
+            "event": "llm.bulk",
+            "id": self.id,
+            "items": items,
+            "first_seq": first,
+            "last_seq": last,
+            "ts": _now_ms()
+        })
+
+    def _sweep_resend_unacked_tail_bulk(self, force=False):
+        """
+        Resend ONLY the tail of the unacked window as one llm.bulk, not
+        every packet one-by-one.
+        """
         with self._lock:
             start = self.last_acked + 1
             end   = self.seq
-            if end < start: return
-            for s in range(start, end + 1):
-                pkt = self.window.get(s)
-                if pkt is not None:
-                    self._dm(pkt)
+            if end < start:
+                return
+            unacked = end - start + 1
+            # If not forced and pressure is light, skip heavy resends
+            if not force and unacked <= 2:
+                return
+            # Take only the tail
+            take = min(self.RESEND_TAIL_MAX, unacked)
+            seqs = list(range(end - take + 1, end + 1))
+        self._send_bulk(seqs)
 
     def _send_done(self, meta: dict):
         with self._lock:
@@ -1649,12 +1719,23 @@ class _LLMStream:
         except Exception as e:
             _log("llm.on_done.err", str(e))
 
+    # ────────────────────────────────────────────────────────────────
+    # ACK + pressure hints from client
+    # ────────────────────────────────────────────────────────────────
     def ack(self, upto: int, meta: Optional[dict] = None):
         client_now = None
         rendered = None
+        pressure = None
+        panic_for_ms = 0
+        bulk_max_ms = None
+        bulk_parts = None
         if isinstance(meta, dict):
-            client_now = meta.get("client_now")
-            rendered = meta.get("rendered")
+            client_now   = meta.get("client_now")
+            rendered     = meta.get("rendered")
+            pressure     = meta.get("pressure")
+            panic_for_ms = int(meta.get("panic_for_ms", 0) or 0)
+            bulk_max_ms  = meta.get("bulk_max_ms")
+            bulk_parts   = meta.get("bulk_parts")
 
         with self._lock:
             # track receive progress
@@ -1662,7 +1743,7 @@ class _LLMStream:
                 self.last_recv_seq = upto
                 self._last_recv_change = time.monotonic()
 
-            # advance delivery-ACK as well (kept for window eviction/backpressure logic)
+            # delivery ACK (kept for eviction/backpressure logic)
             if upto > self.last_acked:
                 self.last_acked = upto
                 self._last_ack_change = time.monotonic()
@@ -1672,13 +1753,13 @@ class _LLMStream:
             pkt_ts = pkt.get("ts") if isinstance(pkt, dict) else None
             now_ms = int(time.time() * 1000)
 
-            # E2E (client clock) if provided
+            # E2E with client clock
             if pkt_ts and isinstance(client_now, (int, float)):
                 sample = max(0, float(client_now) - float(pkt_ts))
                 self._e2e_latency_ema_ms = sample if self._e2e_latency_ema_ms is None \
                     else (0.8 * self._e2e_latency_ema_ms + 0.2 * sample)
 
-            # Fallback RTT-ish (server clock only)
+            # RTT-ish fallback
             if pkt_ts:
                 sample_rtt = max(0, now_ms - int(pkt_ts))
                 self._ack_rtt_ema_ms = sample_rtt if self._ack_rtt_ema_ms is None \
@@ -1688,43 +1769,57 @@ class _LLMStream:
             if isinstance(rendered, int) and rendered > self.last_rendered_seq:
                 self.last_rendered_seq = rendered
 
-            # free memory: evict anything <= max(received, acked)
+            # evict anything <= max(received, acked)
             hi = max(self.last_recv_seq, self.last_acked)
             for s in [s for s in list(self.window.keys()) if s <= hi]:
                 self.window.pop(s, None)
             self.window_order = [s for s in self.window_order if s > hi]
 
+            # pressure hints
+            if pressure in ("panic", "bulk"):
+                dur_s = (panic_for_ms or 2500) / 1000.0
+                self._panic_until = max(self._panic_until, time.monotonic() + dur_s)
+            elif pressure == "freeze":
+                dur_s = (panic_for_ms or 2000) / 1000.0
+                self._force_freeze_until = max(self._force_freeze_until, time.monotonic() + dur_s)
+
+            if isinstance(bulk_max_ms, (int, float)) and bulk_max_ms > 0:
+                self._bulk_max_ms_override = int(bulk_max_ms)
+            if isinstance(bulk_parts, int) and bulk_parts > 0:
+                self._bulk_parts_override = int(bulk_parts)
 
     def cancel(self):
         with self._lock:
             self.cancelled = True
 
+    # ────────────────────────────────────────────────────────────────
+    # Resender: tail-bulk instead of flooding
+    # ────────────────────────────────────────────────────────────────
     def _resend_loop(self):
         while True:
+            if self.cancelled:
+                return
+            time.sleep(self.RESEND_INTERVAL)
             now = time.monotonic()
             with self._lock:
                 ack_stalled = (now - self._last_ack_change) > self.ACK_STALL_SECS
                 recv_stalled = (now - self._last_recv_change) > self.ACK_STALL_SECS
                 unacked = self.seq - self.last_acked
-                window_full = len(self.window_order) > self.MAX_WINDOW_PKTS
-            # Only bail if BOTH sides look stalled and we’re at real risk
-            if (ack_stalled and recv_stalled) and (unacked > (self.MAX_WINDOW_PKTS // 2) or window_full):
-                self._send_error("ack stall: aborting stream to prevent memory pressure", kind="ack_stall")
-                self.cancelled = True
-                return
-            if self.cancelled: return
-            time.sleep(self.RESEND_INTERVAL)
+            # watchdog-ish: if both sides appear dead, just keep nudging the tail in bulk
+            if ack_stalled and recv_stalled and unacked > 0:
+                self._sweep_resend_unacked_tail_bulk(force=True)
+                continue
+            # normal resend: bulk the tail only when there is useful pressure
+            if unacked > 4:
+                self._sweep_resend_unacked_tail_bulk(force=False)
+            # if we’ve fully acked the done frame, exit
             with self._lock:
-                target_hi = self.seq
-                start = self.last_acked + 1
-                for s in range(start, target_hi + 1):
-                    pkt = self.window.get(s)
-                    if pkt is not None:
-                        self._dm(pkt)
                 if self.done_sent and self.last_acked >= self.done_seq:
                     return
 
-
+    # ────────────────────────────────────────────────────────────────
+    # Send helpers for coalesced text
+    # ────────────────────────────────────────────────────────────────
     def _send_coalesced_text(self, text: str):
         if not text: return
         if self.api == "chat":
@@ -1733,6 +1828,9 @@ class _LLMStream:
             data = {"response": text}
         self._send_chunk(data)
 
+    # ────────────────────────────────────────────────────────────────
+    # Stats
+    # ────────────────────────────────────────────────────────────────
     def _update_stats_from_part(self, part: dict):
         now = time.monotonic()
         delta = _extract_delta_from_part(self.api, part)
@@ -1761,10 +1859,12 @@ class _LLMStream:
         approx_tokens = int(self._stats["chars"] / 4.0) if self._stats["chars"] else 0
         approx_tps = (approx_tokens / elapsed_s) if elapsed_s > 0 else None
 
-        # derived net state
-        unacked = max(0, self.seq - self.last_acked)
-        recv_gap = max(0, self.seq - self.last_recv_seq)
-        rendered_gap = max(0, self.seq - self.last_rendered_seq)
+        with self._lock:
+            unacked = max(0, self.seq - self.last_acked)
+            recv_gap = max(0, self.seq - self.last_recv_seq)
+            rendered_gap = max(0, self.seq - self.last_rendered_seq)
+            e2e = self._e2e_latency_ema_ms
+            rtt = self._ack_rtt_ema_ms
 
         payload = {
             "event": "llm.stats",
@@ -1793,13 +1893,15 @@ class _LLMStream:
                 "unacked": unacked,
                 "recv_gap": recv_gap,
                 "rendered_gap": rendered_gap,
-                "e2e_latency_ema_ms": self._e2e_latency_ema_ms,
-                "ack_rtt_ema_ms": self._ack_rtt_ema_ms,
+                "e2e_latency_ema_ms": e2e,
+                "ack_rtt_ema_ms": rtt,
             },
         }
         self._dm(payload)
 
-
+    # ────────────────────────────────────────────────────────────────
+    # Main loop
+    # ────────────────────────────────────────────────────────────────
     def run(self):
         if self.client is None: return
         self._send_start()
@@ -1821,10 +1923,7 @@ class _LLMStream:
             bulk_buf: list[str] = []
             last_flush = time.monotonic()
 
-            bulk_buf: list[str] = []
-            last_flush = time.monotonic()
-
-            # NEW: freeze-to-bulk state
+            # freeze state
             freeze_mode = False
             freeze_started = 0.0
             freeze_buf: list[str] = []
@@ -1854,37 +1953,37 @@ class _LLMStream:
                     ack_stalled_s = (now - self._last_ack_change)
                     rendered_gap = self.seq - self.last_rendered_seq
                     e2e_ms = (self._e2e_latency_ema_ms or 0.0)
+                    rtt_ms = (self._ack_rtt_ema_ms or 0.0)
+                # Client-requested overrides
+                in_panic_hint  = (now < self._panic_until)
+                in_freeze_hint = (now < self._force_freeze_until)
 
-                # Decide if we should enter/keep FREEZE (one-big-frame) mode
+                # Should we FREEZE?
                 want_freeze = (
+                    in_freeze_hint or
                     (unacked >= self.FREEZE_UNACK) or
-                    (ack_stalled_s >= self.FREEZE_ACK_STALE_S and e2e_ms >= self.FREEZE_E2E_MS) or
+                    ((ack_stalled_s >= self.FREEZE_ACK_STALE_S) and (e2e_ms >= self.FREEZE_E2E_MS or rtt_ms >= self.FREEZE_E2E_MS)) or
                     (rendered_gap >= self.FREEZE_RENDERED_GAP)
                 )
 
                 if want_freeze and not freeze_mode:
                     freeze_mode = True
                     freeze_started = now
-                    # dump any normal bulk we were preparing so we don't interleave strategies
                     _bulk_flush()
 
-                # always extract textual delta once
+                # extract once
                 delta = _extract_delta_from_part(self.api, part)
 
                 if freeze_mode:
-                    # Buffer aggressively; send nothing until we recover or finish
                     if delta:
                         freeze_buf.append(delta)
                         freeze_bytes += len(delta.encode("utf-8", "ignore"))
-                        # safety: don't grow without bound
                         if freeze_bytes >= self.FREEZE_MAX_BYTES:
                             _freeze_flush()
                     else:
-                        # non-text event: flush text once, then forward this structural part
                         _freeze_flush()
                         self._send_chunk(part)
 
-                    # Exit conditions: we caught up OR we’ve held long enough
                     with self._lock:
                         recovered = (self.seq - self.last_acked) <= max(8, self.FREEZE_UNACK // 4)
                     held_too_long = (now - freeze_started) >= self.FREEZE_MAX_HOLD_S
@@ -1892,34 +1991,27 @@ class _LLMStream:
                     if recovered or held_too_long:
                         _freeze_flush()
                         freeze_mode = False
-                    continue  # don’t fall through to normal bulk logic
+                    continue  # skip normal bulk
 
-                # ── Normal bulk logic (milder coalescing) ──
+                # ── Normal / Panic bulk logic ─────────────────────────
                 with self._lock:
                     unacked = self.seq - self.last_acked
                     ack_stalled_s = (now - self._last_ack_change)
+
                 ack_stale = ack_stalled_s > 0.8
-                panic = ack_stalled_s >= self.SEVERE_ACK_STALE_SECS
+                panic = in_panic_hint or (ack_stalled_s >= self.SEVERE_ACK_STALE_SECS)
 
-                if panic:
+                # pick caps (allow client override while in panic)
+                max_parts = (self._bulk_parts_override if panic and self._bulk_parts_override else
+                             (self.BULK_PANIC_PARTS if panic else self.BULK_MAX_PARTS))
+                max_ms    = (self._bulk_max_ms_override if panic and self._bulk_max_ms_override else
+                             (self.BULK_PANIC_MS if panic else self.BULK_MAX_MS))
+
+                if (panic or (unacked >= self.BULK_UNACK_THRESHOLD) or ack_stale):
                     if delta:
                         bulk_buf.append(delta)
-                        too_many = len(bulk_buf) >= self.BULK_PANIC_PARTS
-                        too_old  = (now - last_flush) * 1000.0 >= self.BULK_PANIC_MS
-                        if too_many or too_old:
-                            _bulk_flush()
-                        continue
-                    else:
-                        _bulk_flush()
-                        self._send_chunk(part)
-                    continue
-
-                bulk_mode = (unacked >= self.BULK_UNACK_THRESHOLD) or ack_stale
-                if bulk_mode:
-                    if delta:
-                        bulk_buf.append(delta)
-                        too_many = len(bulk_buf) >= self.BULK_MAX_PARTS
-                        too_old  = (now - last_flush) * 1000.0 >= self.BULK_MAX_MS
+                        too_many = len(bulk_buf) >= max_parts
+                        too_old  = (now - last_flush) * 1000.0 >= max_ms
                         if too_many or too_old:
                             _bulk_flush()
                         continue
@@ -1930,14 +2022,15 @@ class _LLMStream:
                     _bulk_flush()
                     self._send_chunk(part)
 
-            # stream ended — flush whatever is left
+            # end of stream — flush
             if not self.cancelled:
                 _freeze_flush()
                 _bulk_flush()
 
             for _ in range(self.FINAL_SWEEPS):
                 if self.cancelled: break
-                self._sweep_resend_unacked()
+                # use tail-bulk sweep instead of spamming
+                self._sweep_resend_unacked_tail_bulk(force=False)
                 with self._lock:
                     if self.last_acked >= self.seq: break
                 time.sleep(self.FINAL_GAP_SECS)
@@ -1950,6 +2043,9 @@ class _LLMStream:
         except Exception as e:
             self._send_error(f"{type(e).__name__}: {e}", kind="exception")
 
+    # ────────────────────────────────────────────────────────────────
+    # Non-streaming + streaming invocations
+    # ────────────────────────────────────────────────────────────────
     def _invoke_once(self, api: str) -> dict:
         if api == "chat":
             if isinstance(self.kwargs.get("messages"), list):
