@@ -1473,6 +1473,9 @@ class _LLMStream:
 
     STATS_INTERVAL_SECS = 0.5
 
+    _ALLOWED_CHAT_KW = {"messages", "format", "options", "keep_alive", "tools", "tool_choice"}
+    _ALLOWED_GEN_KW  = {"prompt", "images", "options", "keep_alive", "template", "system"}
+
     def __init__(self, src_addr: str, req: dict,
                  on_start=None, on_delta=None, on_done=None):
         self.src_addr = src_addr
@@ -2027,22 +2030,27 @@ class _LLMStream:
         except Exception as e:
             self._send_error(f"{type(e).__name__}: {e}", kind="exception")
 
-    # ────────────────────────────────────────────────────────────────
-    # Non-streaming + streaming invocations
-    # ────────────────────────────────────────────────────────────────
+
+    def _kw_for_client(self, api: str) -> dict:
+        kw = dict(self.kwargs or {})
+        # Never pass 'think' into the Ollama client
+        kw.pop("think", None)
+        allow = self._ALLOWED_CHAT_KW if api == "chat" else self._ALLOWED_GEN_KW
+        return {k: v for k, v in kw.items() if k in allow}
+
     def _invoke_once(self, api: str) -> dict:
+        kw = self._kw_for_client(api)
         if api == "chat":
-            if isinstance(self.kwargs.get("messages"), list):
-                self.kwargs["messages"] = _massage_images_in_messages(
-                    self.kwargs["messages"],
-                    src_addr=self.src_addr,
+            if isinstance(kw.get("messages"), list):
+                kw["messages"] = _massage_images_in_messages(
+                    kw["messages"], src_addr=self.src_addr,
                     log_prefix=f"{self.src_addr} → {self.model}"
                 )
-            return self.client.chat(model=self.model, stream=False, **self.kwargs)
+            return self.client.chat(model=self.model, stream=False, **kw)
         elif api == "generate":
-            return self.client.generate(model=self.model, stream=False, **self.kwargs)
+            return self.client.generate(model=self.model, stream=False, **kw)
         elif api == "embed":
-            return self.client.embed(model=self.model, **self.kwargs)
+            return self.client.embed(model=self.model, **kw)
         elif api == "show":
             raw = self.client.show(self.model)
             return _slim_show_payload_keep_modelfile_no_license(raw)
@@ -2056,26 +2064,26 @@ class _LLMStream:
             return self.client.delete(self.model)
         elif api == "copy":
             src = self.model
-            dst = self.kwargs.get("dst") or self.kwargs.get("to")
+            dst = kw.get("dst") or kw.get("to")
             return self.client.copy(src, dst)
         elif api == "create":
-            return self.client.create(model=self.model, **self.kwargs)
+            return self.client.create(model=self.model, **kw)
         else:
             raise ValueError(f"unsupported api '{api}'")
 
     def _invoke_stream(self, api: str):
-        meta = {"mode":"stream","api":api}
+        meta = {"mode": "stream", "api": api}
+        kw = self._kw_for_client(api)
         if api == "chat":
-            if isinstance(self.kwargs.get("messages"), list):
-                self.kwargs["messages"] = _massage_images_in_messages(
-                    self.kwargs["messages"],
-                    src_addr=self.src_addr,
+            if isinstance(kw.get("messages"), list):
+                kw["messages"] = _massage_images_in_messages(
+                    kw["messages"], src_addr=self.src_addr,
                     log_prefix=f"{self.src_addr} → {self.model}"
                 )
-            gen = self.client.chat(model=self.model, stream=True, **self.kwargs)
+            gen = self.client.chat(model=self.model, stream=True, **kw)
             return gen, meta
         elif api == "generate":
-            gen = self.client.generate(model=self.model, stream=True, **self.kwargs)
+            gen = self.client.generate(model=self.model, stream=True, **kw)
             return gen, meta
         else:
             raise ValueError(f"streaming not supported for api '{api}'")
@@ -2085,20 +2093,25 @@ _llm_streams: Dict[str, _LLMStream] = {}
 
 def _normalize_think_on_body(body: dict) -> dict:
     """
-    Normalize 'think' so downstream clients see it consistently.
-    - top-level: body['think'] = bool
-    - kwargs.think = bool
-    - kwargs.options.thinking = bool
+    Normalize 'think' so downstream code sees it consistently.
+    - Keep a top-level 'think' (bool) for telemetry.
+    - DO NOT add 'think' to kwargs (Ollama client doesn't accept it).
+    - If think=True, set kwargs.options.thinking=True (silently ignored if unsupported).
     """
     out = dict(body or {})
-    think = bool(out.get("think") or (out.get("kwargs", {}) or {}).get("think") or False)
+    # accept either top-level or kwargs.think coming from older clients
+    incoming_kw = (out.get("kwargs") or {})
+    think = bool(out.get("think") or incoming_kw.get("think") or False)
+
     out["think"] = think
     kw = out.setdefault("kwargs", {})
-    kw["think"] = think
+    # ensure no stray kwarg that would break the Ollama client call
+    kw.pop("think", None)
+
     if think:
         opts = kw.setdefault("options", {})
-        # 'thinking' covers a broad set of clients; harmless if ignored
-        opts.setdefault("thinking", True)
+        opts["thinking"] = True  # harmless if model ignores it
+
     return out
 
 def _start_llm(src_addr: str, body: dict,
@@ -2419,8 +2432,18 @@ def _handle_dm(src_addr: str, body: dict):
                         _log("vision.recv", f"📥 {src_addr} sid={sid} b64={b64_ct} blobs={ref_ct}")
                         break
 
+
             opts = _merge_options(s, (kwargs.get("options") or {}))
-            call_kwargs = dict(kwargs); call_kwargs["messages"] = req_messages; call_kwargs["options"]  = opts
+            call_kwargs = dict(kwargs)
+            call_kwargs["messages"] = req_messages
+            call_kwargs["options"]  = opts
+
+            # Preserve and apply 'think' from the incoming body/kwargs
+            think_flag = bool(body.get("think") or kwargs.get("think"))
+            # never pass as a raw kwarg to the client
+            call_kwargs.pop("think", None)
+            if think_flag:
+                call_kwargs.setdefault("options", {})["thinking"] = True
 
             def on_start():
                 if stream: _start_assistant(src_addr, sid)
@@ -2435,10 +2458,17 @@ def _handle_dm(src_addr: str, body: dict):
                 _finish_assistant(src_addr, sid)
 
             req_body = {
-                "event":"llm.request","api": api,"model": s.model,"stream": stream,
-                "kwargs": call_kwargs,"id": body.get("id"),"sid": sid,
+                "event": "llm.request",
+                "api":   api,
+                "model": s.model,
+                "stream": stream,
+                "kwargs": call_kwargs,
+                "id": body.get("id"),
+                "sid": sid,
+                "think": think_flag,   # ← carry to _start_llm → _normalize_think_on_body
             }
             rid = _start_llm(src_addr, req_body, on_start=on_start, on_delta=on_delta_fn, on_done=on_done_fn)
+
             _log("llm.start", f"{src_addr} sid={sid} id={rid} api={api} model={s.model} stream={stream}")
             return
         else:
