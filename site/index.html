@@ -4266,7 +4266,7 @@ ${META_END}`;
           st.onChunk(part);
           st.next++;
         }
-        renderChat();
+        requestRenderChat();
         sendAck(id, st.next - 1);
       }
       /* ========= Coalesced ACKs for streams ========= */
@@ -5166,6 +5166,17 @@ ${META_END}`;
         // Not handled here
         return false;
       }
+// Coalesced chat renderer: batches many triggers into one paint
+let __renderChatQueued = false;
+function requestRenderChat() {
+  if (__renderChatQueued) return;
+  __renderChatQueued = true;
+  const raf = window.requestAnimationFrame || ((fn) => setTimeout(fn, 16));
+  raf(() => {
+    __renderChatQueued = false;
+    try { renderChat(); } catch (e) { console.warn('[requestRenderChat] render failed:', e); }
+  });
+}
 
 
 
