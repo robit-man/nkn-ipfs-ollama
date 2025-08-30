@@ -824,6 +824,15 @@
       margin-top: 10px
     }
 
+    .msg.assistant .thinking {
+      white-space: pre-wrap;
+      opacity: .8;
+      border-left: 3px solid var(--border, #333);
+      padding: .5rem .75rem;
+      margin: .25rem 0 .5rem;
+    }
+
+
     .settings-data-row {
       display: flex;
       flex-flow: row;
@@ -1060,8 +1069,6 @@
           <div id="peers" class="chip" title="Active clients the hub reports">Peers</div>
           <div id="latent" class="chip" title="Round‑trip latency to the hub">Latency</div>
         </div>
-
-
       </div>
 
 
@@ -2829,6 +2836,25 @@
         chat.appendChild(w);
         chat.scrollTop = chat.scrollHeight;
       }
+      // Creates/updates a <pre class="thinking"> inside the assistant message bubble
+      function setStreamingThinking(streamId, text) {
+        const root = document.querySelector(`.msg.assistant[data-stream-id="${streamId}"]`);
+        if (!root) return;
+
+        let box = root.querySelector('.thinking');
+        if (!box) {
+          box = document.createElement('pre');
+          box.className = 'thinking';
+          box.setAttribute('aria-label', 'Model thinking');
+          // insert near the top so the final answer stays prominent
+          root.insertBefore(box, root.firstChild);
+        }
+        box.textContent = text;
+
+        // respect the toggle visibility
+        const show = !!(window.settings && settings.think);
+        box.style.display = show ? '' : 'none';
+      }
       function setStreamingContent(id, fullText) {
         if (!streams.has(id) && id !== currentStreamId && id !== pendingStreamId) return;
 
@@ -3498,107 +3524,128 @@ ${META_END}`;
       function _pick(...vals) { for (const v of vals) if (v != null) return v; return null; }
 
       // Accepts either a flat shape or nested {ollama|approx|stats|metrics:{...}}
-      function extractTPSAndTokens(any) {
-        if (!any || typeof any !== 'object') return null;
+      // Pull TPS/tokens from many possible shapes (flat or nested) and compute a reliable TPS.
+      function extractTPSAndTokens(src) {
+        if (!src || typeof src !== 'object') return null;
 
         // unwrap common wrappers
         const layers = [
-          any,
-          any.data,
-          any.stats,
-          any.metrics,
-          any.ollama,
-          any.approx
+          src,
+          src.data,
+          src.stats,
+          src.metrics,
+          src.ollama,
+          src.approx
         ].filter(o => o && typeof o === 'object');
 
-        let tps = null, tokens = null, approx = false;
-
-        for (const o of layers) {
-          // tokens/sec
-          tps = _pick(_num(o.tps), _num(o.tokens_per_sec), _num(o.tok_per_sec), _num(o.tokps), tps);
-          // token count
-          tokens = _pick(_num(o.tokens), _num(o.eval_count), _num(o.output_tokens), tokens);
-          if (o === any.approx) approx = true;
-        }
-
-        // Also handle Ollama's nanosecond durations if present (more reliable, final)
-        // eval_count / (eval_duration_ns / 1e9)
-        const evalCnt = _pick(layers[0]?.eval_count, layers[1]?.eval_count, any?.ollama?.eval_count);
-        const evalDurNs = _pick(layers[0]?.eval_duration, layers[1]?.eval_duration, any?.ollama?.eval_duration);
-        if (tps == null && _num(evalCnt) != null && _num(evalDurNs) != null && evalDurNs > 0) {
-          tps = Number(evalCnt) / (Number(evalDurNs) / 1e9);
-          approx = false; // this is authoritative
-        }
-
-        if (tps == null && tokens == null) return null;
-        return { tps, tokens, approx };
-      }
-      // Pull TPS/tokens from many possible shapes
-      function extractTPSAndTokens(src) {
-        if (!src || typeof src !== 'object') return null;
-        const tryNums = (...vals) => {
+        const tryNum = (v) => {
+          const n = Number(v);
+          return Number.isFinite(n) ? n : null;
+        };
+        const pickNum = (...vals) => {
           for (const v of vals) {
-            const n = Number(v);
-            if (Number.isFinite(n)) return n;
+            const n = tryNum(v);
+            if (n != null) return n;
           }
           return null;
         };
-        const tps = tryNums(
-          src.tps, src.tokens_per_sec, src.tok_per_sec, src.tokps,
-          src.metrics && src.metrics.tps
+
+        // tokens (prefer exact eval_count; fall back to approx.tokens)
+        const tokens = pickNum(
+          layers[0]?.eval_count, layers[1]?.eval_count,
+          src?.ollama?.eval_count,
+          layers[0]?.tokens, layers[1]?.tokens,
+          src?.approx?.tokens, src?.metrics?.tokens
         );
-        const tokens = tryNums(
-          src.tokens, src.eval_count, src.output_tokens,
-          src.metrics && src.metrics.tokens
+
+        // candidates for instantaneous TPS
+        let tps = pickNum(
+          layers[0]?.tps, layers[1]?.tps,
+          layers[0]?.tokens_per_sec, layers[1]?.tokens_per_sec,
+          src?.ollama?.tokens_per_sec,
+          src?.tok_per_sec, src?.tokps,
+          src?.metrics?.tps
         );
-        return (tps != null || tokens != null) ? { tps, tokens } : null;
+        let approx = false;
+
+        // If no direct TPS, compute from precise durations when present.
+        // Ollama exposes eval_duration in ns or ms depending on path; accept either.
+        const evalCnt = pickNum(layers[0]?.eval_count, layers[1]?.eval_count, src?.ollama?.eval_count);
+        const durNs = pickNum(layers[0]?.eval_duration, layers[1]?.eval_duration, src?.ollama?.eval_duration);
+        const durMs = pickNum(layers[0]?.eval_duration_ms, layers[1]?.eval_duration_ms, src?.ollama?.eval_duration_ms);
+        const elapsedMs = pickNum(layers[0]?.elapsed_ms, layers[1]?.elapsed_ms, src?.elapsed_ms);
+
+        if (tps == null && evalCnt != null) {
+          if (durMs != null && durMs > 0) tps = evalCnt / (durMs / 1000);
+          else if (durNs != null && durNs > 0) tps = evalCnt / (durNs / 1e9);
+        }
+
+        // As a last resort, wall-clock from tokens & elapsed
+        if (tps == null && tokens != null && elapsedMs != null && elapsedMs > 0) {
+          tps = tokens / (elapsedMs / 1000);
+          approx = true;
+        }
+
+        // If still nothing, see if approx buckets included chars_per_sec
+        const charsPerSec = pickNum(layers[0]?.chars_per_sec, src?.approx?.chars_per_sec);
+        if (tps == null && charsPerSec != null) {
+          tps = charsPerSec / 4; // ~4 chars/token heuristic
+          approx = true;
+        }
+
+        return (tps != null || tokens != null) ? { tps, tokens, approx } : null;
       }
 
 
 
-      // --- helpers used by onInboundData ---
       function applyStreamStats(id, env) {
         if (!id || !env) return;
+
         let rec = statsByStream.get(id);
         if (!rec) {
-          rec = { tps: null, tokens: 0, approx: true, startAt: Date.now(), updatedAt: Date.now() };
+          rec = {
+            tps: null,
+            tokens: 0,
+            approx: true,
+            startAt: Date.now(),
+            updatedAt: Date.now(),
+            finalized: false,
+            tpsFinal: null
+          };
           statsByStream.set(id, rec);
         }
 
-        // Pull candidates from the envelope the hub sends
-        const approx = (env.approx || {});
-        const ollama = (env.ollama || {});
+        // If already sealed, ignore any late/jittery envelopes
+        if (rec.finalized) return;
 
-        // 1) tokens (cumulative best-effort)
-        // Prefer exact eval_count if present; else use approx.tokens; else keep previous.
+        // Pull candidates (flat or nested)
+        const pulled = extractTPSAndTokens(env) || {};
+        const envOllama = (env.ollama || {});
+        const envApprox = (env.approx || {});
+
+        // 1) tokens (prefer exact eval_count)
         let newTokens = rec.tokens;
-        if (Number.isFinite(ollama.eval_count)) newTokens = Math.max(newTokens, Number(ollama.eval_count));
-        else if (Number.isFinite(approx.tokens)) newTokens = Math.max(newTokens, Number(approx.tokens));
+        if (Number.isFinite(envOllama.eval_count)) newTokens = Math.max(newTokens, Number(envOllama.eval_count));
+        else if (Number.isFinite(envApprox.tokens)) newTokens = Math.max(newTokens, Number(envApprox.tokens));
+        else if (Number.isFinite(pulled.tokens)) newTokens = Math.max(newTokens, Number(pulled.tokens));
 
-        // 2) instantaneous TPS candidates
-        let realTps = null;
-        if (Number.isFinite(ollama.tokens_per_sec)) realTps = Number(ollama.tokens_per_sec);
-
-        let approxTps = null;
-        if (Number.isFinite(approx.tokens_per_sec)) approxTps = Number(approx.tokens_per_sec);
-        else if (Number.isFinite(approx.chars_per_sec)) {
-          // chars → tokens ~ /4 heuristic
-          approxTps = approx.chars_per_sec / 4;
-        }
-
-        // 3) Wall-time fallback when neither real nor approx instantaneous TPS is present
-        let wallTps = null;
-        const elapsedS = Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
-        if (newTokens > 0) wallTps = newTokens / elapsedS;
-
-        // Choose the best signal this tick
+        // 2) pick the best instantaneous TPS sample
         let sampleTps = null;
         let isApprox = true;
-        if (Number.isFinite(realTps)) { sampleTps = realTps; isApprox = false; }
-        else if (Number.isFinite(approxTps)) { sampleTps = approxTps; isApprox = true; }
-        else if (Number.isFinite(wallTps)) { sampleTps = wallTps; isApprox = true; }
 
-        // Smooth it if we have a sample
+        if (Number.isFinite(envOllama.tokens_per_sec)) {
+          sampleTps = Number(envOllama.tokens_per_sec);
+          isApprox = false;
+        } else if (Number.isFinite(pulled.tps)) {
+          sampleTps = Number(pulled.tps);
+          isApprox = !!pulled.approx;
+        } else {
+          // 3) last-resort wall clock
+          const elapsedS = Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
+          if (newTokens > 0) { sampleTps = newTokens / elapsedS; isApprox = true; }
+        }
+
+        // Smooth the live value
         if (Number.isFinite(sampleTps)) {
           if (!Number.isFinite(rec.tps)) rec.tps = sampleTps;
           else rec.tps = (1 - TPS_SMOOTH) * rec.tps + TPS_SMOOTH * sampleTps;
@@ -3608,6 +3655,33 @@ ${META_END}`;
         rec.tokens = newTokens;
         rec.updatedAt = Date.now();
         statsByStream.set(id, rec);
+
+        // 4) Seal on final envelopes — pick the most reliable, stop future changes
+        const isFinal = (env.event === 'llm.done') || (String(env.phase || '').toLowerCase() === 'final');
+        if (isFinal) {
+          let finalTps = null;
+
+          if (Number.isFinite(envOllama.tokens_per_sec)) {
+            finalTps = Number(envOllama.tokens_per_sec);                 // authoritative
+          } else if (pulled && Number.isFinite(pulled.tps) && !pulled.approx) {
+            finalTps = Number(pulled.tps);
+          } else if (Number.isFinite(rec.tps)) {
+            finalTps = rec.tps;                                          // use the EMA we have
+          } else if (Number.isFinite(rec.tokens)) {
+            const elapsedS = (typeof env.elapsed_ms === 'number' && env.elapsed_ms > 0)
+              ? (env.elapsed_ms / 1000)
+              : Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
+            if (elapsedS > 0 && rec.tokens > 0) finalTps = rec.tokens / elapsedS;
+          }
+
+          if (Number.isFinite(finalTps)) {
+            rec.tpsFinal = finalTps;
+            rec.tps = finalTps;                  // make public .tps equal the sealed value
+            rec.approx = !Number.isFinite(envOllama.tokens_per_sec) && !!(pulled && pulled.approx);
+          }
+          rec.finalized = true;                  // <- prevents any later drift
+          statsByStream.set(id, rec);
+        }
       }
 
       // VERY rough chars→tokens converter for live fallback between stats frames
@@ -4096,11 +4170,6 @@ ${META_END}`;
         })();
       }
 
-      function handleChunk(id, seq, data) {
-        const st = streams.get(id); if (!st) return;
-        st.buffer.set(seq, data);
-        _drain(id); // cheap: starts/continues a time-sliced pull if needed
-      }
       // capture tool calls per stream id
       const toolCallsByStream = new Map(); // id -> [{ name, arguments, raw }]
 
@@ -5039,6 +5108,7 @@ ${META_END}`;
 
         if (ev === 'llm.start') {
           const { id, stream } = body;
+          const route = routeFor(id);
           ackInit(id);
           console.info('[llm.start]', { id, stream });
 
@@ -5089,7 +5159,20 @@ ${META_END}`;
             return true;
           }
 
-          // Chat bubble sink
+          // Summary sink: NEVER create chat bubbles; accumulate only
+          if (route && (route.sink === 'summary' || route.summary === true)) {
+            startStream(id, (part) => {
+              const text = extractDelta(part);
+              const think = extractThinkingDelta(part);
+              const s = getSession(); if (!s) return;
+              if (text) s._summaryAcc = (s._summaryAcc || '') + text;
+              if (think) s._summaryAccThink = (s._summaryAccThink || '') + think;
+              try { saveJSON(STORAGE.SESS, sessions); } catch { }
+            });
+            return true;
+          }
+
+          // Chat bubble sink (default)
           if (stream) {
             addStreamingAssistantBubble(id);
             const sess = getSession(); if (!sess) return true;
@@ -5097,8 +5180,15 @@ ${META_END}`;
             saveJSON(STORAGE.SESS, sessions);
 
             let acc = '';
+            let thinkAcc = ''; // ← fix: declare to avoid ReferenceError
             startStream(id, (part) => {
               const text = extractDelta(part);
+              const think = extractThinkingDelta(part);
+
+              if (think) {
+                thinkAcc += think;
+                setStreamingThinking(id, thinkAcc);
+              }
               if (text) {
                 acc += text;
                 setStreamingContent(id, acc);
@@ -5119,6 +5209,8 @@ ${META_END}`;
         }
 
         if (ev === 'llm.stats') {
+          const rec = statsByStream.get(body.id);
+          if (rec && rec.finalized) return true;  // ignore late stats after sealing
           applyStreamStats(body.id, body);
           if (useStatsLatency && statsLatencyActive) {
             updateLatencyFromStatsEnvelope(body);
@@ -5131,6 +5223,29 @@ ${META_END}`;
         if (ev === 'llm.bulk') {
           const { id, items = [], last_seq, first_seq } = body || {};
           if (!id || !items.length) return true;
+
+          const route = routeFor(id);
+
+          // Summary sink: accumulate only; never render into chat
+          if (route && (route.sink === 'summary' || route.summary === true)) {
+            const s = getSession();
+            if (s) {
+              for (let i = 0; i < items.length; i++) {
+                const d = items[i]?.data ?? items[i];
+                const t = extractDelta(d); if (t) s._summaryAcc = (s._summaryAcc || '') + t;
+                const th = extractThinkingDelta(d); if (th) s._summaryAccThink = (s._summaryAccThink || '') + th;
+              }
+              try { saveJSON(STORAGE.SESS, sessions); } catch { }
+            }
+            // ACK frames; no chat UI writes
+            for (let i = 0; i < items.length; i++) {
+              const seq = (typeof items[i]?.seq === 'number') ? items[i].seq
+                : (typeof first_seq === 'number') ? (first_seq + i) : null;
+              if (seq != null) { ackNote(id, seq); if (hasAckRendered) ackRendered(id, seq); }
+            }
+            if (typeof last_seq === 'number') sendAck(id, last_seq);
+            return true;
+          }
 
           // Any bulk activity keeps STOP latched for this stream
           uiLatch.activity(id);
@@ -5162,9 +5277,22 @@ ${META_END}`;
           return true;
         }
 
+
         if (ev === 'llm.chunk') {
           // keep STOP latched on every packet for this id
           uiLatch.activity(body.id);
+          const route = routeFor(body.id);
+
+          // Summary sink: accumulate only; never render into chat
+          if (route && (route.sink === 'summary' || route.summary === true)) {
+            if (statsLatencyActive) {
+              updateLatencyFromStatsEnvelope(body);
+              updateLatencyFromStatsEnvelope(body.data || {});
+            }
+            ackNote(body.id, body.seq);
+            if (hasAckRendered) ackRendered(body.id, body.seq);
+            return true;
+          }
 
           if (statsLatencyActive) {
             updateLatencyFromStatsEnvelope(body);
@@ -5178,11 +5306,47 @@ ${META_END}`;
         }
 
         if (ev === 'llm.done') {
+
           const id = body.id;
 
           // Ignore stale finishes for old streams (prevents PLAY flicker)
           if (uiLatch && typeof uiLatch.abandonIfOld === 'function' && uiLatch.abandonIfOld(id)) {
             return true;
+          }
+
+          // Helpers (local to this block)
+          function _extractThinkingFull(d) {
+            if (!d || typeof d !== 'object') return '';
+            if (d.message && typeof d.message.thinking === 'string') return d.message.thinking;
+            if (d.message && typeof d.message.reasoning === 'string') return d.message.reasoning;
+            if (typeof d.thinking === 'string') return d.thinking;
+            if (typeof d.reasoning === 'string') return d.reasoning;
+            const ch = Array.isArray(d.choices) && d.choices[0];
+            if (ch && ch.message && typeof ch.message.reasoning === 'string') return ch.message.reasoning;
+            if (ch && ch.message && typeof ch.message.thinking === 'string') return ch.message.thinking;
+            return '';
+          }
+          function _setStreamingThinking(streamId, text) {
+            if (!text) return;
+            // Prefer the current stream bubble; fallback to last assistant bubble.
+            const root =
+              document.querySelector(`.msg.assistant[data-stream-id="${streamId}"]`) ||
+              document.querySelector('.msg.assistant:last-of-type');
+            if (!root) return;
+
+            let box = root.querySelector('.thinking');
+            if (!box) {
+              box = document.createElement('pre');
+              box.className = 'thinking';
+              box.setAttribute('aria-label', 'Model thinking');
+              root.insertBefore(box, root.firstChild);
+            }
+            // append if it looks new, else set
+            const prev = box.textContent || '';
+            box.textContent = prev && !text.startsWith(prev) ? (prev + text) : (text || prev);
+
+            const show = !!(window.settings && settings.think);
+            box.style.display = show ? '' : 'none';
           }
 
           // 1) Extract any tail text carried on the done envelope
@@ -5199,6 +5363,12 @@ ${META_END}`;
             return '';
           })();
 
+          // NEW: extract any tail reasoning/thinking and render it
+          const tailThinking = _extractThinkingFull(body && body.data || {});
+          if (tailThinking) {
+            _setStreamingThinking(id, tailThinking);
+          }
+
           const hasAckRendered = (typeof ackRendered === 'function');
           const lastRendered = (typeof lastSeqForStream === 'function') ? lastSeqForStream(id) : undefined;
 
@@ -5213,14 +5383,7 @@ ${META_END}`;
                 scroll: true, caretToEnd: true
               });
             } else {
-              const sess = getSession();
-              if (sess && Array.isArray(sess.messages) && sess.messages.length) {
-                for (let i = sess.messages.length - 1; i >= 0; i--) {
-                  const m = sess.messages[i];
-                  if (m.role === 'assistant') { m.content = (m.content || '') + tail; break; }
-                }
-                saveJSON(STORAGE.SESS, sessions);
-              }
+              if (route && route.sink !== 'chat') { /* no chat write */ }
             }
           }
 
@@ -5252,34 +5415,51 @@ ${META_END}`;
 
           applyStreamStats(id, body);
 
-          // TPS fallback if backend didn’t report tokens/sec
+          // TPS fallback ONLY if not already sealed by applyStreamStats (prevents drift)
           {
             const rec = statsByStream.get(id);
-            if (rec && (!Number.isFinite(rec.tps) || rec.tps <= 0)) {
-              const elapsed = Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
-              if (Number.isFinite(rec.tokens) && rec.tokens > 0) {
-                rec.tps = rec.tokens / elapsed;
-                rec.approx = true;
+            if (rec && !rec.finalized) {
+              let finalTps = Number.isFinite(rec.tpsFinal) ? rec.tpsFinal
+                : Number.isFinite(rec.tps) ? rec.tps : null;
+              if (!Number.isFinite(finalTps) && Number.isFinite(rec.tokens)) {
+                const elapsedS = (typeof body.elapsed_ms === 'number' && body.elapsed_ms > 0)
+                  ? (body.elapsed_ms / 1000)
+                  : Math.max(0.25, (Date.now() - (rec.startAt || Date.now())) / 1000);
+                if (elapsedS > 0 && rec.tokens > 0) finalTps = rec.tokens / elapsedS;
+              }
+              if (Number.isFinite(finalTps)) {
+                rec.tpsFinal = finalTps;
+                rec.tps = finalTps;
+                rec.approx = !Number.isFinite(body?.ollama?.tokens_per_sec);
+                rec.finalized = true;
                 statsByStream.set(id, rec);
               }
             }
           }
 
+
           // Persist TPS on last assistant turn (chat sink)
           {
-            const sess = getSession();
-            if (sess && Array.isArray(sess.messages)) {
-              for (let i = sess.messages.length - 1; i >= 0; i--) {
-                if (sess.messages[i].role === 'assistant') {
-                  const st = statsByStream.get(id);
-                  if (st && Number.isFinite(st.tps)) {
-                    sess.messages[i]._tps = st.tps;
-                    sess.messages[i]._tpsIsApprox = !!st.approx;
+            if (route && route.sink === 'chat') {
+              const sess = getSession();
+              if (sess && Array.isArray(sess.messages)) {
+                for (let i = sess.messages.length - 1; i >= 0; i--) {
+                  if (sess.messages[i].role === 'assistant') {
+                    const st = statsByStream.get(id);
+                    if (st && Number.isFinite(st.tps)) {
+                      sess.messages[i]._tps = st.tps;
+                      sess.messages[i]._tpsIsApprox = !!st.approx;
+                    }
+                    const sealed = st && (Number.isFinite(st.tpsFinal) ? st.tpsFinal : null);
+                    if (Number.isFinite(sealed)) {
+                      sess.messages[i]._tps = sealed;
+                      sess.messages[i]._tpsIsApprox = !!(st && st.tpsFinal == null && st.approx);
+                    }
+                    break;
                   }
-                  break;
                 }
+                saveJSON(STORAGE.SESS, sessions);
               }
-              saveJSON(STORAGE.SESS, sessions);
             }
           }
 
@@ -5301,6 +5481,17 @@ ${META_END}`;
               if (typeof sysgenPending !== 'undefined') sysgenPending.delete(id);
             }
             isSysGenStreaming = false; sysgenCurrentId = null;
+          }
+
+          // Commit summary safely into session metadata (no chat injection)
+          if (route && (route.sink === 'summary' || route.summary === true)) {
+            const s = getSession();
+            if (s) {
+              s._summaryText = (s._summaryAcc || '') + (tail || '');
+              if ((s._summaryAccThink || tailThinking)) s._summaryReasoning = (s._summaryAccThink || '') + (tailThinking || '');
+              delete s._summaryAcc; delete s._summaryAccThink;
+              saveJSON(STORAGE.SESS, sessions);
+            }
           }
 
           // 6) Optional summary path — call your summarizer later
@@ -5350,6 +5541,7 @@ ${META_END}`;
           // do not clear pendingStreamId immediately; it clears when flip happens
           // but make sure route is cleared
           clearRoute(id);
+
           // 8) Schedule title summary ONLY after injection into chat is impossible
           (function scheduleSummaryOnceNoInjectionPossible() {
             const sess = getSession();
@@ -5401,6 +5593,39 @@ ${META_END}`;
 
 
         if (ev === 'llm.result') {
+          // Helpers (local to this block)
+          function _extractThinkingFull(d) {
+            if (!d || typeof d !== 'object') return '';
+            if (d.message && typeof d.message.thinking === 'string') return d.message.thinking;
+            if (d.message && typeof d.message.reasoning === 'string') return d.message.reasoning;
+            if (typeof d.thinking === 'string') return d.thinking;
+            if (typeof d.reasoning === 'string') return d.reasoning;
+            const ch = Array.isArray(d.choices) && d.choices[0];
+            if (ch && ch.message && typeof ch.message.reasoning === 'string') return ch.message.reasoning;
+            if (ch && ch.message && typeof ch.message.thinking === 'string') return ch.message.thinking;
+            return '';
+          }
+          function _setStreamingThinking(streamId, text) {
+            if (!text) return;
+            const root =
+              document.querySelector(`.msg.assistant[data-stream-id="${streamId}"]`) ||
+              document.querySelector('.msg.assistant:last-of-type');
+            if (!root) return;
+
+            let box = root.querySelector('.thinking');
+            if (!box) {
+              box = document.createElement('pre');
+              box.className = 'thinking';
+              box.setAttribute('aria-label', 'Model thinking');
+              root.insertBefore(box, root.firstChild);
+            }
+            box.textContent = text;
+            const show = !!(window.settings && settings.think);
+            box.style.display = show ? '' : 'none';
+          }
+
+          const route = routeFor(body.id);
+
           // 1) Callback sink
           if (route && route.sink === 'callback' && typeof route.cb === 'function') {
             try { route.cb({ ok: true, body }); } catch { }
@@ -5449,9 +5674,26 @@ ${META_END}`;
             console.debug('[caps-toggle] skipped:', e);
           }
 
-          // 4) Chat-style results
+          // 4) Summary sink: accumulate to session metadata, do NOT inject a chat message
+          if (route && (route.sink === 'summary' || route.summary === true)) {
+            const s = getSession();
+            if (s) {
+              const text = extractFull(body.data) || '';
+              const think = _extractThinkingFull(body && body.data || {});
+              s._summaryAcc = (s._summaryAcc || '') + text;
+              if (think) s._summaryAccThink = (s._summaryAccThink || '') + think;
+              saveJSON(STORAGE.SESS, sessions);
+            }
+            clearRoute(body.id);
+            return true;
+          }
+
+          // 5) Chat-style results (chat sink ONLY)
           const sess = getSession();
-          if (!sess) { clearRoute(body.id); return true; }
+          if (route && route.sink !== 'chat') {
+            clearRoute(body.id);
+            return true;
+          }
 
           const finalText = (() => {
             const d = body && body.data;
@@ -5464,7 +5706,9 @@ ${META_END}`;
             return extractFull(d) || '';
           })();
 
-          if (!finalText) {
+          const finalThinking = _extractThinkingFull(body && body.data || '');
+
+          if (!finalText && !finalThinking) {
             renderChat();
             clearRoute(body.id);
             return true;
@@ -5481,28 +5725,46 @@ ${META_END}`;
           };
 
           let merged = false;
-          for (let i = sess.messages.length - 1; i >= 0; i--) {
-            const m = sess.messages[i];
-            if (m.role === 'assistant') {
-              m.content = mergeText(m.content, finalText);
-              merged = true;
-              const st = statsByStream.get(body.id);
-              if (st && Number.isFinite(st.tps)) {
-                m._tps = st.tps;
-                m._tpsIsApprox = !!st.approx;
+          if (finalText) {
+            for (let i = sess.messages.length - 1; i >= 0; i--) {
+              const m = sess.messages[i];
+              if (m.role === 'assistant') {
+                m.content = mergeText(m.content, finalText);
+                merged = true;
+                const st = statsByStream.get(body.id);
+                const sealed = st && (Number.isFinite(st.tpsFinal) ? st.tpsFinal : st.tps);
+                if (Number.isFinite(sealed)) {
+                  m._tps = sealed;
+                  m._tpsIsApprox = !!(st && st.tpsFinal == null && st.approx);
+                }
+                break;
               }
-              break;
             }
-          }
-          if (!merged) {
-            sess.messages.push({ role: 'assistant', content: finalText, ts: Date.now() });
+            if (!merged) {
+              // During results, only show sealed TPS if it already exists (avoid jitter)
+              const st = statsByStream.get(body.id);
+              const sealed = st && (Number.isFinite(st.tpsFinal) ? st.tpsFinal : null);
+              const msg = { role: 'assistant', content: finalText, ts: Date.now() };
+              if (Number.isFinite(sealed)) {
+                msg._tps = sealed;
+                msg._tpsIsApprox = !!(st && st.tpsFinal == null && st.approx);
+              }
+              sess.messages.push(msg);
+            }
           }
 
           saveJSON(STORAGE.SESS, sessions);
           renderChat();
+
+          // Render the thinking block (after renderChat to ensure the bubble exists)
+          if (finalThinking) {
+            requestAnimationFrame(() => _setStreamingThinking(body.id, finalThinking));
+          }
+
           clearRoute(body.id);
           return true;
         }
+
 
         if (ev === 'llm.error') {
           ackFlushAndClear(body.id, 0);
@@ -5582,6 +5844,40 @@ ${META_END}`;
       /* ========= /Inbound demux ========= */
 
 
+      // Return only *delta* reasoning/thinking for streaming chunks
+      function extractThinkingDelta(part) {
+        if (!part) return '';
+        // common “flat” and nested shapes
+        const d = part.data || part.message || part;
+
+        // providers vary; prefer explicit delta keys
+        if (typeof d.thinking_delta === 'string') return d.thinking_delta;
+        if (typeof d.reasoning_delta === 'string') return d.reasoning_delta;
+
+        // OpenAI-like chunk shapes
+        const ch = d.choices && d.choices[0];
+        if (ch && ch.delta) {
+          if (typeof ch.delta.reasoning === 'string') return ch.delta.reasoning;
+          if (typeof ch.delta.thinking === 'string') return ch.delta.thinking;
+        }
+
+        // avoid returning full blobs here — deltas only
+        return '';
+      }
+
+      // Return the full reasoning/thinking from a final result envelope
+      function extractThinkingFull(data) {
+        if (!data) return '';
+        if (data.message && typeof data.message.thinking === 'string') return data.message.thinking;
+        if (typeof data.thinking === 'string') return data.thinking;
+        if (data.message && typeof data.message.reasoning === 'string') return data.message.reasoning;
+
+        const ch = data.choices && data.choices[0];
+        if (ch && ch.message && typeof ch.message.reasoning === 'string') return ch.message.reasoning;
+        if (ch && ch.message && typeof ch.message.thinking === 'string') return ch.message.thinking;
+
+        return '';
+      }
 
 
       function extractDelta(part) {

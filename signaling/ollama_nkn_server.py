@@ -1234,13 +1234,19 @@ def _extract_delta_from_part(api: str, part: Any) -> str:
     return ""
 
 def _extract_thinking_from_part(api: str, part: Any) -> str:
+    """Extract model 'thinking' (aka 'reasoning') delta from a streamed part."""
     try:
-        if api == "chat":
-            msg = part.get("message") if isinstance(part, dict) else None
-            if msg and isinstance(msg, dict):
-                t = msg.get("thinking")
+        if isinstance(part, dict):
+            # Primary: chat-style payloads
+            if api == "chat":
+                msg = part.get("message") or {}
+                t = msg.get("thinking") or msg.get("reasoning")
                 if isinstance(t, str):
                     return t
+            # Fallbacks: some providers surface it at top-level
+            t2 = part.get("thinking") or part.get("reasoning")
+            if isinstance(t2, str):
+                return t2
     except Exception:
         pass
     return ""
@@ -1824,40 +1830,40 @@ class _LLMStream:
     # Send helpers for coalesced text
     # ────────────────────────────────────────────────────────────────
     def _send_coalesced_field(self, field: str, text: str):
+        """
+        Coalesce either assistant 'content' or 'thinking'/'reasoning' into a chat-style chunk.
+        We always normalize to 'thinking' on the wire so the client has one place to read it.
+        """
         if not text:
             return
+        fld = "thinking" if field in ("thinking", "reasoning") else field
         if self.api == "chat":
-            # keep role for clients that expect it on message
-            data = {"message": {"role": "assistant", field: text}}
+            data = {"message": {"role": "assistant", fld: text}}
         else:
-            # non-chat has no "thinking", but harmless to re-use response path
+            # Non-chat APIs don’t have a formal thinking field; using response is safest.
             data = {"response": text}
         self._send_chunk(data)
 
-    def _send_coalesced_text(self, text: str):
-        # backwards compat: coalesce as content
-        self._send_coalesced_field("content", text)
-
-    # ────────────────────────────────────────────────────────────────
-    # Stats
-    # ────────────────────────────────────────────────────────────────
     def _update_stats_from_part(self, part: dict):
+        # count thinking chars for cps/tokens approximation
         now = time.monotonic()
         think_delta = _extract_thinking_from_part(self.api, part)
         if think_delta:
-            if self._stats["t0"] is None: self._stats["t0"] = now
+            if self._stats["t0"] is None:
+                self._stats["t0"] = now
             self._stats["tlast"] = now
             self._stats["chars"] += len(think_delta)
         try:
             if isinstance(part, dict):
                 if "eval_count" in part: self._stats["eval_count"] = int(part["eval_count"])
                 if "eval_duration" in part: self._stats["eval_duration_s"] = _dur_to_seconds(part["eval_duration"])
-                if (not self._stats["eval_duration_s"]) and ("total_duration" in part):
+                if (not self._stats.get("eval_duration_s")) and ("total_duration" in part):
                     self._stats["eval_duration_s"] = _dur_to_seconds(part["total_duration"])
                 if "prompt_eval_count" in part: self._stats["prompt_eval_count"] = int(part["prompt_eval_count"])
                 if "prompt_eval_duration" in part: self._stats["prompt_eval_duration_s"] = _dur_to_seconds(part["prompt_eval_duration"])
         except Exception:
             pass
+
 
     def _emit_stats(self, phase: str = "stream"):
         t0 = self._stats["t0"]; tlast = self._stats["tlast"]
@@ -2143,23 +2149,21 @@ def _normalize_think_on_body(body: dict) -> dict:
     """
     Normalize 'think' so downstream code sees it consistently.
     - Keep a top-level 'think' (bool) for telemetry.
-    - DO NOT add 'think' to kwargs (Ollama client doesn't accept it).
-    - If think=True, set kwargs.options.thinking=True (silently ignored if unsupported).
+    - Do not pass 'think' directly to the client lib.
+    - Map to kwargs.options.thinking=True (providers that support 'reasoning' will ignore/accept gracefully).
     """
     out = dict(body or {})
-    # accept either top-level or kwargs.think coming from older clients
     incoming_kw = (out.get("kwargs") or {})
     think = bool(out.get("think") or incoming_kw.get("think") or False)
 
     out["think"] = think
     kw = out.setdefault("kwargs", {})
-    # ensure no stray kwarg that would break the Ollama client call
     kw.pop("think", None)
-
     if think:
         opts = kw.setdefault("options", {})
-        opts["thinking"] = True  # harmless if model ignores it
-
+        # Prefer the common 'thinking' switch; add 'reasoning' too if your provider expects it.
+        opts["thinking"] = True
+        # opts["reasoning"] = True  # <-- uncomment if your backend uses this flag
     return out
 
 def _start_llm(src_addr: str, body: dict,
