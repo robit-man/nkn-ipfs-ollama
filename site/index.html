@@ -745,7 +745,7 @@
       pointer-events: none;
       display: flex;
       overflow: auto;
-      padding: 2rem 0.5rem;
+      padding: unset;
       z-index: 50;
       backdrop-filter: blur(10px);
       filter: blur(100px);
@@ -6312,8 +6312,8 @@ ${META_END}`;
       }, 250));
 
       // Settings modal
-      function openSettings() { updateSettingsUI(); el('overlay').style.width = '100vw'; el('overlay').style.height = '100vh'; el('overlay').style.pointerEvents = 'all'; el('overlay').style.filter = 'blur(0px)'; }
-      function closeSettings() { el('overlay').style.width = '0vw'; el('overlay').style.height = '0vh'; el('overlay').style.pointerEvents = 'none'; el('overlay').style.filter = 'blur(100px)'; }
+      function openSettings() { updateSettingsUI(); el('overlay').style.width = '100vw'; el('overlay').style.height = '100vh'; el('overlay').style.pointerEvents = 'all'; el('overlay').style.filter = 'blur(0px)';el('overlay').style.padding = '2rem 0.5rem';  }
+      function closeSettings() { el('overlay').style.width = '0vw'; el('overlay').style.height = '0vh'; el('overlay').style.pointerEvents = 'none'; el('overlay').style.filter = 'blur(100px)';el('overlay').style.padding = 'unset'; }
 
       // Sidebar Toggle Mobile
       function toggleSidebar() {
