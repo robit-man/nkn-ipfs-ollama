@@ -5442,10 +5442,10 @@ function ackFromFrame(envelope, flags) {
             updateLatencyFromStatsEnvelope(body.data || {});
           }
 
-        ackNote(body.id, body.seq);
-        if (hasAckRendered) ackRendered(body.id, body.seq);
-        ackFromFrame(body);
-        return true;
+          ackNote(body.id, body.seq);
+          handleChunk(body.id, body.seq, body.data);
+          if (hasAckRendered) ackRendered(body.id, body.seq);
+          return true;
         }
 
         if (ev === 'llm.done') {
@@ -5541,6 +5541,58 @@ function ackFromFrame(envelope, flags) {
           };
 
 
+          // --- Global, transport-safe ACK pipe (singleton) ---
+          const AckPipe = (() => {
+            let ready = true;
+            const buf = new Map(); // id -> { upto, rendered, clientNow, seen_done }
+            let flushTimer = null;
+
+            function _trySend(id, rec) {
+              const payload = {
+                event: 'llm.ack',
+                id,
+                upto: rec.upto,
+                upto_recv: rec.upto,
+                upto_rendered: Number.isInteger(rec.rendered) ? rec.rendered : undefined,
+                clientNow: rec.clientNow || Date.now(),
+                seen_done: !!rec.seen_done
+              };
+              try { sendDM(payload); return true; } catch { return false; }
+            }
+
+            function _scheduleFlush() {
+              if (flushTimer) return;
+              flushTimer = setTimeout(() => {
+                flushTimer = null;
+                if (!ready || buf.size === 0) return;
+                for (const [id, rec] of buf) if (_trySend(id, rec)) buf.delete(id);
+                if (buf.size) _scheduleFlush();
+              }, 40);
+            }
+
+            function setReady(isReady) { ready = !!isReady; if (ready) _scheduleFlush(); }
+
+            function send(id, upto, rendered, flags = {}) {
+              if (!id || !Number.isInteger(upto)) return;
+              const rec = buf.get(id) || { upto: 0, rendered: 0, clientNow: 0, seen_done: false };
+              rec.upto = Math.max(rec.upto, upto);
+              if (Number.isInteger(rendered)) rec.rendered = Math.max(rec.rendered, rendered);
+              rec.clientNow = Date.now();
+              if (flags.seen_done) rec.seen_done = true;
+              buf.set(id, rec);
+
+              if (!ready) return;
+              if (_trySend(id, rec)) buf.delete(id);
+              else _scheduleFlush();
+            }
+
+            function flushNow() {
+              if (!ready || buf.size === 0) return;
+              for (const [id, rec] of buf) if (_trySend(id, rec)) buf.delete(id);
+            }
+
+            return { setReady, send, flushNow };
+          })();
 
 
 
