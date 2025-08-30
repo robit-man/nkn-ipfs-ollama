@@ -571,8 +571,8 @@
 
     #thinkToggleWrap>span {
       display: flex;
-      flex-flow:row;
-      justify-content:center;
+      flex-flow: row;
+      justify-content: center;
     }
 
     #connText>svg {
@@ -3618,19 +3618,24 @@ ${META_END}`;
 
       // Ensures payload carries the 'think' flag when the toggle is on
       function attachThinkToPayload(payload) {
-        // top-level for our hub, and mirror into kwargs/options for wider client compatibility
-        const enabled = !!(window.settings && settings.think);
-        payload.think = enabled;
+        // prefer module-scoped `settings`, fall back to window.settings
+        const s = (typeof settings === 'object' && settings) || (window && window.settings) || {};
+        const enabled = !!s.think;
 
-        // also mirror into kwargs
+        // top-level flags
+        payload.think = enabled;
+        payload.options = payload.options || {};
+        if (enabled) payload.options.thinking = true;
+
+        // mirror into kwargs for wider compatibility
         payload.kwargs = payload.kwargs || {};
         payload.kwargs.think = enabled;
-
-        // and into options.thinking
         const opts = (payload.kwargs.options = payload.kwargs.options || {});
         if (enabled) opts.thinking = true;
+
         return payload;
       }
+
 
       // ─────────── Outbox queue (send while connecting -> queue; flush on reconnect)
       const outbox = []; // [{ payload, route }]
@@ -3639,6 +3644,9 @@ ${META_END}`;
         const id = payload.id || newId('req');
         payload.id = id;
         registerRoute(id, route);
+
+        // ✅ ensure every LLM request carries the thinking flags BEFORE logging/sending
+        payload = attachThinkToPayload(payload);
 
         const bytes = approxBytes(payload);
         console.groupCollapsed('%c[LLM.REQUEST]', 'color:#0af', { id, api: payload.api, stream: payload.stream, bytes });
@@ -4522,20 +4530,32 @@ ${META_END}`;
         return out;
       }
 
-      // Session control → hub
-      function currentOptions() { return { temperature: settings.temperature, top_p: settings.top_p, seed: settings.seed, num_ctx: settings.num_ctx }; }
+      function currentOptions() {
+        const s = (typeof settings === 'object' && settings) || (window && window.settings) || {};
+        const o = {
+          temperature: settings.temperature,
+          top_p: settings.top_p,
+          seed: settings.seed,
+          num_ctx: settings.num_ctx,
+        };
+        if (s.think) o.thinking = true;
+        return o;
+      }
+
       function sendSessionOpen(s, seed) {
         if (!s || !HUB_ADDR) return;
-        const payload = {
+        let payload = {
           event: 'session.open',
           sid: s.id,
           model: s.model || undefined,
           system: (s.system || ''),
-          options: currentOptions()
+          options: currentOptions(),
         };
         if (seed) { payload.history = buildHistoryForSession(s); payload.replace = true; }
+        payload = attachThinkToPayload(payload);
         trySend(HUB_ADDR, payload);
       }
+
       function sendSessionReset(sid) { if (!sid || !HUB_ADDR) return; trySend(HUB_ADDR, { event: 'session.reset', sid }); }
 
       // Back off: let the SDK handle path rotation & reconnects.
