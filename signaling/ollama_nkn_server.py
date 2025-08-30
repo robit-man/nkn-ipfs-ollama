@@ -1233,6 +1233,22 @@ def _extract_delta_from_part(api: str, part: Any) -> str:
         pass
     return ""
 
+def _extract_thinking_from_part(api: str, part: Any) -> str:
+    try:
+        if api == "chat":
+            msg = part.get("message") if isinstance(part, dict) else None
+            if msg and isinstance(msg, dict):
+                t = msg.get("thinking")
+                if isinstance(t, str):
+                    return t
+    except Exception:
+        pass
+    return ""
+
+def _extract_both_deltas(api: str, part: Any) -> tuple[str, str]:
+    # (thinking_delta, content_delta)
+    return _extract_thinking_from_part(api, part), _extract_delta_from_part(api, part)
+
 def _extract_full_text(api: str, data: Any) -> str:
     try:
         if api == "chat":
@@ -1807,24 +1823,31 @@ class _LLMStream:
     # ────────────────────────────────────────────────────────────────
     # Send helpers for coalesced text
     # ────────────────────────────────────────────────────────────────
-    def _send_coalesced_text(self, text: str):
-        if not text: return
+    def _send_coalesced_field(self, field: str, text: str):
+        if not text:
+            return
         if self.api == "chat":
-            data = {"message": {"content": text}}
+            # keep role for clients that expect it on message
+            data = {"message": {"role": "assistant", field: text}}
         else:
+            # non-chat has no "thinking", but harmless to re-use response path
             data = {"response": text}
         self._send_chunk(data)
+
+    def _send_coalesced_text(self, text: str):
+        # backwards compat: coalesce as content
+        self._send_coalesced_field("content", text)
 
     # ────────────────────────────────────────────────────────────────
     # Stats
     # ────────────────────────────────────────────────────────────────
     def _update_stats_from_part(self, part: dict):
         now = time.monotonic()
-        delta = _extract_delta_from_part(self.api, part)
-        if delta:
+        think_delta = _extract_thinking_from_part(self.api, part)
+        if think_delta:
             if self._stats["t0"] is None: self._stats["t0"] = now
             self._stats["tlast"] = now
-            self._stats["chars"] += len(delta)
+            self._stats["chars"] += len(think_delta)
         try:
             if isinstance(part, dict):
                 if "eval_count" in part: self._stats["eval_count"] = int(part["eval_count"])
@@ -1907,28 +1930,38 @@ class _LLMStream:
 
             gen, meta = self._invoke_stream(self.api)
 
-            bulk_buf: list[str] = []
+            bulk_buf_c: list[str] = []   # content
+            bulk_buf_t: list[str] = []   # thinking
             last_flush = time.monotonic()
 
             # freeze state
             freeze_mode = False
             freeze_started = 0.0
-            freeze_buf: list[str] = []
+            freeze_buf_c: list[str] = []
+            freeze_buf_t: list[str] = []
             freeze_bytes = 0
 
             def _bulk_flush():
-                nonlocal bulk_buf, last_flush
-                if bulk_buf:
-                    self._send_coalesced_text("".join(bulk_buf))
-                    bulk_buf = []
-                    last_flush = time.monotonic()
+                nonlocal bulk_buf_c, bulk_buf_t, last_flush
+                if bulk_buf_t:
+                    self._send_coalesced_field("thinking", "".join(bulk_buf_t))
+                    bulk_buf_t = []
+                if bulk_buf_c:
+                    self._send_coalesced_field("content", "".join(bulk_buf_c))
+                    bulk_buf_c = []
+                last_flush = time.monotonic()
+
 
             def _freeze_flush():
-                nonlocal freeze_buf, freeze_bytes
-                if freeze_buf:
-                    self._send_coalesced_text("".join(freeze_buf))
-                    freeze_buf = []
-                    freeze_bytes = 0
+                nonlocal freeze_buf_c, freeze_buf_t, freeze_bytes
+                if freeze_buf_t:
+                    self._send_coalesced_field("thinking", "".join(freeze_buf_t))
+                    freeze_buf_t = []
+                if freeze_buf_c:
+                    self._send_coalesced_field("content", "".join(freeze_buf_c))
+                    freeze_buf_c = []
+                freeze_bytes = 0
+
 
             for part in gen:
                 if self.cancelled:
@@ -1958,13 +1991,21 @@ class _LLMStream:
                     freeze_started = now
                     _bulk_flush()
 
-                # extract once
-                delta = _extract_delta_from_part(self.api, part)
+                # extract once (both channels)
+                think_delta, delta = _extract_both_deltas(self.api, part)
 
                 if freeze_mode:
+                    added = False
+                    if think_delta:
+                        freeze_buf_t.append(think_delta)
+                        freeze_bytes += len(think_delta.encode("utf-8", "ignore"))
+                        added = True
                     if delta:
-                        freeze_buf.append(delta)
+                        freeze_buf_c.append(delta)
                         freeze_bytes += len(delta.encode("utf-8", "ignore"))
+                        added = True
+
+                    if added:
                         if freeze_bytes >= self.FREEZE_MAX_BYTES:
                             _freeze_flush()
                     else:
@@ -1979,6 +2020,7 @@ class _LLMStream:
                         _freeze_flush()
                         freeze_mode = False
                     continue  # skip normal bulk
+
 
                 # ── Normal / Panic bulk logic ─────────────────────────
                 with self._lock:
@@ -1995,9 +2037,14 @@ class _LLMStream:
                              (self.BULK_PANIC_MS if panic else self.BULK_MAX_MS))
 
                 if (panic or (unacked >= self.BULK_UNACK_THRESHOLD) or ack_stale):
+                    added = False
+                    if think_delta:
+                        bulk_buf_t.append(think_delta); added = True
                     if delta:
-                        bulk_buf.append(delta)
-                        too_many = len(bulk_buf) >= max_parts
+                        bulk_buf_c.append(delta); added = True
+                    if added:
+                        parts_ct = len(bulk_buf_t) + len(bulk_buf_c)
+                        too_many = parts_ct >= max_parts
                         too_old  = (now - last_flush) * 1000.0 >= max_ms
                         if too_many or too_old:
                             _bulk_flush()
@@ -2008,6 +2055,7 @@ class _LLMStream:
                 else:
                     _bulk_flush()
                     self._send_chunk(part)
+
 
             # end of stream — flush
             if not self.cancelled:
