@@ -5167,16 +5167,16 @@ ${META_END}`;
         return false;
       }
       // Coalesced chat renderer: batches many triggers into one paint
-let __renderChatQueued = false;
-function requestRenderChat() {
-  if (__renderChatQueued) return;
-  __renderChatQueued = true;
-  const raf = window.requestAnimationFrame || ((fn) => setTimeout(fn, 16));
-  raf(() => {
-    __renderChatQueued = false;
-    try { renderChat(); } catch (e) { console.warn('[requestRenderChat] render failed:', e); }
-  });
-}
+      let __renderChatQueued = false;
+      function requestRenderChat() {
+        if (__renderChatQueued) return;
+        __renderChatQueued = true;
+        const raf = window.requestAnimationFrame || ((fn) => setTimeout(fn, 16));
+        raf(() => {
+          __renderChatQueued = false;
+          try { renderChat(); } catch (e) { console.warn('[requestRenderChat] render failed:', e); }
+        });
+      }
 
 
 
