@@ -5166,7 +5166,7 @@ ${META_END}`;
         // Not handled here
         return false;
       }
-// Coalesced chat renderer: batches many triggers into one paint
+      // Coalesced chat renderer: batches many triggers into one paint
 let __renderChatQueued = false;
 function requestRenderChat() {
   if (__renderChatQueued) return;
@@ -5195,8 +5195,8 @@ function requestRenderChat() {
           const LATCH_KEY = '__uiStreamLatch';
           if (window[LATCH_KEY]) return window[LATCH_KEY];
 
-          const QUIET_MS = 300;            // wait this long with no activity before PLAY
-          const TOGGLE_MIN_GAP_MS = 500;   // don’t flip modes more often than this
+          const QUIET_MS = 120;            // wait this long with no activity before PLAY
+          const TOGGLE_MIN_GAP_MS = 150;   // don’t flip modes more often than this
           let activeId = null;
           let state = 'idle';              // 'idle' | 'streaming' | 'ending'
           let lastToggleAt = 0;
@@ -5216,13 +5216,15 @@ function requestRenderChat() {
           }
           function setSendModeSafely(reason) {
             const t = now();
-            if ((t - lastToggleAt) < TOGGLE_MIN_GAP_MS) return;
+            const ignoreGap = (state === 'ending'); // allow immediate flip after DONE
+            if (!ignoreGap && (t - lastToggleAt) < TOGGLE_MIN_GAP_MS) return;
             if (quietTimer) { clearTimeout(quietTimer); quietTimer = null; }
             state = 'idle';
             activeId = null;
             lastToggleAt = t;
             try { setSendMode && setSendMode(); } catch { }
           }
+
 
           return (window[LATCH_KEY] = {
             activity(id) {
@@ -6323,8 +6325,8 @@ function requestRenderChat() {
       }, 250));
 
       // Settings modal
-      function openSettings() { updateSettingsUI(); el('overlay').style.width = '100vw'; el('overlay').style.height = '100vh'; el('overlay').style.pointerEvents = 'all'; el('overlay').style.filter = 'blur(0px)';el('overlay').style.padding = '2rem 0.5rem';  }
-      function closeSettings() { el('overlay').style.width = '0vw'; el('overlay').style.height = '0vh'; el('overlay').style.pointerEvents = 'none'; el('overlay').style.filter = 'blur(100px)';el('overlay').style.padding = 'unset'; }
+      function openSettings() { updateSettingsUI(); el('overlay').style.width = '100vw'; el('overlay').style.height = '100vh'; el('overlay').style.pointerEvents = 'all'; el('overlay').style.filter = 'blur(0px)'; el('overlay').style.padding = '2rem 0.5rem'; }
+      function closeSettings() { el('overlay').style.width = '0vw'; el('overlay').style.height = '0vh'; el('overlay').style.pointerEvents = 'none'; el('overlay').style.filter = 'blur(100px)'; el('overlay').style.padding = 'unset'; }
 
       // Sidebar Toggle Mobile
       function toggleSidebar() {
