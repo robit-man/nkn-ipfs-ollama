@@ -744,8 +744,8 @@
       overflow: hidden;
       pointer-events: none;
       display: flex;
-      align-items: center;
-      justify-content: center;
+      overflow: auto;
+      padding: 2rem 0.5rem;
       z-index: 50;
       backdrop-filter: blur(10px);
       filter: blur(100px);
@@ -768,10 +768,12 @@
     .modal {
       width: min(560px, 92vw);
       background: var(--panel);
+      height: fit-content;
       border: 1px solid #2a2a2a;
       border-radius: 16px;
       box-shadow: var(--shadow);
-      padding: 14px
+      padding: 14px;
+      margin: auto;
     }
 
     .modal h3 {
@@ -4936,97 +4938,97 @@ ${META_END}`;
           (!ev && looksLikeModels(body));
       }
 
-/* === AckPipe singleton (order-safe) === */
-function getAckPipe() {
-  if (window.__AckPipeSingleton) return window.__AckPipeSingleton;
+      /* === AckPipe singleton (order-safe) === */
+      function getAckPipe() {
+        if (window.__AckPipeSingleton) return window.__AckPipeSingleton;
 
-  window.__AckPipeSingleton = (function () {
-    let ready = true;
-    const buf = new Map(); // id -> { upto, rendered, clientNow, seen_done }
-    let flushTimer = null;
+        window.__AckPipeSingleton = (function () {
+          let ready = true;
+          const buf = new Map(); // id -> { upto, rendered, clientNow, seen_done }
+          let flushTimer = null;
 
-    function _trySend(id, rec) {
-      const payload = {
-        event: 'llm.ack',
-        id,
-        upto: rec.upto,
-        upto_recv: rec.upto,
-        upto_rendered: Number.isInteger(rec.rendered) ? rec.rendered : undefined,
-        clientNow: rec.clientNow || Date.now(),
-        seen_done: !!rec.seen_done
-      };
-      try { sendDM(payload); return true; } catch { return false; }
-    }
+          function _trySend(id, rec) {
+            const payload = {
+              event: 'llm.ack',
+              id,
+              upto: rec.upto,
+              upto_recv: rec.upto,
+              upto_rendered: Number.isInteger(rec.rendered) ? rec.rendered : undefined,
+              clientNow: rec.clientNow || Date.now(),
+              seen_done: !!rec.seen_done
+            };
+            try { sendDM(payload); return true; } catch { return false; }
+          }
 
-    function _scheduleFlush() {
-      if (flushTimer) return;
-      flushTimer = setTimeout(() => {
-        flushTimer = null;
-        if (!ready || buf.size === 0) return;
-        for (const [id, rec] of buf) if (_trySend(id, rec)) buf.delete(id);
-        if (buf.size) _scheduleFlush();
-      }, 40);
-    }
+          function _scheduleFlush() {
+            if (flushTimer) return;
+            flushTimer = setTimeout(() => {
+              flushTimer = null;
+              if (!ready || buf.size === 0) return;
+              for (const [id, rec] of buf) if (_trySend(id, rec)) buf.delete(id);
+              if (buf.size) _scheduleFlush();
+            }, 40);
+          }
 
-    return {
-      setReady(isReady) { ready = !!isReady; if (ready) _scheduleFlush(); },
-      send(id, upto, rendered, flags = {}) {
-        if (!id || !Number.isInteger(upto)) return;
-        const rec = buf.get(id) || { upto: 0, rendered: 0, clientNow: 0, seen_done: false };
-        rec.upto = Math.max(rec.upto, upto);
-        if (Number.isInteger(rendered)) rec.rendered = Math.max(rec.rendered, rendered);
-        rec.clientNow = Date.now();
-        if (flags.seen_done) rec.seen_done = true;
-        buf.set(id, rec);
+          return {
+            setReady(isReady) { ready = !!isReady; if (ready) _scheduleFlush(); },
+            send(id, upto, rendered, flags = {}) {
+              if (!id || !Number.isInteger(upto)) return;
+              const rec = buf.get(id) || { upto: 0, rendered: 0, clientNow: 0, seen_done: false };
+              rec.upto = Math.max(rec.upto, upto);
+              if (Number.isInteger(rendered)) rec.rendered = Math.max(rec.rendered, rendered);
+              rec.clientNow = Date.now();
+              if (flags.seen_done) rec.seen_done = true;
+              buf.set(id, rec);
 
-        if (!ready) return;
-        if (_trySend(id, rec)) buf.delete(id);
-        else _scheduleFlush();
-      },
-      flushNow() {
-        if (!ready || buf.size === 0) return;
-        for (const [id, rec] of buf) if (_trySend(id, rec)) buf.delete(id);
+              if (!ready) return;
+              if (_trySend(id, rec)) buf.delete(id);
+              else _scheduleFlush();
+            },
+            flushNow() {
+              if (!ready || buf.size === 0) return;
+              for (const [id, rec] of buf) if (_trySend(id, rec)) buf.delete(id);
+            }
+          };
+        })();
+
+        return window.__AckPipeSingleton;
       }
-    };
-  })();
-
-  return window.__AckPipeSingleton;
-}
 
 
       // Compute ACK 'upto' from any envelope shape and send via AckPipe
       // Compute ACK 'upto' from any envelope shape and send via AckPipe
-function ackFromFrame(envelope, flags) {
-  try {
-    if (!envelope) return;
-    const id = envelope.id;
-    if (!id) return;
+      function ackFromFrame(envelope, flags) {
+        try {
+          if (!envelope) return;
+          const id = envelope.id;
+          if (!id) return;
 
-    let upto = null;
+          let upto = null;
 
-    if (Number.isInteger(envelope.last_seq)) {
-      upto = envelope.last_seq;
-    } else if (Number.isInteger(envelope.seq)) {
-      upto = envelope.seq;
-    } else if (Array.isArray(envelope.items) && envelope.items.length) {
-      const first = Number.isInteger(envelope.first_seq)
-        ? envelope.first_seq
-        : (Number.isInteger(envelope.items[0]?.seq) ? envelope.items[0].seq : null);
-      const last = Number.isInteger(envelope.items[envelope.items.length - 1]?.seq)
-        ? envelope.items[envelope.items.length - 1].seq
-        : null;
-      if (Number.isInteger(last)) upto = last;
-      else if (Number.isInteger(first)) upto = first + envelope.items.length - 1;
-    }
+          if (Number.isInteger(envelope.last_seq)) {
+            upto = envelope.last_seq;
+          } else if (Number.isInteger(envelope.seq)) {
+            upto = envelope.seq;
+          } else if (Array.isArray(envelope.items) && envelope.items.length) {
+            const first = Number.isInteger(envelope.first_seq)
+              ? envelope.first_seq
+              : (Number.isInteger(envelope.items[0]?.seq) ? envelope.items[0].seq : null);
+            const last = Number.isInteger(envelope.items[envelope.items.length - 1]?.seq)
+              ? envelope.items[envelope.items.length - 1].seq
+              : null;
+            if (Number.isInteger(last)) upto = last;
+            else if (Number.isInteger(first)) upto = first + envelope.items.length - 1;
+          }
 
-    if (!Number.isInteger(upto)) return;
+          if (!Number.isInteger(upto)) return;
 
-    const rendered = (typeof lastSeqForStream === 'function') ? lastSeqForStream(id) : undefined;
-    getAckPipe().send(id, upto, rendered, flags);
-  } catch (e) {
-    console.warn('[ackFromFrame] failed:', e);
-  }
-}
+          const rendered = (typeof lastSeqForStream === 'function') ? lastSeqForStream(id) : undefined;
+          getAckPipe().send(id, upto, rendered, flags);
+        } catch (e) {
+          console.warn('[ackFromFrame] failed:', e);
+        }
+      }
 
 
 
