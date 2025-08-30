@@ -2771,7 +2771,34 @@
         // live stream id & stats (set by setStopMode/onInbound handlers)
         const liveStreamId = currentStreamId || pendingStreamId || null;
         const liveStats = liveStreamId ? statsByStream.get(liveStreamId) : null;
-        const liveTps = (liveStats && Number.isFinite(liveStats.tps) && liveStats.tps > 0) ? liveStats.tps : null;
+
+        // --- In-house TPS averaging (drop 0/NaN/±∞ samples) ----------------------
+        const safeAvg = (values) => {
+          const xs = values.filter(v => Number.isFinite(v) && v > 0);
+          if (!xs.length) return null;
+          return xs.reduce((a, b) => a + b, 0) / xs.length;
+        };
+        const liveAvgTPS = (rec) => {
+          if (!rec) return null;
+          const now = Date.now();
+          const start = rec.firstTokAt || rec.startAt || rec.updatedAt || now;
+          const elapsedS = Math.max(0.25, (now - start) / 1000);
+
+          // Candidates:
+          //  - Wall clock average using best token count we have (tokens > approxTokens)
+          //  - Any final sealed value
+          //  - Any instantaneous tps the stats loop left for us
+          const bestTokens = Number.isFinite(rec.tokens) && rec.tokens > 0
+            ? rec.tokens
+            : (Number.isFinite(rec.approxTokens) && rec.approxTokens > 0 ? rec.approxTokens : null);
+          const wall = (bestTokens && elapsedS > 0) ? (bestTokens / elapsedS) : null;
+          const sealed = (Number.isFinite(rec.tpsFinal) && rec.tpsFinal > 0) ? rec.tpsFinal : null;
+          const inst = (Number.isFinite(rec.tps) && rec.tps > 0) ? rec.tps : null;
+
+          // Average only across the non-zero, finite candidates
+          return safeAvg([sealed, wall, inst]);
+        };
+        // -------------------------------------------------------------------------
 
         // render efficiently via a fragment to minimize layout thrash
         const frag = document.createDocumentFragment();
@@ -2789,12 +2816,13 @@
               }</div>`;
           }
 
-          // Prefer FINAL TPS saved on the message… otherwise show LIVE TPS for the active stream
+          // Prefer FINAL TPS saved on the message… otherwise compute LIVE in-house avg for the active stream
           let tpsTxt = '';
-          if (typeof m._tps === 'number' && isFinite(m._tps)) {
+          if (typeof m._tps === 'number' && isFinite(m._tps) && m._tps > 0) {
             tpsTxt = ` • ${m._tps.toFixed(1)} tok/s${m._tpsIsApprox ? ' (est)' : ''}`;
-          } else if (idx === lastAssistantIdx && liveTps != null) {
-            tpsTxt = ` • ${liveTps.toFixed(1)} tok/s`; // live
+          } else if (idx === lastAssistantIdx && liveStats) {
+            const avg = liveAvgTPS(liveStats);
+            if (avg && avg > 0) tpsTxt = ` • ${avg.toFixed(1)} tok/s`; // live average (zero/NaN ignored)
           }
 
           w.innerHTML = `
@@ -2814,6 +2842,7 @@
         // let the sticky manager decide whether to follow the bottom
         StickyScroll.onContentAppended();
       }
+
 
 
 
