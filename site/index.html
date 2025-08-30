@@ -73,9 +73,6 @@
     })();
   </script>
 
-
-
-
   <!-- Import map (kept as requested) -->
   <script type="importmap">
   {
@@ -112,7 +109,6 @@
       box-sizing: border-box;
       transition: all 0.2s ease;
       scrollbar-width: none;
-      /* Makes the scrollbar thinner */
 
     }
 
@@ -171,7 +167,6 @@
       top: 0;
       z-index: 20;
       border-bottom: 1px solid var(--line);
-
     }
 
     .brand {
@@ -199,8 +194,6 @@
     .topbar-select option {
       font-size: 1rem;
       text-transform: capitalize;
-
-
     }
 
     .chip {
@@ -321,7 +314,9 @@
       background: transparent;
     }
 
-    .session .del:hover {}
+    .session .del:hover {
+      transform: scale(1.05);
+    }
 
     .col-main {
       position: relative;
@@ -378,7 +373,6 @@
       padding: 10px;
       field-sizing: content;
       max-height: calc(80vh - 80px);
-
     }
 
     .sysinput:focus {
@@ -878,7 +872,6 @@
 
     }
 
-    /* ── Connection status dot in header ───────────────────────────────────── */
     .conn-dot {
       width: 10px;
       height: 10px;
@@ -1070,9 +1063,6 @@
           <div id="latent" class="chip" title="Round‑trip latency to the hub">Latency</div>
         </div>
       </div>
-
-
-
     </header>
     <div class="row-primary">
       <aside id="sidebar" class="col-left">
@@ -1088,12 +1078,9 @@
         <div id="sessions" class="sessions"></div>
         <div id="backdrop" class="backdrop"></div>
       </aside>
-
       <main class="col-main">
         <div id="modelCaps" class="row"></div>
-
         <div id="chat" class="chat"></div>
-
         <div class="composer">
           <!-- NEW: attachments preview row -->
           <div id="attachPreview" class="row" style="align-items:center; flex-wrap:wrap;"></div>
@@ -1108,9 +1095,7 @@
                 d="M14.2639 15.9375L12.5958 14.2834C11.7909 13.4851 11.3884 13.086 10.9266 12.9401C10.5204 12.8118 10.0838 12.8165 9.68048 12.9536C9.22188 13.1095 8.82814 13.5172 8.04068 14.3326L4.04409 18.2801M14.2639 15.9375L14.6053 15.599C15.4112 14.7998 15.8141 14.4002 16.2765 14.2543C16.6831 14.126 17.12 14.1311 17.5236 14.2687C17.9824 14.4251 18.3761 14.8339 19.1634 15.6514L20 16.4934M14.2639 15.9375L18.275 19.9565M18.275 19.9565C17.9176 20 17.4543 20 16.8 20H7.2C6.07989 20 5.51984 20 5.09202 19.782C4.71569 19.5903 4.40973 19.2843 4.21799 18.908C4.12796 18.7313 4.07512 18.5321 4.04409 18.2801M18.275 19.9565C18.5293 19.9256 18.7301 19.8727 18.908 19.782C19.2843 19.5903 19.5903 19.2843 19.782 18.908C20 18.4802 20 17.9201 20 16.8V16.4934M4.04409 18.2801C4 17.9221 4 17.4575 4 16.8V7.2C4 6.0799 4 5.51984 4.21799 5.09202C4.40973 4.71569 4.71569 4.40973 5.09202 4.21799C5.51984 4 6.07989 4 7.2 4H16.8C17.9201 4 18.4802 4 18.908 4.21799C19.2843 4.40973 19.5903 4.71569 19.782 5.09202C20 5.51984 20 6.0799 20 7.2V16.4934M17 8.99989C17 10.1045 16.1046 10.9999 15 10.9999C13.8954 10.9999 13 10.1045 13 8.99989C13 7.89532 13.8954 6.99989 15 6.99989C16.1046 6.99989 17 7.89532 17 8.99989Z"
                 stroke="var(--fg)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
             </svg></button>
-
           <input id="fileInput" type="file" accept="image/*" multiple class="hide" />
-
           <button id="sendBtn" class="sendButton"><svg width="24px" height="24px" viewBox="0 0 24 24" fill="none"
               xmlns="http://www.w3.org/2000/svg">
               <path
@@ -2772,33 +2757,68 @@
         const liveStreamId = currentStreamId || pendingStreamId || null;
         const liveStats = liveStreamId ? statsByStream.get(liveStreamId) : null;
 
-        // --- In-house TPS averaging (drop 0/NaN/±∞ samples) ----------------------
+        // --- In-house TPS averaging + stability (no flapping) ---------------------
+        const LIVE_TPS_TTL_MS = 2500;   // keep last nonzero value visible this long
+        const MIN_ABS_DELTA = 0.2;    // ignore tiny changes to reduce flicker
+        const MIN_REL_DELTA = 0.07;   // or <7% change vs last shown
+
         const safeAvg = (values) => {
           const xs = values.filter(v => Number.isFinite(v) && v > 0);
           if (!xs.length) return null;
           return xs.reduce((a, b) => a + b, 0) / xs.length;
         };
-        const liveAvgTPS = (rec) => {
+
+        const computeLiveAvgTPS = (rec) => {
           if (!rec) return null;
           const now = Date.now();
           const start = rec.firstTokAt || rec.startAt || rec.updatedAt || now;
           const elapsedS = Math.max(0.25, (now - start) / 1000);
 
-          // Candidates:
-          //  - Wall clock average using best token count we have (tokens > approxTokens)
-          //  - Any final sealed value
-          //  - Any instantaneous tps the stats loop left for us
-          const bestTokens = Number.isFinite(rec.tokens) && rec.tokens > 0
-            ? rec.tokens
-            : (Number.isFinite(rec.approxTokens) && rec.approxTokens > 0 ? rec.approxTokens : null);
+          // candidates: wall-clock avg, sealed final, instantaneous
+          const bestTokens =
+            (Number.isFinite(rec.tokens) && rec.tokens > 0) ? rec.tokens :
+              (Number.isFinite(rec.approxTokens) && rec.approxTokens > 0) ? rec.approxTokens : null;
+
           const wall = (bestTokens && elapsedS > 0) ? (bestTokens / elapsedS) : null;
           const sealed = (Number.isFinite(rec.tpsFinal) && rec.tpsFinal > 0) ? rec.tpsFinal : null;
           const inst = (Number.isFinite(rec.tps) && rec.tps > 0) ? rec.tps : null;
 
-          // Average only across the non-zero, finite candidates
           return safeAvg([sealed, wall, inst]);
         };
-        // -------------------------------------------------------------------------
+
+        // For the active stream, pick a display TPS with TTL + hysteresis
+        const pickStableLiveTps = (rec) => {
+          if (!rec) return null;
+          const now = Date.now();
+          const candidate = computeLiveAvgTPS(rec);
+
+          // refresh cache on good sample
+          if (Number.isFinite(candidate) && candidate > 0) {
+            const last = Number.isFinite(rec.uiLastTps) ? rec.uiLastTps : null;
+            // apply hysteresis: only commit if meaningfully different
+            if (last == null) {
+              rec.uiLastTps = candidate;
+              rec.uiLastTpsAt = now;
+            } else {
+              const diff = Math.abs(candidate - last);
+              const rel = diff / Math.max(0.1, last);
+              if (diff >= MIN_ABS_DELTA || rel >= MIN_REL_DELTA) {
+                rec.uiLastTps = candidate;
+                rec.uiLastTpsAt = now;
+              } else {
+                // minor jitter: keep last value/time
+              }
+            }
+          }
+
+          // show last good value within TTL; otherwise hide
+          if (Number.isFinite(rec.uiLastTps) && rec.uiLastTps > 0 &&
+            (now - (rec.uiLastTpsAt || 0)) <= LIVE_TPS_TTL_MS) {
+            return rec.uiLastTps;
+          }
+          return null;
+        };
+        // --------------------------------------------------------------------------
 
         // render efficiently via a fragment to minimize layout thrash
         const frag = document.createDocumentFragment();
@@ -2816,13 +2836,15 @@
               }</div>`;
           }
 
-          // Prefer FINAL TPS saved on the message… otherwise compute LIVE in-house avg for the active stream
+          // Prefer FINAL TPS saved on the message; otherwise stable LIVE TPS for the active stream
           let tpsTxt = '';
           if (typeof m._tps === 'number' && isFinite(m._tps) && m._tps > 0) {
             tpsTxt = ` • ${m._tps.toFixed(1)} tok/s${m._tpsIsApprox ? ' (est)' : ''}`;
           } else if (idx === lastAssistantIdx && liveStats) {
-            const avg = liveAvgTPS(liveStats);
-            if (avg && avg > 0) tpsTxt = ` • ${avg.toFixed(1)} tok/s`; // live average (zero/NaN ignored)
+            const display = pickStableLiveTps(liveStats);
+            if (Number.isFinite(display) && display > 0) {
+              tpsTxt = ` • ${display.toFixed(1)} tok/s`;
+            }
           }
 
           w.innerHTML = `
@@ -2842,10 +2864,6 @@
         // let the sticky manager decide whether to follow the bottom
         StickyScroll.onContentAppended();
       }
-
-
-
-
 
 
       function addStreamingAssistantBubble(id) {

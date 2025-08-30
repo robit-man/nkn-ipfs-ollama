@@ -148,7 +148,9 @@ BRIDGE_SRC = r"""
    - Always-enqueue, concurrent drain
    - Head coalescing of llm.chunk → llm.bulk (bounded by bytes/age/count)
    - Splits oversize bulks on size preflight or send error and retries
-   - Hardened against WS flaps; watchdog heartbeats
+   - Adaptive backpressure (NORMAL/SOFT/HARD/CRITICAL) with hysteresis
+   - Jittered WS suspend/backoff; watchdog heartbeats
+   - Ignores 0.0 TPS-like rates in any smoothing
    - Detailed crit.* reports (includes mb, q, stack)
 
    Drop-in replacement for BRIDGE_SRC.
@@ -165,35 +167,50 @@ const NUM_SUBCLIENTS = parseInt(process.env.NKN_NUM_SUBCLIENTS || '4', 10) || 4;
 const SEED_WS = (process.env.NKN_BRIDGE_SEED_WS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
-/* Queue & memory */
-const MAX_QUEUE   = parseInt(process.env.NKN_MAX_QUEUE || '4000', 10);
-const HEAP_SOFT   = parseInt(process.env.NKN_HEAP_SOFT_MB || '640', 10);
-const HEAP_HARD   = parseInt(process.env.NKN_HEAP_HARD_MB || '896', 10);
+/* Queue & memory (initials; runtime can adapt) */
+const MAX_QUEUE_INIT = parseInt(process.env.NKN_MAX_QUEUE || '4000', 10);
+const HEAP_SOFT_MB   = parseInt(process.env.NKN_HEAP_SOFT_MB || '640', 10);
+const HEAP_HARD_MB   = parseInt(process.env.NKN_HEAP_HARD_MB || '896', 10);
 
-// Drain behavior
-const DRAIN_BASE_BATCH = parseInt(process.env.NKN_DRAIN_BASE || '192', 10);
-const DRAIN_MAX_BATCH  = parseInt(process.env.NKN_DRAIN_MAX_BATCH || '1536', 10);
-const CATCHUP_AGE_MS   = parseInt(process.env.NKN_CATCHUP_AGE_MS || '500', 10);
-// 🔧 was '1' — this starves the pump
-const SEND_CONCURRENCY = parseInt(process.env.NKN_SEND_CONC || '16', 10);
+/* Drain behavior (initials; runtime can adapt) */
+const DRAIN_BASE_INIT = parseInt(process.env.NKN_DRAIN_BASE || '192', 10);
+const DRAIN_MAX_INIT  = parseInt(process.env.NKN_DRAIN_MAX_BATCH || '1536', 10);
+const CATCHUP_AGE_MS  = parseInt(process.env.NKN_CATCHUP_AGE_MS || '500', 10);
 
-// Coalescing / payload sizing
-const COALESCE_HEAD       = (process.env.NKN_COALESCE_HEAD || '0') !== '0';
-const COALESCE_MAX_COUNT  = parseInt(process.env.NKN_COALESCE_MAX_COUNT || '9999999', 10);
-// keep safe < 1MB including envelope; 900k avoids re-sends on some relays
-const COALESCE_MAX_BYTES  = parseInt(process.env.NKN_COALESCE_MAX_BYTES || '900000', 10);
-// 🔧 widen the window; 40ms is too twitchy
-const COALESCE_MAX_AGE_MS = parseInt(process.env.NKN_COALESCE_MAX_AGE_MS || '250', 10);
-// go "force" coalesce on backlog even if head is fresh
-const COALESCE_BACKLOG_TRIGGER = parseInt(process.env.NKN_COALESCE_BACKLOG || '256', 10);
-const DYNAMIC_COALESCE_LAT_MS = parseInt(process.env.NKN_COALESCE_LAT_MS || '1000', 10);
+/* Concurrency (initial; runtime can adapt) */
+const SEND_CONC_INIT  = parseInt(process.env.NKN_SEND_CONC || '16', 10);
 
-// Safety cap for NKN payloads; envelope headroom for JSON
+/* Coalescing / payload sizing (initials; runtime can adapt) */
+const COALESCE_HEAD_INIT      = (process.env.NKN_COALESCE_HEAD || '0') !== '0';
+const COALESCE_MAX_COUNT      = parseInt(process.env.NKN_COALESCE_MAX_COUNT || '9999999', 10);
+const COALESCE_MAX_BYTES_INIT = parseInt(process.env.NKN_COALESCE_MAX_BYTES || '900000', 10);
+const COALESCE_MAX_AGE_INIT   = parseInt(process.env.NKN_COALESCE_MAX_AGE_MS || '250', 10);
+const COALESCE_BACKLOG_TRIGGER_INIT = parseInt(process.env.NKN_COALESCE_BACKLOG || '256', 10);
+const DYNAMIC_COALESCE_LAT_MS_INIT  = parseInt(process.env.NKN_COALESCE_LAT_MS || '1000', 10);
+
+/* Safety cap for NKN payloads; envelope headroom for JSON */
 const MAX_PAYLOAD_BYTES = Number(process.env.NKN_MAX_PAYLOAD_BYTES || 900_000);
 const ENVELOPE_OVERHEAD = 512;
 
 /* Send defaults */
 const SEND_OPTS = { noReply: true, maxHoldingSeconds: 120 };
+
+/* ────────────────────────── RUNTIME (adaptive) ────────────────────────── */
+const runtime = {
+  maxQueue: MAX_QUEUE_INIT,
+  drainBase: DRAIN_BASE_INIT,
+  drainMax: DRAIN_MAX_INIT,
+  sendConc: SEND_CONC_INIT,
+  coalesceHead: COALESCE_HEAD_INIT,
+  coalesceMaxBytes: COALESCE_MAX_BYTES_INIT,
+  coalesceMaxAge: COALESCE_MAX_AGE_INIT,
+  coalesceBacklogTrigger: COALESCE_BACKLOG_TRIGGER_INIT,
+  dynamicCoalesceLatMs: DYNAMIC_COALESCE_LAT_MS_INIT,
+  wsBackoffMs: 800,
+  wsBackoffMax: 20000,
+  phase: 'NORMAL',                 // NORMAL | SOFT | HARD | CRITICAL
+  lastPhaseAt: 0
+};
 
 /* ────────────────────────── STATE ────────────────────────── */
 let clientRef = null;
@@ -210,6 +227,8 @@ function log(...args) { console.error('[bridge]', ...args); }
 function heapMB() { const m = process.memoryUsage(); return Math.round((m.rss || 0) / 1024 / 1024); }
 function rateLimit(fn, ms) { let last = 0; return (...a) => { const t = Date.now(); if (t - last > ms) { last = t; fn(...a); } }; }
 const logSendErr = rateLimit((msg) => log('send warn', msg), 1500);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const jitter = (ms, pct=0.25) => ms + Math.floor(Math.random() * Math.floor(ms * pct));
 
 function suspend(ms = 2000) { suspendUntil = Date.now() + ms; READY = false; }
 
@@ -222,9 +241,9 @@ function jsonSizeBytes(obj) {
 /* ────────────────────────── ENQUEUE ────────────────────────── */
 function enqueue(item) {
   if (!item || typeof item !== 'object') return;
-  if (queue.length >= MAX_QUEUE) {
-    // Drop oldest 10% to survive bursts
-    const drop = queue.splice(0, Math.ceil(MAX_QUEUE * 0.10));
+  if (queue.length >= runtime.maxQueue) {
+    // Drop oldest 10% to survive bursts; report once per spike window
+    const drop = queue.splice(0, Math.ceil(runtime.maxQueue * 0.10));
     sendToPy({ type: 'queue.drop', drop: drop.length, q: queue.length });
   }
   // Stamp generator time for adaptive coalescing/catch-up
@@ -237,10 +256,11 @@ function enqueue(item) {
 
 /* ────────────────────────── COALESCE HEAD ──────────────────────────
    Merge consecutive llm.chunk for the same stream/to into one llm.bulk.
-   Under "severe" backlog (old head or long queue), we relax caps a bit.
+   Under "severe" backlog (old head or long queue), we relax limits by allowing
+   more items within the same byte cap.
 --------------------------------------------------------------------- */
 function tryCoalesceHead(force = false) {
-  if (!COALESCE_HEAD && !force) return null;
+  if (!runtime.coalesceHead && !force) return null;
   if (queue.length < 2) return null;
 
   const first = queue[0];
@@ -253,8 +273,8 @@ function tryCoalesceHead(force = false) {
   const startTs = d0.gen_ts || Date.now();
 
   const countLimit = force ? Number.POSITIVE_INFINITY : COALESCE_MAX_COUNT;
-const hardCap = Math.min(COALESCE_MAX_BYTES || MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES - ENVELOPE_OVERHEAD);
-const byteLimit = force ? hardCap : hardCap;
+  const hardCap = Math.min(runtime.coalesceMaxBytes || MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES - ENVELOPE_OVERHEAD);
+  const byteLimit = hardCap;
 
   let bytes = jsonSizeBytes(d0);
   let count = 1;
@@ -267,11 +287,11 @@ const byteLimit = force ? hardCap : hardCap;
 
     const sz = jsonSizeBytes(dx);
     const projected = bytes + sz + ENVELOPE_OVERHEAD;
-    if (!force && projected > byteLimit) break;
+    if (projected > byteLimit) break;
 
     if (!force) {
       const age = Date.now() - startTs;
-      if (age > COALESCE_MAX_AGE_MS) break;
+      if (age > runtime.coalesceMaxAge) break;
     }
 
     items.push(dx);
@@ -304,11 +324,9 @@ const byteLimit = force ? hardCap : hardCap;
 /* ────────────────────────── SEND HELPERS ────────────────────────── */
 async function safeSendDM(client, to, data) {
   try {
-    // Preflight size protection to avoid NKN/WS close on oversize
     const bytes = jsonSizeBytes(data);
     if (bytes > MAX_PAYLOAD_BYTES) {
       if (data?.event === 'llm.bulk' && Array.isArray(data.items) && data.items.length > 1) {
-        // Split in half and re-enqueue both parts
         const mid = Math.floor(data.items.length / 2);
         const aItems = data.items.slice(0, mid);
         const bItems = data.items.slice(mid);
@@ -318,14 +336,26 @@ async function safeSendDM(client, to, data) {
         enqueue({ to, data: b });
         return true;
       }
-      // If a single chunk exceeds limit (rare), fall through and try anyway.
     }
 
     await client.send(to, JSON.stringify(data), SEND_OPTS);
+
+    // ✅ Report send confirmation to backend for latency accounting
+    const firstSeq = (typeof data.first_seq === 'number') ? data.first_seq : (typeof data.seq === 'number' ? data.seq : null);
+    const lastSeq  = (typeof data.last_seq  === 'number') ? data.last_seq  : (typeof data.seq === 'number' ? data.seq : null);
+    sendToPy({
+      type: 'dm.sent',
+      id: data.id,
+      event: data.event,
+      first_seq: firstSeq,
+      last_seq:  lastSeq,
+      bridge_enq_ts: data.bridge_enq_ts || data.ts || null,
+      bridge_send_ts: Date.now()
+    });
+
     return true;
   } catch (e) {
     const msg = (e && e.message) || String(e || '');
-    // If bulk failed, split and retry
     if (data?.event === 'llm.bulk' && Array.isArray(data.items) && data.items.length > 1) {
       const mid = Math.floor(data.items.length / 2);
       const aItems = data.items.slice(0, mid);
@@ -338,13 +368,16 @@ async function safeSendDM(client, to, data) {
     }
     logSendErr(`${to} → ${msg}`);
     if (msg.includes('WebSocket unexpectedly closed') || msg.includes('socket hang up')) {
-      suspend(2500);
-      sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() });
-      setTimeout(() => { if (READY) kickDrain(); }, 2600);
+      const delay = jitter(runtime.wsBackoffMs);
+      runtime.wsBackoffMs = Math.min(Math.floor(runtime.wsBackoffMs * 1.7), runtime.wsBackoffMax);
+      suspend(delay);
+      sendToPy({ type: 'wsclosed', reason: msg, backoffMs: delay, ts: Date.now() });
+      setTimeout(() => { if (READY) kickDrain(); }, delay + 100);
     }
     return false;
   }
 }
+
 async function safePub(client, topic, data) {
   try {
     await client.publish(TOPIC_NS + '.' + topic, JSON.stringify(data));
@@ -353,9 +386,11 @@ async function safePub(client, topic, data) {
     const msg = (e && e.message) || String(e || '');
     logSendErr(`pub ${topic} → ${msg}`);
     if (msg.includes('WebSocket unexpectedly closed') || msg.includes('socket hang up')) {
-      suspend(2500);
-      sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() });
-      setTimeout(() => { if (READY) kickDrain(); }, 2600);
+      const delay = jitter(runtime.wsBackoffMs);
+      runtime.wsBackoffMs = Math.min(Math.floor(runtime.wsBackoffMs * 1.7), runtime.wsBackoffMax);
+      suspend(delay);
+      sendToPy({ type: 'wsclosed', reason: msg, backoffMs: delay, ts: Date.now() });
+      setTimeout(() => { if (READY) kickDrain(); }, delay + 100);
     }
     return false;
   }
@@ -369,16 +404,14 @@ async function drain(client) {
   const headTs = (queue[0] && queue[0].data && (queue[0].data.gen_ts || queue[0].data.ts)) || now;
   const age = Math.max(0, now - headTs);
   const backlog = queue.length;
-  // 🔧 previously only age; add backlog trigger
-  const severe = (age >= DYNAMIC_COALESCE_LAT_MS) || (backlog >= COALESCE_BACKLOG_TRIGGER);
-
+  const severe = (age >= runtime.dynamicCoalesceLatMs) || (backlog >= runtime.coalesceBacklogTrigger);
 
   // Adaptive take size
-  let take = DRAIN_BASE_BATCH;
-  if (backlog > 256 || age > CATCHUP_AGE_MS) take = Math.min(DRAIN_MAX_BATCH, DRAIN_BASE_BATCH * 2);
-  if (backlog > 512 || age > 2 * CATCHUP_AGE_MS) take = Math.min(DRAIN_MAX_BATCH, Math.floor(DRAIN_BASE_BATCH * 3));
-  if (backlog > 1024 || age > 3 * CATCHUP_AGE_MS) take = DRAIN_MAX_BATCH;
-  if (severe) take = DRAIN_MAX_BATCH; // go wide under pressure
+  let take = runtime.drainBase;
+  if (backlog > 256 || age > CATCHUP_AGE_MS) take = Math.min(runtime.drainMax, runtime.drainBase * 2);
+  if (backlog > 512 || age > 2 * CATCHUP_AGE_MS) take = Math.min(runtime.drainMax, Math.floor(runtime.drainBase * 3));
+  if (backlog > 1024 || age > 3 * CATCHUP_AGE_MS) take = runtime.drainMax;
+  if (severe) take = runtime.drainMax; // go wide under pressure
 
   const batch = [];
   while (batch.length < take && queue.length > 0) {
@@ -387,9 +420,12 @@ async function drain(client) {
     batch.push(queue.shift());
   }
 
-  // Higher parallelism while catching up hard
-  const workers = severe ? SEND_CONCURRENCY
-                         : Math.min(SEND_CONCURRENCY, Math.max(1, Math.ceil(batch.length / 8)));
+  // Parallelism: higher while catching up; lower in HARD/CRITICAL to reduce WS contention
+  const baseWorkers = severe ? runtime.sendConc
+                             : Math.min(runtime.sendConc, Math.max(1, Math.ceil(batch.length / 8)));
+  const workers = (runtime.phase === 'HARD' || runtime.phase === 'CRITICAL')
+    ? Math.max(2, Math.floor(baseWorkers * 0.6))
+    : baseWorkers;
 
   let idx = 0;
   async function worker() {
@@ -409,16 +445,24 @@ async function kickDrain() {
   draining = true;
   try {
     while (queue.length > 0 && READY && Date.now() >= suspendUntil) {
+      const before = queue.length;
       await drain(clientRef);
-      const q = queue.length;
+      const after = queue.length;
 
       // If head very old, don't sleep at all
       const head = queue[0];
       const headAge = head && head.data ? (Date.now() - (head.data.gen_ts || head.data.ts || Date.now())) : 0;
-      const severe = headAge >= DYNAMIC_COALESCE_LAT_MS;
+      const severe = headAge >= runtime.dynamicCoalesceLatMs;
 
       if (severe) { await new Promise(r => setImmediate(r)); continue; }
 
+      // If we made no progress and still READY, yield briefly to avoid tight spin
+      if (after >= before) {
+        await new Promise(r => setTimeout(r, 2));
+        continue;
+      }
+
+      const q = after;
       const wait = q > 1500 ? 0 : q > 300 ? 1 : 3;
       if (wait > 0) await new Promise(r => setTimeout(r, wait));
       else await new Promise(r => setImmediate(r));
@@ -427,6 +471,103 @@ async function kickDrain() {
     draining = false;
   }
 }
+
+/* ────────────────────────── ADAPTIVE CONTROL ────────────────────────── */
+const hyst = {
+  heap: { soft: HEAP_SOFT_MB, hard: Math.max(HEAP_SOFT_MB + 120, HEAP_HARD_MB - 80), crit: HEAP_HARD_MB, fall: Math.max(HEAP_SOFT_MB - 60, 480) },
+  age:  { soft: CATCHUP_AGE_MS * 2, hard: CATCHUP_AGE_MS * 4, crit: CATCHUP_AGE_MS * 6, fall: CATCHUP_AGE_MS },
+  q:    { soft: 0.45, hard: 0.70, crit: 0.85, fall: 0.35 }
+};
+
+function evalPhase(mb, headAge, qLoad) {
+  if (mb >= hyst.heap.crit || headAge >= hyst.age.crit || qLoad >= hyst.q.crit) return 'CRITICAL';
+  if (mb >= hyst.heap.hard || headAge >= hyst.age.hard || qLoad >= hyst.q.hard) return 'HARD';
+  if (mb >= hyst.heap.soft || headAge >= hyst.age.soft || qLoad >= hyst.q.soft) return 'SOFT';
+
+  // hysteresis to prevent flapping
+  const fallOk = (mb <= hyst.heap.fall) && (headAge <= hyst.age.fall) && (qLoad <= hyst.q.fall);
+  return fallOk ? 'NORMAL' : runtime.phase;
+}
+
+function tune(phase) {
+  const prev = { ...runtime };
+
+  switch (phase) {
+    case 'CRITICAL': {
+      runtime.sendConc = clamp(Math.max(2, Math.floor(runtime.sendConc * 0.5))), 1, 64;
+      runtime.drainBase = clamp(Math.floor(runtime.drainBase * 0.8), 64, DRAIN_MAX_INIT);
+      runtime.drainMax  = clamp(Math.max(256, Math.floor(runtime.drainMax * 0.8)), 256, DRAIN_MAX_INIT);
+      runtime.coalesceMaxAge = clamp(runtime.coalesceMaxAge + 800, 100, 12000);
+      runtime.coalesceMaxBytes = clamp(Math.floor(runtime.coalesceMaxBytes * 0.9), 120000, MAX_PAYLOAD_BYTES - ENVELOPE_OVERHEAD);
+      runtime.maxQueue = clamp(Math.max(1000, Math.floor(runtime.maxQueue * 0.9)), 1000, 20000);
+      break;
+    }
+    case 'HARD': {
+      runtime.sendConc = clamp(Math.max(3, Math.floor(runtime.sendConc * 0.75))), 1, 64;
+      runtime.drainBase = clamp(Math.floor(runtime.drainBase * 0.9), 64, DRAIN_MAX_INIT);
+      runtime.drainMax  = clamp(Math.floor(runtime.drainMax * 0.9), 256, DRAIN_MAX_INIT);
+      runtime.coalesceMaxAge = clamp(runtime.coalesceMaxAge + 400, 100, 10000);
+      runtime.coalesceMaxBytes = clamp(Math.floor(runtime.coalesceMaxBytes * 0.95), 120000, MAX_PAYLOAD_BYTES - ENVELOPE_OVERHEAD);
+      break;
+    }
+    case 'SOFT': {
+      runtime.sendConc = clamp(runtime.sendConc, 2, 64);
+      runtime.drainBase = clamp(Math.max(DRAIN_BASE_INIT, runtime.drainBase), 64, DRAIN_MAX_INIT);
+      runtime.drainMax  = clamp(Math.max(DRAIN_MAX_INIT - 128, runtime.drainMax), 256, DRAIN_MAX_INIT);
+      runtime.coalesceMaxAge = clamp(runtime.coalesceMaxAge + 150, 80, 8000);
+      break;
+    }
+    case 'NORMAL':
+    default: {
+      // gentle recovery
+      runtime.sendConc = clamp(runtime.sendConc + 1, 2, 64);
+      runtime.drainBase = clamp(runtime.drainBase + 16, 64, DRAIN_MAX_INIT);
+      runtime.drainMax  = clamp(runtime.drainMax + 32, 256, DRAIN_MAX_INIT);
+      runtime.coalesceMaxAge = clamp(Math.max(COALESCE_MAX_AGE_INIT, runtime.coalesceMaxAge - 200), 80, 8000);
+      runtime.coalesceMaxBytes = clamp(runtime.coalesceMaxBytes + 20_000, 120000, MAX_PAYLOAD_BYTES - ENVELOPE_OVERHEAD);
+      runtime.maxQueue = clamp(runtime.maxQueue + 100, 1000, 20000);
+      // Reset WS backoff slowly when stable
+      runtime.wsBackoffMs = clamp(Math.floor(runtime.wsBackoffMs * 0.9), 500, runtime.wsBackoffMax);
+      break;
+    }
+  }
+
+  // Report if knobs changed
+  const changed = ['sendConc','drainBase','drainMax','coalesceMaxAge','coalesceMaxBytes','maxQueue']
+    .some(k => prev[k] !== runtime[k]);
+  if (changed || prev.phase !== phase) {
+    sendToPy({ type: 'adaptive', phase, cfg: {
+      sendConc: runtime.sendConc, drainBase: runtime.drainBase, drainMax: runtime.drainMax,
+      coalesceMaxAge: runtime.coalesceMaxAge, coalesceMaxBytes: runtime.coalesceMaxBytes,
+      maxQueue: runtime.maxQueue
+    }, ts: Date.now() });
+  }
+}
+
+setInterval(() => {
+  // Metrics snapshot
+  const mb = heapMB();
+  const head = queue[0];
+  const headAge = head && head.data ? (Date.now() - (head.data.gen_ts || head.data.ts || Date.now())) : 0;
+  const qLoad = queue.length / Math.max(1, runtime.maxQueue);
+
+  const ph = evalPhase(mb, headAge, qLoad);
+  if (ph !== runtime.phase) {
+    runtime.phase = ph;
+    runtime.lastPhaseAt = Date.now();
+  }
+  tune(ph);
+
+  // If queue exploded under CRITICAL, trim aggressively to keep bridge alive
+  if (runtime.phase === 'CRITICAL' && queue.length > runtime.maxQueue) {
+    const target = Math.floor(runtime.maxQueue * 0.75);
+    const drop = Math.max(0, queue.length - target);
+    if (drop > 0) {
+      queue.splice(0, drop);
+      sendToPy({ type: 'queue.trim', drop, q: queue.length, mb });
+    }
+  }
+}, 1000);
 
 /* ────────────────────────── BOOTSTRAP ────────────────────────── */
 (async () => {
@@ -451,6 +592,7 @@ async function kickDrain() {
 
     client.on('connect', () => {
       READY = true;
+      runtime.wsBackoffMs = 800; // reset backoff on successful connect
       sendToPy({ type: 'ready', address: client.addr, topicPrefix: TOPIC_NS, ts: Date.now() });
       log('ready at', client.addr);
       kickDrain();
@@ -460,9 +602,11 @@ async function kickDrain() {
       const msg = (e && e.message) || String(e || '');
       log('client error', msg);
       if (msg.includes('WebSocket unexpectedly closed') || msg.includes('VERIFY SIGNATURE ERROR')) {
-        sendToPy({ type: 'wsclosed', reason: msg, ts: Date.now() });
-        suspend(2500);
-        setTimeout(() => { if (READY) kickDrain(); }, 2600);
+        const delay = jitter(runtime.wsBackoffMs);
+        runtime.wsBackoffMs = Math.min(Math.floor(runtime.wsBackoffMs * 1.7), runtime.wsBackoffMax);
+        sendToPy({ type: 'wsclosed', reason: msg, backoffMs: delay, ts: Date.now() });
+        suspend(delay);
+        setTimeout(() => { if (READY) kickDrain(); }, delay + 100);
       }
     });
 
@@ -506,14 +650,14 @@ async function kickDrain() {
     // Heap guard: soft trim, then hard exit (watchdog restarts)
     setInterval(() => {
       const mb = heapMB();
-      if (mb >= HEAP_SOFT) {
+      if (mb >= HEAP_SOFT_MB) {
         try { if (global.gc) global.gc(); } catch {}
-        if (queue.length > Math.floor(MAX_QUEUE * 0.6)) {
-          const drop = queue.splice(0, Math.max(1, queue.length - Math.floor(MAX_QUEUE * 0.6)));
+        if (queue.length > Math.floor(runtime.maxQueue * 0.6)) {
+          const drop = queue.splice(0, Math.max(1, queue.length - Math.floor(runtime.maxQueue * 0.6)));
           sendToPy({ type: 'queue.trim', drop: drop.length, q: queue.length, mb });
         }
       }
-      if (mb >= HEAP_HARD) {
+      if (mb >= HEAP_HARD_MB) {
         sendToPy({ type: 'crit.heap', mb, q: queue.length });
         process.exitCode = 137;
         setTimeout(() => process.exit(137), 10);
@@ -522,10 +666,10 @@ async function kickDrain() {
 
     // Bridge heartbeat to Python watchdog
     setInterval(() => {
-      sendToPy({ type: 'hb', ts: Date.now(), ready: READY, q: queue.length, mb: heapMB() });
+      sendToPy({ type: 'hb', ts: Date.now(), ready: READY, q: queue.length, mb: heapMB(), phase: runtime.phase });
     }, 5000);
 
-    // Safety net: if anything left in queue and we're READY, keep nudging the pump
+    // Drain watchdog: if queue persists and we're READY, nudge the pump
     setInterval(() => {
       if (queue.length && READY && Date.now() >= suspendUntil) kickDrain();
     }, 25);
@@ -539,6 +683,9 @@ async function kickDrain() {
     };
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('warning', (w) => {
+      sendToPy({ type: 'warn', msg: String(w && w.message || w), stack: String(w && w.stack || ''), ts: Date.now() });
+    });
 
     // Fail fast on unexpected errors — INCLUDE mb/q/stack so Python won’t show mb=None
     process.on('uncaughtException', (e) => {
@@ -576,6 +723,7 @@ async function kickDrain() {
   }
 })();
 """
+
 # ──────────────────────────────────────────────────────────────────────
 # IV. Node NKN bridge (DM-first; hardened sends) + watchdog
 # ──────────────────────────────────────────────────────────────────────
@@ -743,6 +891,15 @@ def _bridge_reader_stdout():
                 src = msg.get("src") or ""
                 body = msg.get("msg") or {}
                 _handle_dm(src, body)
+
+            elif t == "dm.sent":
+                sid = msg.get("id")
+                fs  = msg.get("first_seq")
+                ls  = msg.get("last_seq")
+                st  = msg.get("bridge_send_ts")
+                stream = _llm_streams.get(sid)
+                if stream and isinstance(fs, int) and isinstance(ls, int) and isinstance(st, int):
+                    stream.on_dm_sent(fs, ls, st)
 
             elif t in ("queue.drop", "queue.trim"):
                 mb = msg.get("mb")
@@ -1519,6 +1676,11 @@ class _LLMStream:
         self._e2e_latency_ema_ms = None   # client_now - pkt.ts (ms)
         self._ack_rtt_ema_ms = None       # server_now - pkt.ts (fallback if client_now missing)
 
+        # [QOS] bridge queue → send latency EMA (ms) and ack-from-send EMA (ms)
+        self._queue_ema_ms = None                 # send_ts - enq_ts (per seq/event)
+        self._ack_from_send_ema_ms = None         # ack_now - send_ts
+        self._send_ts_by_seq: Dict[int, int] = {} # map seq -> last send_ts actually observed
+
         self.window   = {}                # seq -> pkt (llm.chunk)
         self.window_order = []            # seq in send order
         self.done_sent  = False
@@ -1597,6 +1759,29 @@ class _LLMStream:
         try: self._emit_stats("nonstream")
         except Exception: pass
 
+    # [QOS] Called when the bridge confirms a successful send for a chunk or bulk
+    def on_dm_sent(self, first_seq: int, last_seq: int, bridge_send_ts: int):
+        # Optional: keep an EMA of bridge queue latency if you’re tracking it
+        try:
+            with self._lock:
+                # sample the oldest item’s enq_ts among [first_seq..last_seq]
+                anchors = []
+                for s in range(first_seq, last_seq + 1):
+                    pkt = self.window.get(s)
+                    if pkt:
+                        anchors.append(int(pkt.get("bridge_enq_ts") or pkt.get("ts") or 0))
+                if not anchors:
+                    return
+                enq_ts = min(anchors)
+            if enq_ts:
+                sample = max(0, int(bridge_send_ts) - int(enq_ts))
+                # stash on the object for stats emit if you want
+                setattr(self, "_bridge_queue_latency_ema_ms",
+                        sample if not hasattr(self, "_bridge_queue_latency_ema_ms")
+                        else 0.8 * getattr(self, "_bridge_queue_latency_ema_ms") + 0.2 * sample)
+        except Exception:
+            pass
+
     def _send_chunk(self, data: dict):
         """
         Send a single llm.chunk and track it in the window for resend/bulk replay.
@@ -1605,6 +1790,7 @@ class _LLMStream:
             self.seq += 1
             seq = self.seq
             pkt = {"event":"llm.chunk","id":self.id,"seq":seq,"data":_to_jsonable2(data),"ts":_now_ms()}
+            pkt["bridge_enq_ts"] = pkt["ts"]
             self.window[seq] = pkt
             self.window_order.append(seq)
             # Soft eviction (only for already-acked seqs)
@@ -1633,10 +1819,6 @@ class _LLMStream:
             _log("llm.on_delta.err", str(e))
 
     def _send_bulk(self, seqs: list[int]):
-        """
-        Send a single llm.bulk with the specified seqs (must exist in window).
-        Items are the original llm.chunk envelopes.
-        """
         if not seqs:
             return
         items = []
@@ -1645,7 +1827,6 @@ class _LLMStream:
             pkt = self.window.get(s)
             if not pkt:
                 continue
-            # cheap size estimate
             try:
                 b = len(json.dumps(pkt).encode("utf-8"))
             except Exception:
@@ -1659,14 +1840,17 @@ class _LLMStream:
             return
 
         first = items[0]["seq"]; last = items[-1]["seq"]
+        bulk_ts = _now_ms()
         self._dm({
             "event": "llm.bulk",
             "id": self.id,
             "items": items,
             "first_seq": first,
             "last_seq": last,
-            "ts": _now_ms()
+            "ts": bulk_ts,
+            "bridge_enq_ts": bulk_ts,
         })
+
 
     def _sweep_resend_unacked_tail_bulk(self, force=False):
         with self._lock:
@@ -1717,6 +1901,7 @@ class _LLMStream:
         panic_for_ms = 0
         bulk_max_ms = None
         bulk_parts = None
+        seen_done = False
         if isinstance(meta, dict):
             client_now   = meta.get("client_now")
             rendered     = meta.get("rendered")
@@ -1724,35 +1909,48 @@ class _LLMStream:
             panic_for_ms = int(meta.get("panic_for_ms", 0) or 0)
             bulk_max_ms  = meta.get("bulk_max_ms")
             bulk_parts   = meta.get("bulk_parts")
-            seen_done    = bool(meta.get("seen_done"))           # ← NEW
+            seen_done    = bool(meta.get("seen_done"))
+
+        now_ms = int(time.time() * 1000)
 
         with self._lock:
-            # track receive progress
+            upto = int(upto)
+
+            # Track receive progress
             if upto > self.last_recv_seq:
                 self.last_recv_seq = upto
                 self._last_recv_change = time.monotonic()
 
-            # delivery ACK (kept for eviction/backpressure logic)
+            # Delivery ACK
             if upto > self.last_acked:
                 self.last_acked = upto
                 self._last_ack_change = time.monotonic()
 
-            # compute latency using the packet timestamp we sent
+            # Latency using our packet timestamp (fallback E2E/RTT you already had)
             pkt = self.window.get(upto)
-            pkt_ts = pkt.get("ts") if isinstance(pkt, dict) else None
-            now_ms = int(time.time() * 1000)
+            pkt_ts = int(pkt.get("ts") or 0) if isinstance(pkt, dict) else 0
 
-            # E2E with client clock
             if pkt_ts and isinstance(client_now, (int, float)):
-                sample = max(0, float(client_now) - float(pkt_ts))
+                sample = max(0.0, float(client_now) - float(pkt_ts))
                 self._e2e_latency_ema_ms = sample if self._e2e_latency_ema_ms is None \
                     else (0.8 * self._e2e_latency_ema_ms + 0.2 * sample)
 
-            # RTT-ish fallback
             if pkt_ts:
-                sample_rtt = max(0, now_ms - int(pkt_ts))
+                sample_rtt = max(0, now_ms - pkt_ts)
                 self._ack_rtt_ema_ms = sample_rtt if self._ack_rtt_ema_ms is None \
                     else (0.8 * self._ack_rtt_ema_ms + 0.2 * sample_rtt)
+
+            # [QOS] Ack latency relative to the *actual send* time
+            # fold in all seqs <= upto that have a send_ts recorded
+            to_del = []
+            for seq, send_ts in self._send_ts_by_seq.items():
+                if seq <= upto and isinstance(send_ts, int) and send_ts > 0:
+                    ack_ms = max(0.0, float(now_ms - send_ts))
+                    self._ack_from_send_ema_ms = ack_ms if self._ack_from_send_ema_ms is None \
+                        else (0.78 * self._ack_from_send_ema_ms + 0.22 * ack_ms)
+                    to_del.append(seq)
+            for seq in to_del:
+                self._send_ts_by_seq.pop(seq, None)
 
             # rendered progress (optional)
             if isinstance(rendered, int) and rendered > self.last_rendered_seq:
@@ -1761,13 +1959,13 @@ class _LLMStream:
             if seen_done:
                 self.done_seen = True
 
-            # evict anything <= max(received, acked)
+            # Evict anything <= max(received, acked)
             hi = max(self.last_recv_seq, self.last_acked)
             for s in [s for s in list(self.window.keys()) if s <= hi]:
                 self.window.pop(s, None)
             self.window_order = [s for s in self.window_order if s > hi]
 
-            # pressure hints
+            # Pressure hints from client
             if pressure in ("panic", "bulk"):
                 dur_s = (panic_for_ms or 2500) / 1000.0
                 self._panic_until = max(self._panic_until, time.monotonic() + dur_s)
@@ -1779,6 +1977,7 @@ class _LLMStream:
                 self._bulk_max_ms_override = int(bulk_max_ms)
             if isinstance(bulk_parts, int) and bulk_parts > 0:
                 self._bulk_parts_override = int(bulk_parts)
+
 
     def cancel(self):
         with self._lock:
@@ -1881,6 +2080,8 @@ class _LLMStream:
             rendered_gap = max(0, self.seq - self.last_rendered_seq)
             e2e = self._e2e_latency_ema_ms
             rtt = self._ack_rtt_ema_ms
+            qms = self._queue_ema_ms
+            acks = self._ack_from_send_ema_ms
 
         payload = {
             "event": "llm.stats",
@@ -1911,9 +2112,12 @@ class _LLMStream:
                 "rendered_gap": rendered_gap,
                 "e2e_latency_ema_ms": e2e,
                 "ack_rtt_ema_ms": rtt,
+                "queue_ema_ms": qms,               # ← NEW
+                "ack_from_send_ema_ms": acks,      # ← NEW
             },
         }
         self._dm(payload)
+
 
     # ────────────────────────────────────────────────────────────────
     # Main loop
@@ -1985,12 +2189,15 @@ class _LLMStream:
                 in_freeze_hint = (now < self._force_freeze_until)
 
                 # Should we FREEZE?
+                q_ms = (self._queue_ema_ms or 0.0)
                 want_freeze = (
                     in_freeze_hint or
                     (unacked >= self.FREEZE_UNACK) or
                     ((ack_stalled_s >= self.FREEZE_ACK_STALE_S) and (e2e_ms >= self.FREEZE_E2E_MS or rtt_ms >= self.FREEZE_E2E_MS)) or
-                    (rendered_gap >= self.FREEZE_RENDERED_GAP)
+                    (rendered_gap >= self.FREEZE_RENDERED_GAP) or
+                    (q_ms >= 120.0 and unacked >= 4)  # ← NEW: queue pressure
                 )
+
 
                 if want_freeze and not freeze_mode:
                     freeze_mode = True
@@ -2034,7 +2241,7 @@ class _LLMStream:
                     ack_stalled_s = (now - self._last_ack_change)
 
                 ack_stale = ack_stalled_s > 0.8
-                panic = in_panic_hint or (ack_stalled_s >= self.SEVERE_ACK_STALE_SECS)
+                panic = in_panic_hint or (ack_stalled_s >= self.SEVERE_ACK_STALE_SECS) or ((self._queue_ema_ms or 0.0) >= 120.0)
 
                 # pick caps (allow client override while in panic)
                 max_parts = (self._bulk_parts_override if panic and self._bulk_parts_override else
