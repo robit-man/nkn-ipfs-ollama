@@ -2886,19 +2886,19 @@ def models():
         return jsonify(ok=False, error=str(e), host=OLLAMA_HOST), 500
 
 # ──────────────────────────────────────────────────────────────────────
-# XI. Run
+# XI. Run (with Git auto-update + self-restart)
 # ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import os, sys, time, errno, threading, subprocess, shutil
+    from eventlet import wsgi
+
     print("→ NKN client hub running. HTTP is metadata only (no websockets).")
     _print_models_on_start()
 
-    if state["nkn_address"]:
+    if state.get("nkn_address"):
         print(f"   Hub NKN address: {state['nkn_address']}")
     else:
         print("   (Waiting for NKN bridge to connect…)")
-
-    import errno
-    from eventlet import wsgi
 
     def _bind_http(host: str = "0.0.0.0", base_port: int = None, tries: int = 50):
         """Bind to base_port or the next available. If all tried, use ephemeral."""
@@ -2926,8 +2926,111 @@ if __name__ == "__main__":
         port = listener.getsockname()[1]
         return listener, port
 
+    # ── Git auto-update watchdog ───────────────────────────────────────
+    _RESTARTING = False
+    _RESTART_LOCK = threading.Lock()
+
+    def _run(cmd, cwd=None):
+        """Run a command, returning (rc, stdout). Never raises."""
+        try:
+            out = subprocess.check_output(cmd, cwd=cwd, stderr=subprocess.STDOUT, text=True)
+            return 0, (out or "").strip()
+        except subprocess.CalledProcessError as e:
+            return e.returncode, (e.output or "").strip()
+        except FileNotFoundError:
+            return 127, "not-found"
+
+    def _repo_root():
+        rc, out = _run(["git", "rev-parse", "--show-toplevel"])
+        return out if rc == 0 and out else None
+
+    def _upstream_ref():
+        """Return upstream like 'origin/main' if set, else None."""
+        rc, out = _run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        if rc == 0 and out and out != "@{u}":
+            return out
+        return None
+
+    def _head_hash(ref="HEAD"):
+        rc, out = _run(["git", "rev-parse", ref])
+        return out if rc == 0 and out else None
+
+    def _schedule_restart(listener):
+        """Pull latest code and re-exec the current process."""
+        global _RESTARTING
+        with _RESTART_LOCK:
+            if _RESTARTING:
+                return
+            _RESTARTING = True
+
+
+        print("↻ [autoupdate] Update detected; pulling latest and restarting…", flush=True)
+        # Fetch + pull (prefer rebase/autostash; continue even if pull fails)
+        _run(["git", "fetch", "--all", "-p"])
+        rc, out = _run(["git", "pull", "--rebase", "--autostash"])
+        if rc != 0:
+            print(f"[autoupdate] pull failed (continuing anyway):\n{out}", flush=True)
+
+        # Close listener to avoid port conflicts on exec, then exec the same script.
+        try:
+            try:
+                listener.close()
+            except Exception:
+                pass
+            time.sleep(0.2)  # small grace for accept loop
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            print(f"[autoupdate] exec failed: {e}; exiting", flush=True)
+            os._exit(0)
+
+    def _git_autoupdater(listener, poll_secs=None):
+        """Background thread: poll for remote changes and trigger restart."""
+        if shutil.which("git") is None:
+            print("[autoupdate] git not found; auto-restart disabled", flush=True)
+            return
+        root = _repo_root()
+        if not root:
+            print("[autoupdate] not a git repo; auto-restart disabled", flush=True)
+            return
+
+        poll = poll_secs or int(os.environ.get("GIT_POLL_SECS", "30") or 30)
+        remote = os.environ.get("GIT_REMOTE", "origin")
+
+        upstream = os.environ.get("GIT_UPSTREAM") or _upstream_ref()
+        if not upstream:
+            # Fallback: derive from current branch if no explicit upstream set
+            rc, cur = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+            branch = cur if rc == 0 else None
+            if branch:
+                upstream = f"{remote}/{branch}"
+
+        print(f"[autoupdate] watching {upstream or 'HEAD'} every {poll}s", flush=True)
+
+        while True:
+            if _RESTARTING:
+                return
+            # Fetch just the remote we care about (faster on large repos)
+            _run(["git", "fetch", remote, "-p"])
+
+            local = _head_hash("HEAD")
+            remote_hash = _head_hash(upstream) if upstream else None
+
+            if local and remote_hash and local != remote_hash:
+                print(f"[autoupdate] local {local[:7]} != remote {remote_hash[:7]}", flush=True)
+                _schedule_restart(listener)
+                return
+
+            time.sleep(poll)
+
+    # ── Start HTTP and the watchdog ─────────────────────────────────────
     listener, http_port = _bind_http()
     state["http_port"] = http_port  # optional: expose chosen port in / metadata
     print(f"   HTTP listening on http://0.0.0.0:{http_port}")
 
+    # Start git watchdog in a native thread (subprocess is blocking; avoid greenlets here)
+    threading.Thread(target=_git_autoupdater, args=(listener,), daemon=True).start()
+
+    # Blocking WSGI server (will be replaced by exec on update)
     wsgi.server(listener, app)
