@@ -591,6 +591,10 @@ setInterval(() => {
     clientRef = client;
 
     client.on('connect', () => {
+      if (READY) { // already announced this epoch
+        log('connect (duplicate) — READY already true');
+        return;
+      }
       READY = true;
       runtime.wsBackoffMs = 800; // reset backoff on successful connect
       sendToPy({ type: 'ready', address: client.addr, topicPrefix: TOPIC_NS, ts: Date.now() });
@@ -782,6 +786,131 @@ extra = "--unhandled-rejections=strict --heapsnapshot-signal=SIGUSR2 --max-old-s
 bridge_env["NODE_OPTIONS"] = (node_opts + " " + extra).strip()
 
 # Bridge process + watchdog state (unchanged)
+
+# ── Hard reset plumbing ──────────────────────────────────────────────
+_HARD_RESET_LOCK = threading.RLock()
+_IN_HARD_RESET = False
+_FORCE_HARD_RESET = False   # set by stderr/stdout readers on crit.*
+
+def _cancel_all_streams():
+    try:
+        for sid, st in list(_llm_streams.items()):
+            try:
+                st.cancel()
+            except Exception:
+                pass
+        _llm_streams.clear()
+    except Exception:
+        pass
+
+def _clear_sessions_and_blobs(keep_sessions: bool = False):
+    # sessions
+    if not keep_sessions:
+        with SESSION_LOCK:
+            try:
+                SESSIONS.clear()
+            except Exception:
+                pass
+    # blobs
+    try:
+        with _BLOBS_LOCK:
+            _BLOBS.clear()
+        for p in BLOB_DIR.glob("*.tmp"):
+            try: p.unlink()
+            except Exception: pass
+        # keep finished .bin files by default; uncomment to purge all
+        # for p in BLOB_DIR.glob("*.bin"):
+        #     try: p.unlink()
+        #     except Exception: pass
+    except Exception:
+        pass
+
+def _rotate_seed_hex_in_env() -> str:
+    """Generate a new SEED and persist back into .env; returns new hex."""
+    try:
+        new_seed = secrets.token_hex(32)
+        dotenv["NKN_SEED_HEX"] = new_seed
+        lines = []
+        for k, v in dotenv.items():
+            lines.append(f"{k}={v}")
+        ENV_PATH.write_text("\n".join(lines) + "\n")
+        os.environ["NKN_SEED_HEX"] = new_seed
+        return new_seed
+    except Exception as e:
+        _log("reset.seed.err", str(e))
+        return NKN_SEED_HEX
+
+def _hard_reset(*, rotate_seed: bool = False, bridge_only: bool = True, keep_sessions: bool = False, reexec: bool = False):
+    """
+    Hard reset lifecycle:
+      1) cancel LLM streams
+      2) clear sessions/blobs (unless kept)
+      3) kill/respawn Node bridge (or full re-exec)
+    """
+    global bridge, _last_hb, _ready_at, _IN_HARD_RESET
+
+    with _HARD_RESET_LOCK:
+        if _IN_HARD_RESET:
+            return
+        _IN_HARD_RESET = True
+
+        try:
+            _log("reset.begin", f"rotate_seed={rotate_seed} bridge_only={bridge_only} keep_sessions={keep_sessions} reexec={reexec}")
+
+            # option: rotate NKN identity
+            if rotate_seed:
+                new_seed = _rotate_seed_hex_in_env()
+                bridge_env["NKN_SEED_HEX"] = new_seed
+
+            # drain/clear ephemeral runtime
+            _cancel_all_streams()
+            _clear_sessions_and_blobs(keep_sessions=keep_sessions)
+
+            # stop bridge
+            try:
+                with _bridge_lock:
+                    if bridge:
+                        try:
+                            bridge.terminate()
+                            for _ in range(30):
+                                if bridge.poll() is not None:
+                                    break
+                                time.sleep(0.1)
+                            if bridge.poll() is None:
+                                bridge.kill()
+                        except Exception:
+                            try: bridge.kill()
+                            except Exception: pass
+                        bridge = None
+            except Exception:
+                pass
+
+            # reset bridge health markers & flap window
+            _last_hb = time.time()
+            _ready_at = 0.0
+            try:
+                with _ws_flap_lock:
+                    _ws_flap_times.clear()
+            except Exception:
+                pass
+            state["nkn_address"] = None
+
+            if reexec and not bridge_only:
+                # re-exec current python process with same argv to fully sanitize runtime
+                try:
+                    sys.stdout.flush(); sys.stderr.flush()
+                except Exception:
+                    pass
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
+            # spawn fresh bridge
+            with _bridge_lock:
+                bridge = _spawn_bridge()
+            _log("reset.end", "bridge respawned")
+        finally:
+            _IN_HARD_RESET = False
+
+
 bridge = None
 state: Dict[str, Any] = {"nkn_address": None, "topic_prefix": TOPIC_PREFIX}
 _last_hb = 0.0
@@ -910,7 +1039,9 @@ def _bridge_reader_stdout():
 
             elif t in ("crit.heap", "crit.uncaught", "crit.unhandled"):
                 print(f"‼️ bridge critical: {t} mb={msg.get('mb')} q={msg.get('q')}")
-                globals()["_FORCE_RESTART"] = True
+                # escalate from soft restart to hard reset
+                globals()["_FORCE_HARD_RESET"] = True
+                globals()["_FORCE_RESTART"] = False  # avoid double action in watchdog
         except Exception:
             time.sleep(0.2)
 
@@ -923,7 +1054,8 @@ def _bridge_reader_stderr():
                     sys.stderr.write(line)
                     low = line.lower()
                     if any(pat.lower() in low for pat in _CRIT_ERR_PATTERNS):
-                        globals()["_FORCE_RESTART"] = True
+                        globals()["_FORCE_HARD_RESET"] = True
+                        globals()["_FORCE_RESTART"] = False
                 else:
                     time.sleep(0.1)
             else:
@@ -959,9 +1091,14 @@ def _watchdog_loop():
         try:
             with _bridge_lock:
                 need_restart = False
+                do_hard = False
                 now = time.time()
 
-                if not bridge or bridge.poll() is not None:
+                if globals().get("_FORCE_HARD_RESET"):
+                    print("↻ HARD RESET NKN bridge (critical condition) …")
+                    globals()["_FORCE_HARD_RESET"] = False
+                    do_hard = True
+                elif not bridge or bridge.poll() is not None:
                     need_restart = True
                 elif getattr(bridge, "start_time", 0) and _ready_at == 0.0:
                     if now - getattr(bridge, "start_time", 0) > READY_GRACE_SECS:
@@ -983,7 +1120,12 @@ def _watchdog_loop():
                     globals()["_FORCE_RESTART"] = False
                     need_restart = True
 
-                if need_restart:
+                if do_hard:
+                    with _ws_flap_lock:
+                        _ws_flap_times.clear()
+                    # hard reset bridge + clear ephemeral; do not rotate seed by default
+                    _hard_reset(rotate_seed=False, bridge_only=True, keep_sessions=False, reexec=False)
+                elif need_restart:
                     with _ws_flap_lock:
                         _ws_flap_times.clear()
                     _restart_bridge_locked()
@@ -2488,6 +2630,24 @@ def _handle_dm(src_addr: str, body: dict):
             detail = (body.get("detail") or body.get("include") or "count")
             _send_ctrl_peers(src_addr, detail=detail, req_id=req_id)
             return
+        elif op == "reset":
+            # options: hard (default True), rotateSeed, keepSessions, reexec
+            hard = body.get("hard")
+            hard = True if hard is None else bool(hard)
+            rotate = bool(body.get("rotateSeed") or body.get("rotate_seed") or False)
+            keep_sessions = bool(body.get("keepSessions") or body.get("keep_sessions") or False)
+            reexec = bool(body.get("reexec") or False)
+            if hard:
+                _dm(src_addr, {"event": "ctrl.ack", "id": req_id, "ts": _now_ms(), "op": "reset", "mode": "hard"})
+                # Perform in a thread so we can send the ack first
+                threading.Thread(target=_hard_reset, kwargs={
+                    "rotate_seed": rotate, "bridge_only": not reexec, "keep_sessions": keep_sessions, "reexec": reexec
+                }, daemon=True).start()
+            else:
+                _dm(src_addr, {"event":"ctrl.ack","id":req_id,"ts":_now_ms(),"op":"reset","mode":"soft"})
+                globals()["_FORCE_RESTART"] = True
+            return
+
         else:
             _dm(src_addr, {
                 "event": "ctrl.error",
@@ -2848,6 +3008,21 @@ _DEFAULT_ICE = (
     if not DISABLE_WEBRTC
     else {"iceServers": [], "iceCandidatePoolSize": 0}
 )
+@app.route("/admin/reset", methods=["POST", "GET"])
+def admin_reset():
+    try:
+        rotate = request.args.get("rotate_seed", request.form.get("rotate_seed", "0")) in ("1","true","yes","on")
+        keep_sessions = request.args.get("keep_sessions", request.form.get("keep_sessions","0")) in ("1","true","yes","on")
+        reexec = request.args.get("reexec", request.form.get("reexec","0")) in ("1","true","yes","on")
+        threading.Thread(target=_hard_reset, kwargs={
+            "rotate_seed": rotate,
+            "bridge_only": not reexec,
+            "keep_sessions": keep_sessions,
+            "reexec": reexec
+        }, daemon=True).start()
+        return jsonify(ok=True, hard=True, rotateSeed=rotate, keepSessions=keep_sessions, reexec=reexec, ts=_now_ms())
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 @app.route("/bootstrap")
 def bootstrap():
