@@ -42,14 +42,10 @@ def _create_venv():
 def _ensure_deps():
     missing = []
     checks = [("flask", "flask"),
-            ("flask-cors", "flask_cors"),
-            ("eventlet", "eventlet"),
-            ("PyJWT", "jwt"),
-            ("ollama","ollama"),
-            # monitoring
-            ("psutil","psutil"),
-            ("nvidia-ml-py3","pynvml")]
-
+              ("flask-cors", "flask_cors"),
+              ("eventlet", "eventlet"),
+              ("PyJWT", "jwt"),
+              ("ollama","ollama")]
     for pkg, mod in checks:
         if _module_missing(mod): missing.append(pkg)
     if missing:
@@ -117,17 +113,6 @@ JWT_EXP       = timedelta(minutes=30)
 OLLAMA_HOST   = dotenv.get("OLLAMA_HOST","http://127.0.0.1:11434")
 DISABLE_WEBRTC= dotenv.get("NKN_DISABLE_WEBRTC", "1") in ("1","true","yes","on")
 NKN_NUM_SUBCLIENTS = int(dotenv.get("NKN_NUM_SUBCLIENTS", "4"))
-# ── Memory guard thresholds (env overrides allowed) ──────────────────
-MEM_CHECK_EVERY_MS   = int(dotenv.get("MEM_CHECK_EVERY_MS", "2000"))  # poll period
-MEM_SOFT_PCT         = float(dotenv.get("MEM_SOFT_PCT", "85"))        # system RAM soft %
-MEM_HARD_PCT         = float(dotenv.get("MEM_HARD_PCT", "95"))        # system RAM hard %
-PROC_RSS_HARD_MB     = int(dotenv.get("PROC_RSS_HARD_MB", "4096"))    # per-proc RSS hard cap
-GPU_SOFT_PCT         = float(dotenv.get("GPU_SOFT_PCT", "90"))        # GPU VRAM soft %
-GPU_HARD_PCT         = float(dotenv.get("GPU_HARD_PCT", "98"))        # GPU VRAM hard %
-REEXEC_ON_HARD       = dotenv.get("REEXEC_ON_HARD","0").lower() in ("1","true","yes","on")
-
-# Keep Ollama models out of VRAM unless needed: "0" unloads immediately; e.g. "30s" keeps warm briefly
-OLLAMA_KEEP_ALIVE_DEFAULT = dotenv.get("OLLAMA_KEEP_ALIVE_DEFAULT", "0")
 
 # Session policy
 SESSION_TTL_SECS   = 60 * 45      # prune sessions idle > 45m
@@ -1160,169 +1145,6 @@ def _shutdown(*_):
     try: bridge.terminate()
     except Exception: pass
     os._exit(0)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# VI-a. MemoryGuard — system/GPU memory monitor + cleanup
-# ──────────────────────────────────────────────────────────────────────
-class _MemoryGuard:
-    _running = False
-    _thr = None
-
-    @classmethod
-    def start(cls):
-        if cls._running: return
-        cls._running = True
-        cls._thr = threading.Thread(target=cls._run, daemon=True)
-        cls._thr.start()
-        _log("mem.start", f"interval={MEM_CHECK_EVERY_MS}ms soft={MEM_SOFT_PCT}% hard={MEM_HARD_PCT}% "
-                          f"gpu_soft={GPU_SOFT_PCT}% gpu_hard={GPU_HARD_PCT}% rss_hard={PROC_RSS_HARD_MB}MB "
-                          f"keep_alive={OLLAMA_KEEP_ALIVE_DEFAULT}")
-
-    @staticmethod
-    def _free_cuda():
-        # Best-effort CUDA/torch cache release
-        try:
-            import torch
-            if torch.cuda.is_available():
-                try:
-                    for d in range(torch.cuda.device_count()):
-                        torch.cuda.set_device(d)
-                        torch.cuda.empty_cache()
-                        torch.cuda.ipc_collect()
-                except Exception:
-                    # fall back to current device
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _metrics():
-        """Return dict with system %, swap %, rss MB, gpu % (max across GPUs)."""
-        out = {"vmem_pct": None, "swap_pct": None, "rss_mb": None, "gpu_pct": None}
-        try:
-            import psutil
-            vm = psutil.virtual_memory()
-            sw = psutil.swap_memory()
-            pr = psutil.Process(os.getpid())
-            out["vmem_pct"] = float(vm.percent)
-            out["swap_pct"] = float(sw.percent)
-            out["rss_mb"] = int((pr.memory_info().rss or 0) / (1024*1024))
-        except Exception:
-            pass
-        # GPU via NVML
-        try:
-            import pynvml
-            pynvml.nvmlInit()
-            n = pynvml.nvmlDeviceGetCount()
-            pct = 0.0
-            for i in range(n):
-                h = pynvml.nvmlDeviceGetHandleByIndex(i)
-                mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-                if mem.total:
-                    pct = max(pct, 100.0 * float(mem.used) / float(mem.total))
-            out["gpu_pct"] = pct if pct > 0.0 else None
-        except Exception:
-            pass
-        return out
-
-    @staticmethod
-    def _soft_cleanup(m):
-        # Quick measures: Python GC, free CUDA cache, trim blobs
-        try:
-            import gc; gc.collect()
-        except Exception:
-            pass
-        _MemoryGuard._free_cuda()
-
-        # Opportunistic: cancel *idle* streams if any are stalled on ACKs
-        try:
-            bad = []
-            for sid, st in list(_llm_streams.items()):
-                try:
-                    # if a stream has sent all chunks but done not seen for a long time, cancel it
-                    last_acked = getattr(st, "last_acked", 0)
-                    seq = getattr(st, "seq", 0)
-                    done_sent = getattr(st, "done_sent", False)
-                    last_change = getattr(st, "_last_ack_change", 0.0)
-                    if done_sent and last_acked >= seq and (time.monotonic() - last_change) > 15.0:
-                        bad.append(sid)
-                except Exception:
-                    continue
-            for sid in bad:
-                try:
-                    _llm_streams[sid].cancel()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Trim half-finished or old tmp blobs ASAP
-        try:
-            now = time.time()
-            for p in BLOB_DIR.glob("*.tmp"):
-                try:
-                    if (now - p.stat().st_mtime) > max(60.0, BLOB_STALL_SECS / 2.0):
-                        p.unlink()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        _log("mem.soft", f"vmem={m['vmem_pct']}% swap={m['swap_pct']}% rss={m['rss_mb']}MB gpu={m['gpu_pct']}%")
-
-    @staticmethod
-    def _hard_action(m):
-        _log("mem.hard", f"pressure! vmem={m['vmem_pct']}% swap={m['swap_pct']}% rss={m['rss_mb']}MB gpu={m['gpu_pct']}%")
-        # Stop streams and purge ephemeral state
-        try: _cancel_all_streams()
-        except Exception: pass
-        try: _clear_sessions_and_blobs(keep_sessions=False)
-        except Exception: pass
-        # Free CUDA now
-        _MemoryGuard._free_cuda()
-
-        # Either re-exec full Python (fresh process) or hard reset the bridge
-        if REEXEC_ON_HARD:
-            try:
-                sys.stdout.flush(); sys.stderr.flush()
-            except Exception:
-                pass
-            try:
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-            except Exception as e:
-                _log("mem.reexec.err", str(e))
-        else:
-            # Hard reset just the Node bridge & ephemeral; keep Python alive
-            try:
-                _hard_reset(rotate_seed=False, bridge_only=True, keep_sessions=False, reexec=False)
-            except Exception as e:
-                _log("mem.reset.err", str(e))
-
-    @classmethod
-    def _run(cls):
-        interval = max(200, int(MEM_CHECK_EVERY_MS)) / 1000.0
-        while True:
-            try:
-                m = cls._metrics()
-                v = m.get("vmem_pct") or 0.0
-                s = m.get("swap_pct") or 0.0
-                r = m.get("rss_mb") or 0
-                g = m.get("gpu_pct") or 0.0
-
-                hard = (v >= MEM_HARD_PCT) or (g >= GPU_HARD_PCT) or (r >= PROC_RSS_HARD_MB)
-                soft = (v >= MEM_SOFT_PCT) or (g >= GPU_SOFT_PCT)
-
-                if hard:
-                    cls._hard_action(m)
-                elif soft:
-                    cls._soft_cleanup(m)
-            except Exception as e:
-                _log("mem.guard.err", str(e))
-            time.sleep(interval)
-
-
 
 signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
@@ -2612,20 +2434,12 @@ class _LLMStream:
             self._send_error(f"{type(e).__name__}: {e}", kind="exception")
 
 
-def _kw_for_client(self, api: str) -> dict:
-    kw = dict(self.kwargs or {})
-    # Never pass 'think' into the Ollama client
-    kw.pop("think", None)
-    # Apply default keep_alive if not explicitly provided
-    try:
-        if "keep_alive" not in kw and OLLAMA_KEEP_ALIVE_DEFAULT is not None:
-            kw["keep_alive"] = OLLAMA_KEEP_ALIVE_DEFAULT
-    except Exception:
-        # safety: if constant not present, just continue
-        pass
-    allow = self._ALLOWED_CHAT_KW if api == "chat" else self._ALLOWED_GEN_KW
-    return {k: v for k, v in kw.items() if k in allow}
-
+    def _kw_for_client(self, api: str) -> dict:
+        kw = dict(self.kwargs or {})
+        # Never pass 'think' into the Ollama client
+        kw.pop("think", None)
+        allow = self._ALLOWED_CHAT_KW if api == "chat" else self._ALLOWED_GEN_KW
+        return {k: v for k, v in kw.items() if k in allow}
 
     def _invoke_once(self, api: str) -> dict:
         kw = self._kw_for_client(api)
@@ -3254,13 +3068,7 @@ if __name__ == "__main__":
     from eventlet import wsgi
 
     print("→ NKN client hub running. HTTP is metadata only (no websockets).")
-
-    # ← start memory guard early
-    try: _MemoryGuard.start()
-    except Exception as _e: print(f"[mem] guard failed to start: {_e}")
-
     _print_models_on_start()
-
 
     if state.get("nkn_address"):
         print(f"   Hub NKN address: {state['nkn_address']}")
